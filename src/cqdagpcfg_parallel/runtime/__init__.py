@@ -29,13 +29,16 @@ from .batch_transport import (
 )
 from .candidate_batch import CandidateBatch, guess_payload_bytes
 from .candidate_queue import BoundedCandidateQueue, CandidateQueueStats, QueueWatermark
-from .events import EventLog, RuntimeEvent
-from .metrics import ProtocolMetrics
+from .hash_targets import HashTargetConsumer, HashTargetSet, NodeAgentJsonReporter, digest_guess
 from .mock_pipeline import PipelineConfig, PipelineStats, run_candidate_pipeline
 from .model_transport import (
+    DEFAULT_MODEL_FETCH_RETRIES,
+    DEFAULT_MODEL_FETCH_TIMEOUT_MS,
     JsonModelFetchCodec,
+    ModelFetchError,
     ModelFetchRequest,
     ModelFetchResponse,
+    ModelFetchTimeoutError,
     ZmqModelArtifactClient,
     ZmqModelArtifactServer,
 )
@@ -50,8 +53,11 @@ from .worker import (
     source_reclaim_counters,
 )
 from .zmq_transport import (
+    DEFAULT_ZMQ_HIGH_WATERMARK,
+    DEFAULT_ZMQ_LINGER_MS,
     ZmqBatchTransportStats,
     ZmqEndpoint,
+    ZmqEndpointBundle,
     ZmqPullBatchSource,
     ZmqPushBatchSink,
 )
@@ -72,8 +78,13 @@ __all__ = [
     "CandidateBatchSink",
     "CandidateBatchSource",
     "CandidateQueueStats",
-    "EventLog",
+    "DEFAULT_MODEL_FETCH_RETRIES",
+    "DEFAULT_MODEL_FETCH_TIMEOUT_MS",
+    "DEFAULT_ZMQ_HIGH_WATERMARK",
+    "DEFAULT_ZMQ_LINGER_MS",
     "DurableBatchCheckpoint",
+    "HashTargetConsumer",
+    "HashTargetSet",
     "JsonCandidateBatchCodec",
     "JsonBatchAckCodec",
     "JsonModelFetchCodec",
@@ -83,14 +94,16 @@ __all__ = [
     "ReclaimableLocalResultSource",
     "SourceReclaimCounters",
     "MemoryBatchSink",
+    "ModelFetchError",
     "ModelFetchRequest",
     "ModelFetchResponse",
+    "ModelFetchTimeoutError",
+    "NodeAgentJsonReporter",
     "PipelineConfig",
     "PipelineStats",
-    "ProtocolMetrics",
     "QueueWatermark",
-    "RuntimeEvent",
     "ZmqEndpoint",
+    "ZmqEndpointBundle",
     "ZmqBatchTransportStats",
     "ZmqPullBatchSource",
     "ZmqPullBatchAckSource",
@@ -99,6 +112,7 @@ __all__ = [
     "ZmqModelArtifactClient",
     "ZmqModelArtifactServer",
     "WorkerRunResult",
+    "digest_guess",
     "guess_payload_bytes",
     "make_candidate_batches",
     "publish_candidate_batches",

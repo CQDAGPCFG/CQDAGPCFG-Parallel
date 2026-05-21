@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep
 
-from common import ensure_project_paths, experiment_src_dir, read_json, repo_root, write_json
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from shared.common import ensure_project_paths, experiment_src_dir, read_json, repo_root
 
 ensure_project_paths()
 
@@ -21,11 +25,16 @@ from cqdagpcfg_parallel.distributed import (
     RoleController,
 )
 from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint
+from shared.role_signals import (
+    RoleSignalConfig,
+    build_role_signal_snapshot,
+    switch_candidates,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the split-process CQDAGPCFG E2E pipeline locally.",
+        description="Run the local CQDAGPCFG tracker plus elastic node-agent pipeline.",
     )
     parser.add_argument("--train-file", type=Path, default=None)
     parser.add_argument("--source-model-path", type=Path, default=None)
@@ -98,7 +107,7 @@ def main() -> None:
 
     prepare_cmd = [
         python,
-        str(scripts_dir / "prepare.py"),
+        str(scripts_dir / "tools" / "prepare.py"),
         "--model-path",
         str(model_path),
         "--targets-path",
@@ -126,144 +135,21 @@ def main() -> None:
     print("local E2E role plan")
     print(f"  generators: {role_plan.generator_count}")
     print(f"  consumers : {role_plan.consumer_count}")
-    print(f"  throughput: {role_plan.expected_throughput:.3f}")
+    print(f"  throughput: {role_plan.expected_throughput:.3f}", flush=True)
 
-    if args.dynamic_rebalance:
-        run_dynamic_rebalanced(
-            args=args,
-            env=env,
-            python=python,
-            scripts_dir=scripts_dir,
-            model_path=model_path,
-            targets_path=targets_path,
-            work_dir=work_dir,
-            initial_plan=role_plan,
-        )
-        if work_dir_context is not None:
-            work_dir_context.cleanup()
-        return
-
-    hit_paths = tuple(work_dir / f"hits-{index}.json" for index in range(role_plan.consumer_count))
-    consumer_cmds = [
-        [
-            python,
-            str(scripts_dir / "hash_consumer.py"),
-            "--targets-path",
-            str(targets_path),
-            "--batch-connect",
-            args.batch_connect,
-            "--ack-connect",
-            args.ack_connect,
-            "--consumer-id",
-            f"consumer-{index}",
-            "--hits-path",
-            str(hit_paths[index]),
-            "--overall-timeout-seconds",
-            str(args.timeout_seconds),
-            "--hash-delay-seconds",
-            str(args.hash_delay_seconds),
-        ]
-        for index in range(role_plan.consumer_count)
-    ]
-    tracker_cmd = [
-        python,
-        str(scripts_dir / "tracker.py"),
-        "--model-path",
-        str(model_path),
-        "--targets-path",
-        str(targets_path),
-        "--model-id",
-        args.model_id,
-        "--control-bind",
-        args.control_bind,
-        "--batch-bind",
-        args.batch_bind,
-        "--ack-bind",
-        args.ack_bind,
-        "--consumer-count",
-        str(role_plan.consumer_count),
-        "--expected-workers",
-        str(role_plan.generator_count),
-        "--demand-window",
-        str(args.demand_window),
-        "--max-chunk-size",
-        str(args.max_chunk_size),
-        "--max-parallel-leases-per-node",
-        str(args.max_parallel_leases_per_node),
-        "--node-affinity-bonus",
-        str(args.node_affinity_bonus),
-        "--batch-size",
-        str(args.batch_size),
-        "--max-batch-payload-bytes",
-        str(args.max_batch_payload_bytes),
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-        "--ack-timeout-seconds",
-        str(args.ack_timeout_seconds),
-        "--ack-retry-interval-seconds",
-        str(args.ack_retry_interval_seconds),
-    ]
-    if args.model_serve_bind is not None:
-        tracker_cmd.extend(
-            [
-                "--model-serve-bind",
-                args.model_serve_bind,
-                "--model-chunk-size",
-                str(args.model_chunk_size),
-                "--model-slot-page-size",
-                str(args.model_slot_page_size),
-                "--model-structure-page-size",
-                str(args.model_structure_page_size),
-            ]
-        )
-    if args.disable_reclaim:
-        tracker_cmd.append("--disable-reclaim")
-    if args.disable_node_affinity:
-        tracker_cmd.append("--disable-node-affinity")
-    worker_cmds = [
-        [
-            python,
-            str(scripts_dir / "generator_worker.py"),
-            "--model-path",
-            str(model_path),
-            "--targets-path",
-            str(targets_path),
-            "--control-connect",
-            args.control_connect,
-            "--worker-id",
-            f"worker-{index}",
-            "--demand-window",
-            str(args.demand_window),
-            "--work-delay-seconds",
-            str(args.worker_delay_seconds),
-        ]
-        for index in range(role_plan.generator_count)
-    ]
-
-    processes: list[subprocess.Popen[str]] = []
-    try:
-        for command in consumer_cmds:
-            processes.append(subprocess.Popen(command, env=env, text=True))
-        sleep(0.2)
-        processes.append(subprocess.Popen(tracker_cmd, env=env, text=True))
-        for command in worker_cmds:
-            processes.append(subprocess.Popen(command, env=env, text=True))
-        failures = []
-        for process in processes:
-            code = process.wait()
-            if code != 0:
-                failures.append((process.args, code))
-        if failures:
-            for command, code in failures:
-                print(f"process failed with code {code}: {command}", file=sys.stderr)
-            raise SystemExit(1)
-        verify_hash_hits(targets_path, hit_paths)
-    finally:
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
-        if work_dir_context is not None:
-            work_dir_context.cleanup()
+    run_node_agent_pipeline(
+        args=args,
+        env=env,
+        python=python,
+        scripts_dir=scripts_dir,
+        model_path=model_path,
+        targets_path=targets_path,
+        work_dir=work_dir,
+        initial_plan=role_plan,
+        enable_rebalance=args.dynamic_rebalance,
+    )
+    if work_dir_context is not None:
+        work_dir_context.cleanup()
 
 
 def run_checked(command: list[str], *, env: dict[str, str]) -> None:
@@ -282,9 +168,9 @@ def verify_hash_hits(targets_path: Path, hit_paths: tuple[Path, ...]) -> None:
     missing = sorted(expected_guesses - found_guesses)
     if missing:
         raise SystemExit(f"hash consumers missed target guesses: {missing}")
-    print("local hash consumers verified")
-    print(f"  consumers: {len(hit_paths)}")
-    print(f"  hits     : {len(all_hits)}")
+    print("local node hit reports verified")
+    print(f"  nodes: {len(hit_paths)}")
+    print(f"  hits : {len(all_hits)}")
 
 
 @dataclass(slots=True)
@@ -301,7 +187,7 @@ class RoleStabilityState:
     last_switch_by_node: dict[str, float]
 
 
-def run_dynamic_rebalanced(
+def run_node_agent_pipeline(
     *,
     args: argparse.Namespace,
     env: dict[str, str],
@@ -311,6 +197,7 @@ def run_dynamic_rebalanced(
     targets_path: Path,
     work_dir: Path,
     initial_plan,
+    enable_rebalance: bool,
 ) -> None:
     if args.rebalance_interval_seconds <= 0.0:
         raise SystemExit("--rebalance-interval-seconds must be positive")
@@ -350,73 +237,44 @@ def run_dynamic_rebalanced(
         hits_path = work_dir / f"hits-{node_id}.json"
         all_metrics_paths.append(metrics_path)
         all_hit_paths.append(hits_path)
+        agent_env = {
+            **env,
+            "CQPCFG_NODE_ID": node_id,
+            "CQPCFG_ROLE_CONNECT": args.role_connect,
+            "CQPCFG_WORK_DELAY_SECONDS": str(args.worker_delay_seconds),
+            "CQPCFG_HASH_DELAY_SECONDS": str(args.hash_delay_seconds),
+            "CQPCFG_CONSUMER_DRAIN_QUIET_MS": str(args.consumer_drain_quiet_ms),
+            "CQPCFG_CONSUMER_DRAIN_TIMEOUT_MS": str(args.consumer_drain_timeout_ms),
+            "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
+            "CQPCFG_METRICS_PATH": str(metrics_path),
+            "CQPCFG_HITS_PATH": str(hits_path),
+            "CQPCFG_MODEL_JSON_PAGE_CACHE": str(args.model_json_page_cache),
+        }
+        if args.model_cache_dir is not None:
+            agent_env["CQPCFG_MODEL_CACHE_DIR"] = str(args.model_cache_dir)
+        if not use_job_context(args):
+            agent_env.update(
+                {
+                    "CQPCFG_TARGETS_PATH": str(targets_path),
+                    "CQPCFG_CONTROL_CONNECT": args.control_connect,
+                    "CQPCFG_BATCH_CONNECT": args.batch_connect,
+                    "CQPCFG_ACK_CONNECT": args.ack_connect,
+                    "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+                    "CQPCFG_SOURCE_MODE": args.source_mode,
+                }
+            )
+            if args.model_connect is not None:
+                agent_env["CQPCFG_MODEL_CONNECT"] = args.model_connect
+                agent_env["CQPCFG_MODEL_ID"] = args.model_id
+            else:
+                agent_env["CQPCFG_MODEL_PATH"] = str(model_path)
         command = [
             python,
-            str(scripts_dir / "node_agent.py"),
-            "--node-id",
-            node_id,
-            "--role-connect",
-            args.role_connect,
-            "--work-delay-seconds",
-            str(args.worker_delay_seconds),
-            "--hash-delay-seconds",
-            str(args.hash_delay_seconds),
-            "--consumer-drain-quiet-ms",
-            str(args.consumer_drain_quiet_ms),
-            "--consumer-drain-timeout-ms",
-            str(args.consumer_drain_timeout_ms),
-            "--metrics-flush-interval-seconds",
-            str(args.metrics_flush_interval_seconds),
-            "--metrics-path",
-            str(metrics_path),
-            "--hits-path",
-            str(hits_path),
+            str(scripts_dir / "services" / "node_agent.py"),
         ]
-        command.extend(["--model-json-page-cache", str(args.model_json_page_cache)])
-        if use_job_context(args):
-            if args.model_cache_dir is not None:
-                command.extend(["--model-cache-dir", str(args.model_cache_dir)])
-        elif args.model_connect is not None:
-            command.extend(
-                [
-                    "--targets-path",
-                    str(targets_path),
-                    "--control-connect",
-                    args.control_connect,
-                    "--batch-connect",
-                    args.batch_connect,
-                    "--ack-connect",
-                    args.ack_connect,
-                    "--demand-window",
-                    str(args.demand_window),
-                    "--model-connect",
-                    args.model_connect,
-                    "--model-id",
-                    args.model_id,
-                ]
-            )
-            if args.model_cache_dir is not None:
-                command.extend(["--model-cache-dir", str(args.model_cache_dir)])
-        else:
-            command.extend(
-                [
-                    "--targets-path",
-                    str(targets_path),
-                    "--control-connect",
-                    args.control_connect,
-                    "--batch-connect",
-                    args.batch_connect,
-                    "--ack-connect",
-                    args.ack_connect,
-                    "--demand-window",
-                    str(args.demand_window),
-                    "--model-path",
-                    str(model_path),
-                ]
-            )
         agents[node_id] = AgentProcess(
             node_id=node_id,
-            process=subprocess.Popen(command, env=env, text=True),
+            process=subprocess.Popen(command, env=agent_env, text=True),
             metrics_path=metrics_path,
             hits_path=hits_path,
         )
@@ -459,7 +317,7 @@ def run_dynamic_rebalanced(
 
     tracker_cmd = [
         python,
-        str(scripts_dir / "tracker.py"),
+        str(scripts_dir / "services" / "tracker.py"),
         "--model-path",
         str(model_path),
         "--targets-path",
@@ -473,7 +331,7 @@ def run_dynamic_rebalanced(
         "--ack-bind",
         args.ack_bind,
         "--consumer-count",
-        str(args.total_nodes),
+        str(args.total_nodes if enable_rebalance else initial_plan.consumer_count),
         "--demand-window",
         str(args.demand_window),
         "--max-chunk-size",
@@ -524,7 +382,7 @@ def run_dynamic_rebalanced(
             role_controller.poll()
             failures.extend(reap_finished())
             now = monotonic()
-            if now >= next_rebalance_at:
+            if enable_rebalance and now >= next_rebalance_at:
                 maybe_rebalance_roles(
                     args=args,
                     allocator=allocator,
@@ -586,108 +444,27 @@ def maybe_rebalance_roles(
     request_switch,
     tracker_metrics_path: Path,
 ) -> None:
-    current_generators = sum(
-        1 for node_id in agents if roles.get(node_id) == "generator"
+    role_signals = build_role_signal_snapshot(
+        config=RoleSignalConfig(
+            total_nodes=args.total_nodes,
+            generator_rate=args.generator_rate,
+            consumer_rate=args.consumer_rate,
+            batch_size=args.batch_size,
+            limit=args.limit,
+            model_json_page_cache=args.model_json_page_cache,
+        ),
+        agent_metrics_paths={
+            node_id: agent.metrics_path for node_id, agent in agents.items()
+        },
+        roles=roles,
+        tracker_metrics_path=tracker_metrics_path,
     )
-    current_consumers = sum(
-        1 for node_id in agents if roles.get(node_id) == "consumer"
-    )
-    if current_generators <= 0 or current_consumers <= 0:
+    if role_signals is None:
         return
 
-    tracker_metrics = read_json(tracker_metrics_path) if tracker_metrics_path.exists() else {}
-    published = int(tracker_metrics.get("published_candidates", 0))
-    generation_rate = float(tracker_metrics.get("candidate_rate", 0.0))
-    consumed = 0
-    consumer_rate = 0.0
-    consumer_idle_seconds = 0.0
-    consumer_elapsed_seconds = 0.0
-    generator_waits = 0
-    generator_completed_items = 0
-    source_cached_records = 0
-    source_peak_cached_records = 0
-    source_reclaimed_records = 0
-    source_repository_units = 0
-    source_stream_units = 0
-    metrics_by_node: dict[str, dict] = {}
-    for node_id, agent in agents.items():
-        path = agent.metrics_path
-        if not path.exists():
-            continue
-        payload = read_json(path)
-        metrics_by_node[node_id] = payload
-        consumed += int(payload.get("consumed_candidates", 0))
-        if roles.get(node_id) == "consumer":
-            consumer_rate += float(payload.get("consumer_rate", 0.0))
-            consumer_idle_seconds += float(payload.get("network_poll_seconds", 0.0))
-            consumer_elapsed_seconds += float(payload.get("elapsed_seconds", 0.0))
-        elif roles.get(node_id) == "generator":
-            generator_waits += int(payload.get("waits", 0))
-            generator_completed_items += int(payload.get("completed_items", 0))
-            source_cached_records += int(payload.get("source_cached_records", 0))
-            source_peak_cached_records += int(payload.get("source_peak_cached_records", 0))
-            source_reclaimed_records += int(payload.get("source_reclaimed_records", 0))
-            source_repository_units += int(payload.get("source_dag_repository_active_units", 0))
-            source_stream_units += int(payload.get("source_dag_stream_active_units", 0))
-
-    if published <= 0 and consumed <= 0:
-        return
-
-    pending = max(0, published - consumed)
-    generator_rate_per_node = (
-        generation_rate / current_generators if generation_rate > 0.0 else args.generator_rate
-    )
-    consumer_rate_per_node = (
-        consumer_rate / current_consumers if consumer_rate > 0.0 else args.consumer_rate
-    )
-    max_pending = args.batch_size * max(1, current_consumers) * 4
-    queue_pressure = _bounded_ratio(pending, max_pending)
-    generator_idle_ratio = _bounded_ratio(
-        generator_waits,
-        generator_waits + generator_completed_items,
-    )
-    consumer_idle_ratio = _bounded_ratio(
-        consumer_idle_seconds,
-        consumer_elapsed_seconds,
-    )
-    source_cache_pressure = _bounded_ratio(
-        source_cached_records,
-        max(source_cached_records, source_peak_cached_records, 1),
-    )
-    page_locality = _bounded_ratio(
-        source_repository_units + source_stream_units,
-        max(1, current_generators * args.model_json_page_cache),
-    )
-    frontier_pressure = _bounded_ratio(
-        (1.0 - queue_pressure) * consumer_idle_ratio
-        + max(0.0, consumer_rate_per_node - generator_rate_per_node)
-        / max(generator_rate_per_node + consumer_rate_per_node, 1e-9),
-        1.0,
-    )
-    priority_pressure = 1.0 - _bounded_ratio(published, max(args.limit, 1))
-    reclaim_pressure = max(
-        queue_pressure,
-        source_cache_pressure
-        * (1.0 - _bounded_ratio(source_reclaimed_records, source_reclaimed_records + source_cached_records)),
-    )
-    snapshot = RoleAllocationInput(
-        total_nodes=args.total_nodes,
-        generator_rate_per_node=max(generator_rate_per_node, 1e-9),
-        consumer_rate_per_node=max(consumer_rate_per_node, 1e-9),
-        current_generator_count=current_generators,
-        pending_candidates=pending,
-        max_pending_candidates=max_pending,
-        generator_idle_ratio=generator_idle_ratio,
-        consumer_idle_ratio=consumer_idle_ratio,
-        migration_cost_per_role_swap=args.batch_size,
-        cqdag_frontier_pressure=frontier_pressure,
-        cqdag_priority_pressure=priority_pressure,
-        cqdag_reclaim_pressure=reclaim_pressure,
-        cqdag_page_locality=page_locality,
-    )
-    plan = allocator.plan(
-        snapshot
-    )
+    current_generators = role_signals.current_generators
+    snapshot = role_signals.allocation_input
+    plan = allocator.plan(snapshot)
     desired_generators = plan.generator_count
     if desired_generators < 1:
         desired_generators = 1
@@ -719,91 +496,25 @@ def maybe_rebalance_roles(
         return
 
     if desired_generators < current_generators:
-        for node_id in _switch_candidates(
-            agents,
+        for node_id in switch_candidates(
+            agents.keys(),
             roles,
             "generator",
-            metrics_by_node=metrics_by_node,
+            metrics_by_node=role_signals.metrics_by_node,
         ):
             if roles.get(node_id) == "generator":
                 if request_switch(node_id, "consumer"):
                     break
     elif desired_generators > current_generators:
-        for node_id in _switch_candidates(
-            agents,
+        for node_id in switch_candidates(
+            agents.keys(),
             roles,
             "consumer",
-            metrics_by_node=metrics_by_node,
+            metrics_by_node=role_signals.metrics_by_node,
         ):
             if roles.get(node_id) == "consumer":
                 if request_switch(node_id, "generator"):
                     break
-
-
-def _switch_candidates(
-    agents: dict[str, AgentProcess],
-    roles: dict[str, str],
-    role: str,
-    *,
-    metrics_by_node: dict[str, dict] | None = None,
-) -> tuple[str, ...]:
-    metrics_by_node = {} if metrics_by_node is None else metrics_by_node
-    node_ids = tuple(node_id for node_id in agents if roles.get(node_id) == role)
-    if role == "generator":
-        return tuple(
-            sorted(
-                node_ids,
-                key=lambda node_id: (
-                    int(
-                        metrics_by_node.get(node_id, {}).get(
-                            "source_dag_repository_active_units",
-                            0,
-                        )
-                    )
-                    + int(
-                        metrics_by_node.get(node_id, {}).get(
-                            "source_dag_stream_active_units",
-                            0,
-                        )
-                    )
-                    + int(
-                        metrics_by_node.get(node_id, {}).get(
-                            "source_cached_records",
-                            0,
-                        )
-                    ),
-                    int(metrics_by_node.get(node_id, {}).get("completed_records", 0)),
-                    node_id,
-                ),
-            )
-        )
-    if role == "consumer":
-        return tuple(
-            sorted(
-                node_ids,
-                key=lambda node_id: (
-                    -_bounded_ratio(
-                        float(
-                            metrics_by_node.get(node_id, {}).get(
-                                "network_poll_seconds",
-                                0.0,
-                            )
-                        ),
-                        float(metrics_by_node.get(node_id, {}).get("elapsed_seconds", 0.0)),
-                    ),
-                    float(metrics_by_node.get(node_id, {}).get("consumer_rate", 0.0)),
-                    int(metrics_by_node.get(node_id, {}).get("consumed_candidates", 0)),
-                    node_id,
-                ),
-            )
-        )
-    return node_ids
-
-
-def _bounded_ratio(numerator: float, denominator: float) -> float:
-    if denominator <= 0.0:
-        return 0.0
-    return min(1.0, max(0.0, numerator / denominator))
 
 
 def use_job_context(args: argparse.Namespace) -> bool:

@@ -15,7 +15,7 @@
 반복 실행은 다음 스크립트로 수행한다.
 
 ```bash
-python experiments/src/protocol_validation.py \
+python experiments/cqpcfg_experiment.py validate \
   --source-model-path ../CQDAGPCFG/examples/artifacts/rockyou_train/model.json \
   --limits 1000 20000 \
   --large-limit 100000

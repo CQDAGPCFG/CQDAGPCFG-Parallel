@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from math import ceil, log
 from pathlib import Path
 from typing import Any, Mapping
 
-from .model_store import FileModelArtifactStore
+from .model_store import DEFAULT_MODEL_CHUNK_SIZE, FileModelArtifactStore
+
+
+DEFAULT_SLOT_PAGE_SIZE = 1024
+DEFAULT_STRUCTURE_PAGE_SIZE = 4096
+MIN_SLOT_ACCESS_WEIGHT = 1e-12
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +106,21 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
     artifact.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, page_root: Path | None = None) -> None:
         super().__init__()
         self._paged_manifests: dict[str, PagedModelManifest] = {}
-        self._pages: dict[tuple[str, str], ModelJsonPage] = {}
+        self._owned_page_root = (
+            tempfile.TemporaryDirectory(prefix="cqdagpcfg-model-pages-")
+            if page_root is None
+            else None
+        )
+        self.page_root = (
+            Path(self._owned_page_root.name)
+            if self._owned_page_root is not None
+            else page_root
+        )
+        self.page_root.mkdir(parents=True, exist_ok=True)
+        self._page_paths: dict[tuple[str, str], Path] = {}
 
     @classmethod
     def from_path(
@@ -111,11 +129,12 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
         *,
         model_id: str = "cqdagpcfg-model",
         artifact_uri: str | None = None,
-        chunk_size: int = 1 << 20,
-        slot_page_size: int = 1024,
-        structure_page_size: int = 4096,
+        chunk_size: int = DEFAULT_MODEL_CHUNK_SIZE,
+        slot_page_size: int = DEFAULT_SLOT_PAGE_SIZE,
+        structure_page_size: int = DEFAULT_STRUCTURE_PAGE_SIZE,
+        page_root: Path | None = None,
     ) -> "FilePagedModelArtifactStore":
-        store = cls()
+        store = cls(page_root=page_root)
         store.put_file(
             path,
             model_id=model_id,
@@ -135,8 +154,8 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
         path: Path,
         *,
         model_id: str,
-        slot_page_size: int = 1024,
-        structure_page_size: int = 4096,
+        slot_page_size: int = DEFAULT_SLOT_PAGE_SIZE,
+        structure_page_size: int = DEFAULT_STRUCTURE_PAGE_SIZE,
     ) -> PagedModelManifest:
         if slot_page_size <= 0:
             raise ValueError("slot_page_size must be positive")
@@ -167,15 +186,17 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
                 start = page_index * slot_page_size
                 end = min(len(entries), start + slot_page_size)
                 page_id = slot_page_id(symbol, page_index)
-                self._pages[(artifact_manifest.model_fingerprint, page_id)] = ModelJsonPage(
-                    model_fingerprint=artifact_manifest.model_fingerprint,
-                    page_id=page_id,
-                    data={
-                        "kind": "slot_entries",
-                        "symbol": symbol,
-                        "start": start,
-                        "entries": list(entries[start:end]),
-                    },
+                self._write_page(
+                    ModelJsonPage(
+                        model_fingerprint=artifact_manifest.model_fingerprint,
+                        page_id=page_id,
+                        data={
+                            "kind": "slot_entries",
+                            "symbol": symbol,
+                            "start": start,
+                            "entries": list(entries[start:end]),
+                        },
+                    )
                 )
 
         structure_page_count = (
@@ -185,14 +206,16 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
             start = page_index * structure_page_size
             end = min(len(structures), start + structure_page_size)
             page_id = structure_page_id(page_index)
-            self._pages[(artifact_manifest.model_fingerprint, page_id)] = ModelJsonPage(
-                model_fingerprint=artifact_manifest.model_fingerprint,
-                page_id=page_id,
-                data={
-                    "kind": "structures",
-                    "start": start,
-                    "structures": list(structures[start:end]),
-                },
+            self._write_page(
+                ModelJsonPage(
+                    model_fingerprint=artifact_manifest.model_fingerprint,
+                    page_id=page_id,
+                    data={
+                        "kind": "structures",
+                        "start": start,
+                        "structures": list(structures[start:end]),
+                    },
+                )
             )
 
         manifest = PagedModelManifest(
@@ -215,9 +238,27 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
 
     def fetch_page(self, fingerprint: str, *, page_id: str) -> ModelJsonPage:
         try:
-            return self._pages[(fingerprint, page_id)]
+            path = self._page_paths[(fingerprint, page_id)]
         except KeyError as exc:
             raise KeyError(f"unknown model page: {fingerprint} {page_id}") from exc
+        return ModelJsonPage.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def close(self) -> None:
+        if self._owned_page_root is not None:
+            self._owned_page_root.cleanup()
+            self._owned_page_root = None
+
+    def _write_page(self, page: ModelJsonPage) -> None:
+        page_dir = self.page_root / _fingerprint_dirname(page.model_fingerprint)
+        page_dir.mkdir(parents=True, exist_ok=True)
+        path = page_dir / f"{_page_filename(page.page_id)}.json"
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(page.to_dict(), separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+        self._page_paths[(page.model_fingerprint, page.page_id)] = path
 
 
 def structure_page_id(page_index: int) -> str:
@@ -238,11 +279,22 @@ def _slot_access_weight(entries: tuple[Mapping[str, Any], ...]) -> float:
         prob = float(entry["prob"])
         if prob > 0.0:
             entropy -= prob * log(prob)
-    return max(entropy, 1e-12)
+    return max(entropy, MIN_SLOT_ACCESS_WEIGHT)
+
+
+def _fingerprint_dirname(fingerprint: str) -> str:
+    return fingerprint.replace(":", "_")
+
+
+def _page_filename(page_id: str) -> str:
+    return sha256(page_id.encode("utf-8")).hexdigest()
 
 
 __all__ = [
+    "DEFAULT_SLOT_PAGE_SIZE",
+    "DEFAULT_STRUCTURE_PAGE_SIZE",
     "FilePagedModelArtifactStore",
+    "MIN_SLOT_ACCESS_WEIGHT",
     "ModelJsonPage",
     "PagedModelManifest",
     "PagedSlotTableManifest",

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
 import pytest
 
-from cqdagpcfg_parallel.distributed import (
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[2] / "experiments" / "src"
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from cqdagpcfg_parallel.distributed import (  # noqa: E402
     CqdagAwareElasticRoleAllocator,
     DistributedRole,
     DynamicRoleAllocator,
     RoleAllocationConfig,
     RoleAllocationInput,
     ThroughputOptimalRoleAllocator,
+)
+from shared.role_signals import (  # noqa: E402
+    RoleSignalConfig,
+    build_role_signal_snapshot,
+    switch_candidates,
 )
 
 
@@ -226,3 +239,111 @@ def test_dynamic_role_allocator_is_cqdag_aware_default() -> None:
     )
 
     assert plan.reason == "cqdag_aware_elastic"
+
+
+def test_role_signals_build_cqdag_aware_allocation_input(tmp_path) -> None:
+    tracker_metrics_path = tmp_path / "tracker.json"
+    generator_metrics_path = tmp_path / "generator.json"
+    consumer_metrics_path = tmp_path / "consumer.json"
+    tracker_metrics_path.write_text(
+        json.dumps({"published_candidates": 100, "candidate_rate": 200.0}),
+        encoding="utf-8",
+    )
+    generator_metrics_path.write_text(
+        json.dumps(
+            {
+                "waits": 1,
+                "completed_items": 9,
+                "source_cached_records": 12,
+                "source_peak_cached_records": 24,
+                "source_reclaimed_records": 6,
+                "source_dag_repository_active_units": 4,
+                "source_dag_stream_active_units": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    consumer_metrics_path.write_text(
+        json.dumps(
+            {
+                "consumed_candidates": 60,
+                "consumer_rate": 120.0,
+                "network_poll_seconds": 1.0,
+                "elapsed_seconds": 10.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = build_role_signal_snapshot(
+        config=RoleSignalConfig(
+            total_nodes=2,
+            generator_rate=100.0,
+            consumer_rate=100.0,
+            batch_size=10,
+            limit=1000,
+            model_json_page_cache=16,
+        ),
+        agent_metrics_paths={
+            "node-g": generator_metrics_path,
+            "node-c": consumer_metrics_path,
+        },
+        roles={"node-g": DistributedRole.GENERATOR, "node-c": DistributedRole.CONSUMER},
+        tracker_metrics_path=tracker_metrics_path,
+    )
+
+    assert snapshot is not None
+    assert snapshot.current_generators == 1
+    assert snapshot.current_consumers == 1
+    assert snapshot.allocation_input.pending_candidates == 40
+    assert snapshot.allocation_input.generator_rate_per_node == 200.0
+    assert snapshot.allocation_input.consumer_rate_per_node == 120.0
+    assert snapshot.allocation_input.cqdag_reclaim_pressure > 0.0
+    assert snapshot.allocation_input.cqdag_page_locality > 0.0
+
+
+def test_role_signal_switch_candidates_preserve_cqdag_state() -> None:
+    roles = {
+        "hot-generator": "generator",
+        "cold-generator": "generator",
+        "idle-consumer": "consumer",
+        "busy-consumer": "consumer",
+    }
+    metrics = {
+        "hot-generator": {
+            "source_dag_repository_active_units": 10,
+            "source_dag_stream_active_units": 10,
+            "source_cached_records": 10,
+        },
+        "cold-generator": {
+            "source_dag_repository_active_units": 0,
+            "source_dag_stream_active_units": 1,
+            "source_cached_records": 1,
+        },
+        "idle-consumer": {
+            "network_poll_seconds": 9.0,
+            "elapsed_seconds": 10.0,
+            "consumer_rate": 1.0,
+        },
+        "busy-consumer": {
+            "network_poll_seconds": 1.0,
+            "elapsed_seconds": 10.0,
+            "consumer_rate": 100.0,
+        },
+    }
+
+    generator_candidates = switch_candidates(
+        roles.keys(),
+        roles,
+        "generator",
+        metrics_by_node=metrics,
+    )
+    consumer_candidates = switch_candidates(
+        roles.keys(),
+        roles,
+        "consumer",
+        metrics_by_node=metrics,
+    )
+
+    assert generator_candidates[0] == "cold-generator"
+    assert consumer_candidates[0] == "idle-consumer"

@@ -7,19 +7,27 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from threading import Event, Thread
 from time import monotonic, sleep
 
-from common import ensure_project_paths, experiment_src_dir, read_json, repo_root
-from run_local import run_checked, verify_hash_hits
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from scenarios.run_local import run_checked, verify_hash_hits
+from shared.common import ensure_project_paths, experiment_src_dir, read_json, repo_root
 
 ensure_project_paths()
+
+from cqdagpcfg_parallel.distributed import RoleController
+from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run a fault-injection CQDAGPCFG pipeline: kill the tracker after a "
-            "durable checkpoint, restart it, and add a late generator worker."
+            "durable checkpoint, restart it, and add a late elastic node agent."
         ),
     )
     parser.add_argument("--train-file", type=Path, default=None)
@@ -33,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-connect", default="cqpcfg://127.0.0.1:5655")
     parser.add_argument("--batch-bind", default="cqpcfg://127.0.0.1:5656")
     parser.add_argument("--batch-connect", default="cqpcfg://127.0.0.1:5656")
+    parser.add_argument("--role-bind", default="cqpcfg://127.0.0.1:5657")
+    parser.add_argument("--role-connect", default="cqpcfg://127.0.0.1:5657")
     parser.add_argument("--ack-bind", default="cqpcfg://127.0.0.1:5658")
     parser.add_argument("--ack-connect", default="cqpcfg://127.0.0.1:5658")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -79,7 +89,7 @@ def main() -> None:
 
     prepare_cmd = [
         python,
-        str(scripts_dir / "prepare.py"),
+        str(scripts_dir / "tools" / "prepare.py"),
         "--model-path",
         str(model_path),
         "--targets-path",
@@ -97,33 +107,24 @@ def main() -> None:
         prepare_cmd.extend(["--target-rank", str(rank)])
     run_checked(prepare_cmd, env=env)
 
-    hit_paths = tuple(work_dir / f"hits-{index}.json" for index in range(args.consumer_count))
-    consumers = [
-        subprocess.Popen(
-            [
-                python,
-                str(scripts_dir / "hash_consumer.py"),
-                "--targets-path",
-                str(targets_path),
-                "--batch-connect",
-                args.batch_connect,
-                "--ack-connect",
-                args.ack_connect,
-                "--consumer-id",
-                f"consumer-{index}",
-                "--hits-path",
-                str(hit_paths[index]),
-                "--overall-timeout-seconds",
-                str(args.timeout_seconds),
-                "--hash-delay-seconds",
-                str(args.hash_delay_seconds),
-            ],
+    consumer_ids = tuple(f"consumer-{index}" for index in range(args.consumer_count))
+    roles = {node_id: "consumer" for node_id in consumer_ids}
+    roles["worker-0"] = "generator"
+    role_controller, stop_roles, role_thread = start_role_controller(args, roles)
+    agents = [
+        start_agent(
+            args=args,
+            python=python,
+            scripts_dir=scripts_dir,
+            model_path=model_path,
+            targets_path=targets_path,
+            work_dir=work_dir,
+            node_id=node_id,
             env=env,
-            text=True,
         )
-        for index in range(args.consumer_count)
+        for node_id in (*consumer_ids, "worker-0")
     ]
-    sleep(0.2)
+    hit_paths = [work_dir / f"hits-{node_id}.json" for node_id in (*consumer_ids, "worker-0")]
 
     tracker = start_tracker(
         args=args,
@@ -138,17 +139,6 @@ def main() -> None:
         env=env,
         resume=False,
     )
-    workers = [
-        start_worker(
-            args=args,
-            python=python,
-            scripts_dir=scripts_dir,
-            model_path=model_path,
-            targets_path=targets_path,
-            worker_id="worker-0",
-            env=env,
-        )
-    ]
 
     try:
         wait_for_checkpoint(checkpoint_path, timeout_seconds=args.timeout_seconds)
@@ -159,15 +149,10 @@ def main() -> None:
             raise SystemExit("tracker completed before fault could be injected")
         tracker.kill()
         tracker.wait(timeout=5)
-        for worker in workers:
-            if worker.poll() is None:
-                worker.terminate()
-            try:
-                worker.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                worker.kill()
-                worker.wait(timeout=3)
-        workers = []
+        terminate_agent(agents[-1])
+        agents = agents[:-1]
+        roles.pop("worker-0", None)
+        role_controller.set_roles(roles)
         print("fault injected: tracker process killed after durable checkpoint")
 
         sleep(0.5)
@@ -184,25 +169,28 @@ def main() -> None:
             env=env,
             resume=True,
         )
-        workers.append(
-            start_worker(
-                args=args,
-                python=python,
-                scripts_dir=scripts_dir,
-                model_path=model_path,
-                targets_path=targets_path,
-                worker_id="worker-late",
-                env=env,
-            )
+        roles["worker-late"] = "generator"
+        role_controller.set_roles(roles)
+        late_agent = start_agent(
+            args=args,
+            python=python,
+            scripts_dir=scripts_dir,
+            model_path=model_path,
+            targets_path=targets_path,
+            work_dir=work_dir,
+            node_id="worker-late",
+            env=env,
         )
+        agents.append(late_agent)
+        hit_paths.append(work_dir / "hits-worker-late.json")
         print("fault recovery: tracker restarted and late worker joined")
 
-        failures = wait_all([tracker, *workers, *consumers], timeout_seconds=args.timeout_seconds)
+        failures = wait_all([tracker, *agents], timeout_seconds=args.timeout_seconds)
         if failures:
             for command, code in failures:
                 print(f"process failed with code {code}: {command}", file=sys.stderr)
             raise SystemExit(1)
-        verify_hash_hits(targets_path, hit_paths)
+        verify_hash_hits(targets_path, tuple(hit_paths))
         print("fault-injection run completed")
         print(f"  work dir          : {work_dir}")
         print(f"  checkpoint        : {checkpoint_path}")
@@ -210,9 +198,12 @@ def main() -> None:
         print(f"  batch checkpoint  : {batch_checkpoint_path}")
         print(f"  final emitted     : {read_json(checkpoint_path)['emitted_count']}")
     finally:
-        for process in [tracker, *workers, *consumers]:
+        for process in [tracker, *agents]:
             if process.poll() is None:
                 process.terminate()
+        stop_roles.set()
+        role_thread.join(timeout=2.0)
+        role_controller.close()
         if work_dir_context is not None:
             work_dir_context.cleanup()
 
@@ -233,7 +224,7 @@ def start_tracker(
 ) -> subprocess.Popen[str]:
     command = [
         python,
-        str(scripts_dir / "tracker.py"),
+        str(scripts_dir / "services" / "tracker.py"),
         "--model-path",
         str(model_path),
         "--targets-path",
@@ -277,36 +268,72 @@ def start_tracker(
     return subprocess.Popen(command, env=env, text=True)
 
 
-def start_worker(
+def start_role_controller(
+    args: argparse.Namespace,
+    roles: dict[str, str],
+) -> tuple[RoleController, Event, Thread]:
+    controller = RoleController(
+        endpoint=ZmqEndpoint.from_uri(args.role_bind, bind=True),
+        roles=roles,
+    )
+    stop_event = Event()
+
+    def serve() -> None:
+        while not stop_event.is_set():
+            controller.poll(timeout_ms=100)
+
+    thread = Thread(target=serve, name="cqdagpcfg-fault-role-controller", daemon=True)
+    thread.start()
+    return controller, stop_event, thread
+
+
+def start_agent(
     *,
     args: argparse.Namespace,
     python: str,
     scripts_dir: Path,
     model_path: Path,
     targets_path: Path,
-    worker_id: str,
+    work_dir: Path,
+    node_id: str,
     env: dict[str, str],
 ) -> subprocess.Popen[str]:
+    metrics_dir = work_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    agent_env = {
+        **env,
+        "CQPCFG_NODE_ID": node_id,
+        "CQPCFG_ROLE_CONNECT": args.role_connect,
+        "CQPCFG_MODEL_PATH": str(model_path),
+        "CQPCFG_TARGETS_PATH": str(targets_path),
+        "CQPCFG_SOURCE_MODE": "root",
+        "CQPCFG_CONTROL_CONNECT": args.control_connect,
+        "CQPCFG_BATCH_CONNECT": args.batch_connect,
+        "CQPCFG_ACK_CONNECT": args.ack_connect,
+        "CQPCFG_METRICS_PATH": str(metrics_dir / f"{node_id}.json"),
+        "CQPCFG_HITS_PATH": str(work_dir / f"hits-{node_id}.json"),
+        "CQPCFG_HASH_DELAY_SECONDS": str(args.hash_delay_seconds),
+        "CQPCFG_WORK_DELAY_SECONDS": str(args.worker_delay_seconds),
+        "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+    }
     return subprocess.Popen(
         [
             python,
-            str(scripts_dir / "generator_worker.py"),
-            "--model-path",
-            str(model_path),
-            "--targets-path",
-            str(targets_path),
-            "--control-connect",
-            args.control_connect,
-            "--worker-id",
-            worker_id,
-            "--demand-window",
-            str(args.demand_window),
-            "--work-delay-seconds",
-            str(args.worker_delay_seconds),
+            str(scripts_dir / "services" / "node_agent.py"),
         ],
-        env=env,
+        env=agent_env,
         text=True,
     )
+
+
+def terminate_agent(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
 
 
 def wait_for_checkpoint(path: Path, *, timeout_seconds: float) -> None:

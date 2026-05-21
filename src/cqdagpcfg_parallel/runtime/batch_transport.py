@@ -267,7 +267,7 @@ class BoundedBatchSink:
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, _exc_type, exc, _tb) -> None:
         self.close()
 
     @property

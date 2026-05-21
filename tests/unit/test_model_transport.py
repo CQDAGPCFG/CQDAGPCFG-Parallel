@@ -7,6 +7,7 @@ import pytest
 from cqdagpcfg_parallel.runtime import (
     JsonModelFetchCodec,
     LazyLocalResultSource,
+    ModelFetchTimeoutError,
     ModelFetchRequest,
     ZmqEndpoint,
     ZmqModelArtifactClient,
@@ -16,7 +17,10 @@ from cqdagpcfg_parallel.storage import (
     BoundedModelPageCache,
     FileModelArtifactCache,
     FileModelArtifactStore,
+    FilePagedModelArtifactStore,
     InMemoryModelArtifactStore,
+    slot_page_id,
+    structure_page_id,
 )
 
 
@@ -65,6 +69,40 @@ def test_zmq_model_artifact_transport_fetches_manifest_and_chunks() -> None:
     assert not thread.is_alive()
     assert fetched_manifest == manifest
     assert fetched_payload == payload
+
+
+def test_zmq_model_artifact_client_times_out_without_reply() -> None:
+    zmq = pytest.importorskip("zmq")
+    context = zmq.Context()
+    address = "inproc://model-artifact-timeout"
+    socket = context.socket(zmq.REP)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.bind(address)
+    received = []
+
+    def receive_without_reply() -> None:
+        if socket.poll(1000, zmq.POLLIN):
+            received.append(socket.recv())
+
+    thread = Thread(target=receive_without_reply, daemon=True)
+    thread.start()
+    client = ZmqModelArtifactClient(
+        ZmqEndpoint(address, bind=False, linger_ms=0),
+        context=context,
+        timeout_ms=20,
+        retries=1,
+    )
+
+    try:
+        with pytest.raises(ModelFetchTimeoutError):
+            client.manifest("toy")
+    finally:
+        client.close()
+        thread.join(2.0)
+        socket.close()
+        context.term()
+
+    assert received
 
 
 def test_file_model_artifact_cache_materializes_chunks(tmp_path) -> None:
@@ -130,3 +168,50 @@ def test_bounded_model_page_cache_fetches_and_evicts() -> None:
     assert cache.stats.hits == 1
     assert cache.stats.misses == 2
     assert cache.stats.bytes <= 10
+
+
+def test_file_paged_model_artifact_store_writes_pages_to_disk(tmp_path) -> None:
+    model_path = tmp_path / "model.json"
+    page_root = tmp_path / "pages"
+    model_path.write_text(
+        """
+        {
+          "metadata": {"source": "unit"},
+          "structures": [
+            {"name": "D1", "symbols": ["D1"], "base_prob": 1.0}
+          ],
+          "slot_tables": {
+            "D1": {
+              "unknown_prob": 0.0,
+              "entries": [
+                {"surface": "1", "prob": 0.6},
+                {"surface": "2", "prob": 0.4}
+              ]
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    store = FilePagedModelArtifactStore.from_path(
+        model_path,
+        model_id="toy",
+        chunk_size=64,
+        slot_page_size=1,
+        structure_page_size=1,
+        page_root=page_root,
+    )
+    manifest = store.paged_manifest_for_model("toy")
+    slot_page = store.fetch_page(
+        manifest.model_fingerprint,
+        page_id=slot_page_id("D1", 0),
+    )
+    structure_page = store.fetch_page(
+        manifest.model_fingerprint,
+        page_id=structure_page_id(0),
+    )
+
+    assert list(page_root.rglob("*.json"))
+    assert slot_page.data["entries"][0]["surface"] == "1"
+    assert structure_page.data["structures"][0]["name"] == "D1"

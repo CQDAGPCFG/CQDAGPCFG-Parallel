@@ -8,6 +8,10 @@ from uuid import uuid4
 from cqdagpcfg_parallel.protocol import Lease, LeaseTable, NodeId, WorkerId
 
 
+DEFAULT_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_SNAPSHOT_TO_WARMUP_RATIO = 0.75
+
+
 class MigrationStatus(str, Enum):
     PREPARED = "prepared"
     COMMITTED = "committed"
@@ -36,8 +40,8 @@ class MigrationCommit:
 
 @dataclass(frozen=True, slots=True)
 class SnapshotPolicy:
-    max_snapshot_bytes: int = 8 * 1024 * 1024
-    max_snapshot_to_warmup_ratio: float = 0.75
+    max_snapshot_bytes: int = DEFAULT_MAX_SNAPSHOT_BYTES
+    max_snapshot_to_warmup_ratio: float = DEFAULT_MAX_SNAPSHOT_TO_WARMUP_RATIO
 
     def __post_init__(self) -> None:
         if self.max_snapshot_bytes <= 0:
@@ -229,6 +233,8 @@ def content_digest(payload: str | bytes) -> str:
 
 
 __all__ = [
+    "DEFAULT_MAX_SNAPSHOT_BYTES",
+    "DEFAULT_MAX_SNAPSHOT_TO_WARMUP_RATIO",
     "MigrationCommit",
     "MigrationCoordinator",
     "MigrationStats",

@@ -18,6 +18,16 @@ from .zmq_transport import ZmqEndpoint, _require_zmq
 
 
 ModelFetchKind = Literal["manifest", "chunk", "paged_manifest", "page"]
+DEFAULT_MODEL_FETCH_TIMEOUT_MS = 30_000
+DEFAULT_MODEL_FETCH_RETRIES = 1
+
+
+class ModelFetchError(RuntimeError):
+    """Base error raised by the model fetch protocol."""
+
+
+class ModelFetchTimeoutError(ModelFetchError):
+    """Raised when a model fetch request cannot complete before its timeout."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,9 +191,9 @@ class ZmqModelArtifactServer:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: TracebackType | None,
+        _tb: TracebackType | None,
     ) -> None:
         self.close()
 
@@ -203,7 +213,8 @@ class ZmqModelArtifactServer:
 
     def serve_once(self, *, timeout_ms: int | None = None) -> bool:
         self.open()
-        assert self._socket is not None
+        if self._socket is None:
+            raise RuntimeError("model artifact server socket is not open")
         zmq = _require_zmq()
         if timeout_ms is not None:
             if timeout_ms < 0:
@@ -218,20 +229,22 @@ class ZmqModelArtifactServer:
     def _handle_request(self, request: ModelFetchRequest) -> ModelFetchResponse:
         try:
             if request.kind == "manifest":
-                assert request.model_id is not None
+                if request.model_id is None:
+                    raise ValueError("manifest request is missing model_id")
                 return ModelFetchResponse(
                     ok=True,
                     manifest=self.store.manifest_for_model(request.model_id),
                 )
             if request.kind == "paged_manifest":
-                assert request.model_id is not None
+                if request.model_id is None:
+                    raise ValueError("paged_manifest request is missing model_id")
                 return ModelFetchResponse(
                     ok=True,
                     paged_manifest=self.store.paged_manifest_for_model(request.model_id),
                 )
             if request.kind == "page":
-                assert request.model_fingerprint is not None
-                assert request.page_id is not None
+                if request.model_fingerprint is None or request.page_id is None:
+                    raise ValueError("page request is missing model_fingerprint or page_id")
                 return ModelFetchResponse(
                     ok=True,
                     page=self.store.fetch_page(
@@ -239,7 +252,8 @@ class ZmqModelArtifactServer:
                         page_id=request.page_id,
                     ),
                 )
-            assert request.model_fingerprint is not None
+            if request.model_fingerprint is None:
+                raise ValueError("chunk request is missing model_fingerprint")
             return ModelFetchResponse(
                 ok=True,
                 chunk=self.store.fetch_chunk(
@@ -247,8 +261,11 @@ class ZmqModelArtifactServer:
                     offset=request.offset,
                 ),
             )
-        except BaseException as exc:
-            return ModelFetchResponse(ok=False, error=str(exc))
+        except Exception as exc:
+            return ModelFetchResponse(
+                ok=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -269,12 +286,20 @@ class ZmqModelArtifactClient:
         *,
         context: Any | None = None,
         codec: type[JsonModelFetchCodec] = JsonModelFetchCodec,
+        timeout_ms: int = DEFAULT_MODEL_FETCH_TIMEOUT_MS,
+        retries: int = DEFAULT_MODEL_FETCH_RETRIES,
     ) -> None:
         if endpoint.bind:
             raise ValueError("model artifact client endpoint must connect")
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms cannot be negative")
+        if retries < 0:
+            raise ValueError("retries cannot be negative")
         self.endpoint = endpoint
         self.context = context
         self.codec = codec
+        self.timeout_ms = timeout_ms
+        self.retries = retries
         self._socket: Any | None = None
         self._owns_context = context is None
         self._closed = False
@@ -285,20 +310,25 @@ class ZmqModelArtifactClient:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: TracebackType | None,
+        _tb: TracebackType | None,
     ) -> None:
         self.close()
 
     def open(self) -> None:
         if self._socket is not None:
             return
+        if self._closed:
+            raise RuntimeError("model artifact client is closed")
         zmq = _require_zmq()
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        if self.timeout_ms > 0:
+            socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+            socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         socket.connect(self.endpoint.address)
         self._socket = socket
 
@@ -349,30 +379,56 @@ class ZmqModelArtifactClient:
         return b"".join(chunks)
 
     def _request(self, request: ModelFetchRequest) -> ModelFetchResponse:
-        self.open()
-        assert self._socket is not None
-        self._socket.send(self.codec.dumps_request(request))
-        response = self.codec.loads_response(self._socket.recv())
-        if not response.ok:
-            raise RuntimeError(response.error or "model fetch failed")
-        return response
+        zmq = _require_zmq()
+        last_timeout: BaseException | None = None
+        for attempt in range(self.retries + 1):
+            self.open()
+            if self._socket is None:
+                raise RuntimeError("model artifact client socket is not open")
+            try:
+                self._socket.send(self.codec.dumps_request(request))
+                response = self.codec.loads_response(self._socket.recv())
+            except zmq.Again as exc:
+                last_timeout = exc
+                self._drop_socket()
+                if attempt >= self.retries:
+                    raise ModelFetchTimeoutError(
+                        f"model fetch timed out for {request.kind}"
+                    ) from exc
+                continue
+            if not response.ok:
+                raise ModelFetchError(
+                    f"model fetch failed for {request.kind}: "
+                    f"{response.error or 'unknown server error'}"
+                )
+            return response
+        raise ModelFetchTimeoutError(
+            f"model fetch timed out for {request.kind}"
+        ) from last_timeout
+
+    def _drop_socket(self) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        self._drop_socket()
         if self._owns_context and self.context is not None:
             self.context.term()
             self.context = None
 
 
 __all__ = [
+    "DEFAULT_MODEL_FETCH_RETRIES",
+    "DEFAULT_MODEL_FETCH_TIMEOUT_MS",
     "JsonModelFetchCodec",
+    "ModelFetchError",
     "ModelFetchRequest",
     "ModelFetchResponse",
+    "ModelFetchTimeoutError",
     "ZmqModelArtifactClient",
     "ZmqModelArtifactServer",
 ]

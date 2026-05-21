@@ -3,20 +3,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import exp, fsum, log
-from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from CQDAGPCFG import GuessRecord
-from CQDAGPCFG.enumeration.optimized.blocks import (
-    LeafBlock,
-    LocalMergedBlock,
-    MergedBlock,
-    SharedBlock,
-    SingleConsumerBlock,
-)
 from CQDAGPCFG.enumeration.optimized.factory import OptimizedBlockFactory
-from CQDAGPCFG.enumeration.optimized.builders import BlockFactoryBuilder
-from CQDAGPCFG.enumeration.types import flatten_rank_key
 from CQDAGPCFG.model.types import SlotEntry, Structure
 
 from cqdagpcfg_parallel.protocol import NodeId, WorkerId
@@ -41,7 +31,6 @@ from .block_graph import (
     _iter_repository_blocks,
     _require_structure_index,
     _restore_block_snapshot,
-    tuple_entry_records,
 )
 from .block_graph import BlockNodeDescriptor
 
@@ -322,8 +311,8 @@ class PagedCQDAGRecordSource(CQDAGRecordSource):
             node_id=node_id,
             max_records=max_records,
             prefer_cpp=False,
+            factory_builder=PagedBlockFactoryBuilder(),
         )
-        self.oracle_factory_builder: BlockFactoryBuilder = PagedBlockFactoryBuilder()
 
     def stats(self) -> CQDAGSourceReclaimStats:
         base = super().stats()
@@ -336,16 +325,6 @@ class PagedCQDAGRecordSource(CQDAGRecordSource):
             dag_repository_active_units=paged.json_pages,
             dag_stream_active_units=base.dag_stream_active_units,
         )
-
-    def _restart_from_zero(self) -> None:
-        from .serial_oracle import SerialCQDAGOracle
-
-        self.oracle = SerialCQDAGOracle(self.model, prefer_cpp=False)
-        self._iterator = iter(self.oracle.iter_records(self.max_records))
-        self._cache = []
-        self._cache_base = 0
-        self.exhausted = False
-
 
 class PagedCQDAGStructureRecordSource:
     def __init__(

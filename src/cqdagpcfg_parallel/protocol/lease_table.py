@@ -151,35 +151,6 @@ class LeaseTable:
         ):
             raise StaleLeaseError("lease is missing, expired, or stale")
 
-    def renew(
-        self,
-        lease: Lease,
-        *,
-        ttl_seconds: float | None = None,
-        now: float | None = None,
-    ) -> Lease:
-        now_value = monotonic() if now is None else now
-        ttl = self.default_ttl_seconds if ttl_seconds is None else ttl_seconds
-        self.require_valid(
-            node_id=lease.node_id,
-            worker_id=lease.worker_id,
-            epoch=lease.epoch,
-            start=lease.start,
-            end=lease.end,
-            now=now_value,
-        )
-        renewed = Lease(
-            node_id=lease.node_id,
-            worker_id=lease.worker_id,
-            epoch=lease.epoch,
-            acquired_at=lease.acquired_at,
-            expires_at=now_value + ttl,
-            start=lease.start,
-            end=lease.end,
-        )
-        self._leases.setdefault(lease.node_id, {})[lease.epoch] = renewed
-        return renewed
-
     def release(self, lease: Lease) -> bool:
         leases = self._leases.get(lease.node_id)
         if not leases:

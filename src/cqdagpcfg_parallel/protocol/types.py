@@ -35,10 +35,6 @@ class ChunkRange:
     def size(self) -> int:
         return self.end - self.start
 
-    @property
-    def is_empty(self) -> bool:
-        return self.size == 0
-
 
 @dataclass(frozen=True, slots=True)
 class Demand:

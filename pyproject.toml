@@ -21,7 +21,8 @@ zmq = [
 ]
 dev = [
   "pytest>=8",
-  "pyzmq>=25"
+  "pyzmq>=25",
+  "ruff>=0.15"
 ]
 
 [tool.setuptools.packages.find]
@@ -32,4 +33,7 @@ cqdagpcfg_parallel = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", ".."]
+
+[tool.ruff.lint.per-file-ignores]
+"experiments/src/*.py" = ["E402"]

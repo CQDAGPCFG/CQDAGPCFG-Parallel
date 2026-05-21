@@ -10,6 +10,16 @@ from .batch_transport import BatchEndOfStream, BinaryCandidateBatchCodec
 from .candidate_batch import CandidateBatch
 
 
+DEFAULT_ZMQ_HIGH_WATERMARK = 100
+DEFAULT_ZMQ_LINGER_MS = 0
+
+CONTROL_PORT_OFFSET = 0
+BATCH_PORT_OFFSET = 1
+ROLE_PORT_OFFSET = 2
+ACK_PORT_OFFSET = 3
+MODEL_PORT_OFFSET = 4
+
+
 def _require_zmq() -> Any:
     try:
         import zmq  # type: ignore[import-not-found]
@@ -38,8 +48,8 @@ class ZmqBatchTransportStats:
 class ZmqEndpoint:
     address: str
     bind: bool = False
-    high_watermark: int = 100
-    linger_ms: int = 0
+    high_watermark: int = DEFAULT_ZMQ_HIGH_WATERMARK
+    linger_ms: int = DEFAULT_ZMQ_LINGER_MS
 
     def __post_init__(self) -> None:
         if not self.address:
@@ -55,8 +65,8 @@ class ZmqEndpoint:
         uri: str,
         *,
         bind: bool = False,
-        high_watermark: int = 100,
-        linger_ms: int = 0,
+        high_watermark: int = DEFAULT_ZMQ_HIGH_WATERMARK,
+        linger_ms: int = DEFAULT_ZMQ_LINGER_MS,
     ) -> "ZmqEndpoint":
         parsed = urlparse(uri)
         query = parse_qs(parsed.query)
@@ -82,6 +92,56 @@ class ZmqEndpoint:
                 linger_ms=endpoint_linger,
             )
         raise ValueError(f"unsupported endpoint URI scheme: {parsed.scheme}")
+
+
+@dataclass(frozen=True, slots=True)
+class ZmqEndpointBundle:
+    """Public CQPCFG endpoint expanded into internal ZeroMQ subchannels."""
+
+    control: str
+    batch: str
+    role: str
+    ack: str
+    model: str
+
+    @classmethod
+    def from_base_uri(
+        cls,
+        uri: str,
+        *,
+        advertise_host: str | None = None,
+    ) -> "ZmqEndpointBundle":
+        parsed = urlparse(uri)
+        if parsed.scheme not in {"cqpcfg", "tcp"}:
+            raise ValueError("endpoint bundle base URI must use cqpcfg:// or tcp://")
+        if not parsed.hostname or parsed.port is None:
+            raise ValueError("endpoint bundle base URI must include host and port")
+        host = parsed.hostname if advertise_host is None else advertise_host
+        query = f"?{parsed.query}" if parsed.query else ""
+        return cls(
+            control=_subchannel_uri(parsed.scheme, host, parsed.port, CONTROL_PORT_OFFSET, query),
+            batch=_subchannel_uri(parsed.scheme, host, parsed.port, BATCH_PORT_OFFSET, query),
+            role=_subchannel_uri(parsed.scheme, host, parsed.port, ROLE_PORT_OFFSET, query),
+            ack=_subchannel_uri(parsed.scheme, host, parsed.port, ACK_PORT_OFFSET, query),
+            model=_subchannel_uri(parsed.scheme, host, parsed.port, MODEL_PORT_OFFSET, query),
+        )
+
+
+def _subchannel_uri(
+    scheme: str,
+    host: str,
+    base_port: int,
+    offset: int,
+    query: str,
+) -> str:
+    port = base_port + offset
+    return f"{scheme}://{_format_uri_host(host)}:{port}{query}"
+
+
+def _format_uri_host(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def _query_bool(values: list[str], *, default: bool) -> bool:
@@ -142,9 +202,9 @@ class ZmqPushBatchSink:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: TracebackType | None,
+        _tb: TracebackType | None,
     ) -> None:
         self.close()
 
@@ -250,9 +310,9 @@ class ZmqPullBatchSource:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
+        _exc_type: type[BaseException] | None,
         exc: BaseException | None,
-        tb: TracebackType | None,
+        _tb: TracebackType | None,
     ) -> None:
         self.close()
 
@@ -332,6 +392,8 @@ class ZmqPullBatchSource:
 
 
 __all__ = [
+    "DEFAULT_ZMQ_HIGH_WATERMARK",
+    "DEFAULT_ZMQ_LINGER_MS",
     "ZmqBatchTransportStats",
     "ZmqEndpoint",
     "ZmqPullBatchSource",

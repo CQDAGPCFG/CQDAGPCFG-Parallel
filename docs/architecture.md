@@ -9,7 +9,6 @@
 - `simulation`: deterministic single-process simulator와 global merger
 - `runtime`: candidate batch, bounded queue, transport decorator, local/mock executor
 - `distributed`: ZeroMQ ROUTER/DEALER 기반 tracker/worker distributed executor
-- `control_plane`: worker 등록과 heartbeat를 위한 in-process control model
 - `storage`: checkpoint, chunk manifest, model manifest, state migration snapshot 자료형
 
 ## Protocol Modules
@@ -41,14 +40,14 @@
 - `annotations.py`: `@cqpcfg_generator`, `@cqpcfg_consumer`, `@cqpcfg_distributed`, `@cqpcfg_tracker`, `@cqpcfg_worker` 기반 public API
 - `messages.py`: `ready`, `work`, `chunk`, `exhausted`, `wait`, `stop`, `migrate_*` control message codec
 - `migration.py`: snapshot handoff의 prepare/commit/abort와 lease epoch fencing
-- `tracker.py`: demand, lease, chunk store, merger를 소유하는 ZeroMQ tracker
+- `experiments/cqpcfg_experiment.py tracker`: demand, lease, chunk store, merger를 소유하는 ZeroMQ tracker
 - `worker.py`: source에서 local result range를 materialize하는 ZeroMQ worker
 - `runner.py`: in-process context로 tracker와 여러 worker를 띄우는 테스트/실험 runner
 - `role_allocator.py`: CQDAG frontier/reclaim/page locality를 반영해 generator/consumer node 비율을 조정하는 elastic allocator
 - `role_control.py`: persistent node agent에게 현재 role을 전달하는 ZeroMQ role control plane
-- `node_agent.py`: 한 프로세스 안에서 generator/consumer role을 hot-swap하는 reusable node runtime
+- `experiments/cqpcfg_experiment.py worker`: 한 프로세스 안에서 generator/consumer role을 hot-swap하는 reusable node runtime
 
-`NodeAgent`와 `RoleController`는 라이브러리 레벨 API이다. `experiments/src`는 모델 로딩, 순수 hash 검증, hit report 같은 실험-specific wiring만 담당한다.
+`NodeAgent`, `RoleController`, CQDAG source bootstrap, `@cqdagpcfg_node_agent`, `@cqdagpcfg_tracker`는 라이브러리 레벨 API이다. CLI/env parsing과 role-signal metrics reader는 `experiments/src`에서 담당한다.
 
 ## CQDAG-Aware Elastic Role Allocation
 
@@ -86,7 +85,7 @@ page/cache locality:
 
 role switch 대상도 CQDAG-aware하게 고른다. generator를 consumer로 바꿔야 할 때는 page/cache가 덜 warm한 generator를 먼저 바꾸고, consumer를 generator로 바꿔야 할 때는 idle 시간이 큰 consumer를 먼저 바꾼다. 이 때문에 동적 역할 조정은 단순히 node 수만 바꾸는 것이 아니라 CQDAGPCFG 상태 locality를 보존하는 elastic resource allocation이 된다.
 
-## Annotation API
+## Framework API
 
 한 프로세스에서 tracker와 여러 worker를 같이 띄우는 실험은 다음처럼 쓴다. 기본 chunk/scheduling 정책은 자동으로 선택된다.
 
@@ -107,7 +106,7 @@ def consume(batch):
     external_tool.write(batch.guesses)
 ```
 
-tracker와 worker를 별도 스크립트로 분리할 때는 다음처럼 선언한다.
+tracker와 generator-only worker를 별도 스크립트로 분리할 때는 다음처럼 선언한다.
 
 ```python
 @cqpcfg_tracker(bind="cqpcfg://0.0.0.0:5555", limit=80, expected_workers=3)
@@ -118,13 +117,140 @@ tracker_config.run()
 ```
 
 ```python
-@cqpcfg_worker(connect="cqpcfg://127.0.0.1:5555", worker_id="worker-0")
+@cqpcfg_worker(
+    connect="cqpcfg://127.0.0.1:5555",
+    worker_id="worker-0",
+    resource_cpus=2.0,
+    resource_memory="4g",
+    resource_gpus=1,
+    model_json_page_cache=64,
+)
 @cqpcfg_generator
 def worker_source(worker_id):
     return CQDAGRecordSource(model, max_records=96)
 
 worker_source.run()
 ```
+
+자원 선언은 worker 쪽 decorator가 갖는다. Tracker는 worker가 보고한 CPU, memory, GPU, model page cache 정보를 role allocation 입력으로만 사용한다.
+
+생성과 소비를 모두 맡을 수 있는 elastic node는 `@cqpcfg_node_agent`를 클래스에 붙여 선언한다. 이 경우 하나의 process가 generator와 consumer 구현을 모두 들고 있고, `RoleController`가 내려준 현재 role에 따라 하나만 실행한다.
+
+```python
+@cqpcfg_node_agent(
+    connect="cqpcfg://127.0.0.1:5555",
+    node_id="node-0",
+    resource_cpus=2.0,
+    resource_memory="4g",
+    resource_gpus=1,
+    model_json_page_cache=64,
+)
+class WorkerNode:
+    @cqpcfg_generator
+    def source(self, worker_id):
+        return CQDAGRecordSource(model, max_records=96)
+
+    @cqpcfg_consumer
+    def consume(self, batch):
+        hash_engine.verify(batch.guesses)
+
+WorkerNode.run()
+```
+
+PCFG framework 표면은 Ray actor와 비슷한 사용감을 따른다. `@cqdagpcfg.remote(...)`는 node class를 원격 실행 가능한 PCFG actor로 선언하고, 실행은 `Node.remote()`로 시작한다. 사용자는 transport, batch id, ack, rank 보강을 직접 다루지 않는다.
+
+```python
+from hashlib import sha256
+
+from cqdagpcfg_parallel import cqdagpcfg
+
+
+@cqdagpcfg.remote(
+    env_prefix="CQPCFG",
+    connect="cqpcfg://tracker:5555",
+    num_cpus=2,
+    memory="4g",
+    num_gpus=1,
+    model_json_page_cache=128,
+)
+class ExperimentNode:
+    def consume(self, guess: str):
+        return sha256(guess.encode()).hexdigest()
+
+ExperimentNode.remote()
+```
+
+`@cqdagpcfg.remote`는 Ray처럼 괄호 없이도 쓸 수 있고, resource option이 필요하면 `@cqdagpcfg.remote(...)`로 쓴다. `connect`, CPU/GPU, memory, model page cache처럼 배포자가 직접 판단해야 하는 값은 decorator에 드러내고, `env_prefix="CQPCFG"`를 주면 같은 값들을 환경 변수로 덮어쓸 수 있다. 일반 사용자는 transport subchannel, drain timeout, ack, bootstrap 같은 protocol detail을 직접 선언하지 않는다. `consume()`은 기본적으로 후보 문자열 하나를 받고, `None`, `False`, `True`, digest 문자열, `dict`, `list[dict]`를 반환할 수 있다. Tracker는 target hash table을 제공하지만, guess를 어떤 hash 알고리즘으로 digest할지는 consumer가 결정한다. 프레임워크는 반환된 digest나 `hash` 필드를 target table에 매칭하고, `rank`, `batch_id`, `guess`, `node_id`, `elapsed_seconds` 같은 실행 메타데이터를 자동으로 붙여 hit log와 metrics에 반영한다. 내부 batch를 직접 보고 싶은 고급 사용자는 parameter 이름을 `batch`로 두면 `CandidateBatch`를 그대로 받을 수 있다.
+
+`generate()`는 선택적 hook이다. 생략하면 프레임워크가 기본 CQDAGPCFG source를 사용한다. 사용자가 후보를 필터링하거나 변형하고 싶을 때는 `guess` 또는 `record`를 받아 `None`, 문자열, `GuessRecord`, 또는 이들의 iterable을 반환한다. `None`은 해당 후보를 제거한다. 프레임워크는 반환값을 range-preserving local stream으로 감싸기 때문에 사용자가 직접 `[start,end)` source를 구현하지 않는다.
+
+```python
+class RuleNode:
+    def generate(self, guess: str):
+        if len(guess) < 8:
+            return None
+        return [guess, f"{guess}2026"]
+
+    def consume(self, guess: str):
+        return sha256(guess.encode()).hexdigest()
+```
+
+Tracker actor는 후보를 직접 변형하지 않는다. 대신 `on_start(job)`과 `on_complete(summary)` hook으로 실험 단위 metadata와 protocol summary를 받는다. 여기서 serial digest 검증, peak resident record, reclaim count, affinity hit/miss 같은 논문용 지표를 기록할 수 있다.
+
+```python
+from cqdagpcfg_parallel.adapters.cqdagpcfg import cqdagpcfg_tracker
+
+
+@cqdagpcfg_tracker(config)
+class ExperimentTracker:
+    def on_start(self, job):
+        print(job.limit, job.source_mode)
+
+    def on_node_join(self, node):
+        print(node.node_id, node.role)
+
+    def on_node_leave(self, node):
+        print(node.node_id, node.reason)
+
+    def on_role_change(self, event):
+        print(event.node_id, event.previous_role, event.new_role)
+
+    def on_memory_snapshot(self, snapshot):
+        print(snapshot.peak_resident_records, snapshot.reclaimed_records)
+
+    def on_checkpoint(self, checkpoint):
+        print(checkpoint.emitted_count)
+
+    def on_batch_retry(self, event):
+        print(event.batch_id, event.reason)
+
+    def on_error(self, error):
+        print(error.stage, error.message)
+
+    def on_complete(self, summary):
+        assert summary.digest == summary.serial_digest
+        print(summary.peak_resident_records, summary.reclaimed_records)
+
+ExperimentTracker.run()
+```
+
+기본 tracker hook은 `on_start`, `on_node_join`, `on_node_leave`, `on_role_change`, `on_memory_snapshot`, `on_checkpoint`, `on_batch_retry`, `on_error`, `on_complete`이다. 이 hook들은 user-facing 실험 이벤트만 다루며, lease epoch, chunk publish, scheduler score 같은 내부 프로토콜 객체는 직접 노출하지 않는다.
+
+Framework service는 같은 이벤트를 `cqdagpcfg.*` logger에도 남긴다. 기본 로그는 key=value text이고, `CQPCFG_LOG_FORMAT=json`을 주면 JSON line으로 바뀐다.
+
+```bash
+CQPCFG_LOG_LEVEL=INFO \
+CQPCFG_LOG_FORMAT=json \
+python experiments/cqpcfg_experiment.py worker
+```
+
+대표 이벤트 이름은 다음과 같다.
+
+- `tracker.start`, `tracker.protocol_ready`, `tracker.complete`
+- `tracker.node_join`, `tracker.node_leave`, `tracker.role_change`
+- `tracker.memory_snapshot`, `tracker.checkpoint`, `tracker.batch_retry`
+- `node.start`, `node.job_context_received`, `node.complete`
+- `node_agent.generator_session_start`, `node_agent.consumer_session_start`, `node_agent.role_switch`
 
 ## M1~M3 Flow
 

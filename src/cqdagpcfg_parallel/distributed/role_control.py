@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, _require_zmq
 
 from .job_context import JobContext
+from .resources import RoleResourcePolicy, WorkerResourceSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,12 +37,27 @@ class RoleController:
         *,
         endpoint: ZmqEndpoint,
         roles: Mapping[str, str],
+        auto_assign_roles: Iterable[str] = (),
+        default_role: str = "idle",
+        assign_default_role: bool = False,
+        resource_policy: RoleResourcePolicy = RoleResourcePolicy(),
         job_context: JobContext | Mapping[str, Any] | None = None,
     ) -> None:
         if not endpoint.bind:
             raise ValueError("role controller endpoint must bind")
+        valid_roles = {"generator", "consumer", "idle"}
+        if default_role not in valid_roles:
+            raise ValueError("default_role must be generator, consumer, or idle")
+        queued_roles = deque(str(role) for role in auto_assign_roles)
+        invalid_roles = sorted(set(queued_roles) - valid_roles)
+        if invalid_roles:
+            raise ValueError(f"invalid auto-assigned roles: {invalid_roles}")
         self.endpoint = endpoint
         self.roles = dict(roles)
+        self.auto_assign_roles = queued_roles
+        self.default_role = default_role
+        self.assign_default_role = assign_default_role
+        self.resource_policy = resource_policy
         self.job_context = _normalize_job_context(job_context)
         self.stop = False
         self.status_by_node: dict[str, dict] = {}
@@ -70,8 +87,8 @@ class RoleController:
     def set_roles(self, roles: Mapping[str, str]) -> None:
         self.roles = dict(roles)
 
-    def set_job_context(self, job_context: JobContext | Mapping[str, Any] | None) -> None:
-        self.job_context = _normalize_job_context(job_context)
+    def role_count(self, role: str) -> int:
+        return sum(1 for value in self.roles.values() if value == role)
 
     def set_stop(self, value: bool) -> None:
         self.stop = value
@@ -95,10 +112,18 @@ class RoleController:
             except json.JSONDecodeError:
                 status = {"decode_error": True}
                 self.status_by_node[node_id] = status
+            resources = WorkerResourceSpec.from_dict(
+                _mapping_or_none(status.get("resources")),
+            )
+            if node_id not in self.roles:
+                self._assign_new_node(node_id, resources)
+            role = self.roles.get(node_id, self.default_role)
+            if not resources.fits(self.resource_policy.requirement_for(role)):
+                role = "idle"
 
             reply_payload: dict[str, Any] = {
                 "schema_version": 1,
-                "role": self.roles.get(node_id, "idle"),
+                "role": role,
                 "stop": self.stop,
             }
             if self.job_context is not None:
@@ -116,6 +141,17 @@ class RoleController:
             self._messages += 1
             self._bytes += len(payload) + len(reply)
             timeout_ms = 0
+
+    def _assign_new_node(self, node_id: str, resources: WorkerResourceSpec) -> None:
+        for role in tuple(self.auto_assign_roles):
+            if resources.fits(self.resource_policy.requirement_for(role)):
+                self.roles[node_id] = role
+                self.auto_assign_roles.remove(role)
+                return
+        if self.assign_default_role and resources.fits(
+            self.resource_policy.requirement_for(self.default_role),
+        ):
+            self.roles[node_id] = self.default_role
 
     def close(self) -> None:
         self._socket.close()
@@ -230,6 +266,10 @@ def _normalize_job_context(
     if isinstance(job_context, JobContext):
         return job_context
     return JobContext.from_dict(job_context)
+
+
+def _mapping_or_none(value: object) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) else None
 
 
 __all__ = [

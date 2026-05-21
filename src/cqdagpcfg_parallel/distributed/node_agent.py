@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import Callable
 
+from cqdagpcfg_parallel.framework_logging import log_event
 from cqdagpcfg_parallel.protocol import WorkerId
 from cqdagpcfg_parallel.runtime import (
     BatchAck,
@@ -15,12 +17,14 @@ from cqdagpcfg_parallel.runtime import (
 from cqdagpcfg_parallel.runtime.worker import LocalResultSource, source_reclaim_counters
 from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, ZmqPullBatchSource
 
-from .role_control import RoleClient, RoleControlReply, RoleControlStats
+from .role_control import RoleClient, RoleControlReply
+from .resources import WorkerResourceSpec
 from .worker import DistributedProtocolWorker
 
 
 CandidateBatchHandler = Callable[[CandidateBatch], None]
 NodeAgentStatsCallback = Callable[["NodeAgentStats"], None]
+LOGGER = logging.getLogger("cqdagpcfg.node_agent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,10 @@ class NodeAgentStats:
     desired_role: str
     final: bool
     model_loaded_once: bool
+    resource_cpu_cores: float | None = None
+    resource_memory_bytes: int | None = None
+    resource_gpu_count: int | None = None
+    resource_model_json_page_cache: int | None = None
     role_switches: int = 0
     generator_sessions: int = 0
     consumer_sessions: int = 0
@@ -88,6 +96,7 @@ class NodeAgent:
         role_refresh_interval_seconds: float = 0.05,
         stats_flush_interval_seconds: float = 0.25,
         stats_callback: NodeAgentStatsCallback | None = None,
+        resources: WorkerResourceSpec = WorkerResourceSpec(),
     ) -> None:
         if control_endpoint.bind:
             raise ValueError("control_endpoint must connect")
@@ -125,6 +134,7 @@ class NodeAgent:
         self.role_refresh_interval_seconds = role_refresh_interval_seconds
         self.stats_flush_interval_seconds = stats_flush_interval_seconds
         self.stats_callback = stats_callback
+        self.resources = resources
 
         self.started_at = monotonic()
         self.role_switches = 0
@@ -183,6 +193,14 @@ class NodeAgent:
         self.current_role = "generator"
         session_id = f"{self.node_id}-generator-{self.generator_sessions}"
         retire_requested = False
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "node_agent.generator_session_start",
+            node_id=self.node_id,
+            session_id=session_id,
+            session=self.generator_sessions,
+        )
 
         def should_retire() -> bool:
             nonlocal retire_requested
@@ -202,15 +220,42 @@ class NodeAgent:
         self.completed_records += stats.completed_records
         self.waits += stats.waits
         self.flush_stats(final=False)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "node_agent.generator_session_complete",
+            node_id=self.node_id,
+            session_id=session_id,
+            completed_items=stats.completed_items,
+            completed_records=stats.completed_records,
+            waits=stats.waits,
+            retire_requested=retire_requested,
+        )
 
         if retire_requested and not self.should_stop():
             self.role_switches += 1
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "node_agent.role_switch",
+                node_id=self.node_id,
+                previous_role="generator",
+                next_role=self._last_reply.role,
+                role_switches=self.role_switches,
+            )
             return True
         return False
 
     def run_consumer_session(self) -> bool:
         self.consumer_sessions += 1
         self.current_role = "consumer"
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "node_agent.consumer_session_start",
+            node_id=self.node_id,
+            session=self.consumer_sessions,
+        )
         source = ZmqPullBatchSource(self.batch_endpoint)
         ack_sink = (
             ZmqPushBatchAckSink(self.ack_endpoint)
@@ -226,6 +271,17 @@ class NodeAgent:
                     if self.desired_role() != "consumer":
                         finished = self._drain_consumer_before_switch(source, ack_sink)
                         self.role_switches += 1
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "node_agent.role_switch",
+                            node_id=self.node_id,
+                            previous_role="consumer",
+                            next_role=self._last_reply.role,
+                            role_switches=self.role_switches,
+                            drained_batches=self.drained_batches,
+                            drain_timeouts=self.drain_timeouts,
+                        )
                         self.flush_stats(final=False)
                         return finished
                     message = source.receive_envelope(timeout_ms=self.receive_timeout_ms)
@@ -233,6 +289,14 @@ class NodeAgent:
                         continue
                     if isinstance(message, BatchEndOfStream):
                         self.flush_stats(final=False)
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "node_agent.consumer_end_of_stream",
+                            node_id=self.node_id,
+                            consumed_batches=self.consumed_batches,
+                            consumed_candidates=self.consumed_candidates,
+                        )
                         return True
                     self._consume_and_ack(message, ack_sink)
                     self.flush_stats(final=False)
@@ -292,6 +356,16 @@ class NodeAgent:
                     )
                 )
         except BaseException as exc:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "node_agent.consume_failed",
+                node_id=self.node_id,
+                batch_id=message.batch_id,
+                start_rank=message.start_rank,
+                end_rank=message.end_rank,
+                error=exc,
+            )
             if ack_sink is not None:
                 ack_sink.publish(
                     BatchAck(
@@ -336,6 +410,10 @@ class NodeAgent:
             desired_role=self._last_reply.role,
             final=final,
             model_loaded_once=model_loaded_once,
+            resource_cpu_cores=self.resources.cpu_cores,
+            resource_memory_bytes=self.resources.memory_bytes,
+            resource_gpu_count=self.resources.gpu_count,
+            resource_model_json_page_cache=self.resources.model_json_page_cache,
             role_switches=self.role_switches,
             generator_sessions=self.generator_sessions,
             consumer_sessions=self.consumer_sessions,
@@ -383,6 +461,7 @@ class NodeAgent:
                 "completed_records": self.completed_records,
                 "consumed_candidates": self.consumed_candidates,
                 "role_switches": self.role_switches,
+                "resources": self.resources.to_dict(),
             }
         )
         return self._last_reply

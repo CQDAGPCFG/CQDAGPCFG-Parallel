@@ -10,8 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep
 
-from common import ensure_project_paths, experiment_src_dir, read_json, repo_root, write_json
-from run_local import print_overhead_summary, run_checked, verify_hash_hits
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from scenarios.run_local import print_overhead_summary, run_checked, verify_hash_hits
+from shared.common import ensure_project_paths, experiment_src_dir, read_json, repo_root, write_json
 
 ensure_project_paths()
 
@@ -122,7 +126,7 @@ def main() -> None:
 
     prepare_cmd = [
         python,
-        str(scripts_dir / "prepare.py"),
+        str(scripts_dir / "tools" / "prepare.py"),
         "--model-path",
         str(model_path),
         "--targets-path",
@@ -339,81 +343,46 @@ def start_agent(
 ) -> AgentProcess:
     metrics_path = metrics_dir / f"{node_id}.json"
     hits_path = work_dir / f"hits-{node_id}.json"
+    agent_env = {
+        **env,
+        "CQPCFG_NODE_ID": node_id,
+        "CQPCFG_ROLE_CONNECT": args.role_connect,
+        "CQPCFG_WORK_DELAY_SECONDS": str(args.worker_delay_seconds),
+        "CQPCFG_HASH_DELAY_SECONDS": str(args.hash_delay_seconds),
+        "CQPCFG_CONSUMER_DRAIN_QUIET_MS": str(args.consumer_drain_quiet_ms),
+        "CQPCFG_CONSUMER_DRAIN_TIMEOUT_MS": str(args.consumer_drain_timeout_ms),
+        "CQPCFG_ROLE_REPLY_TIMEOUT_MS": str(args.role_reply_timeout_ms),
+        "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
+        "CQPCFG_EXPERIMENT_START_MONOTONIC": str(experiment_started_at),
+        "CQPCFG_METRICS_PATH": str(metrics_path),
+        "CQPCFG_HITS_PATH": str(hits_path),
+        "CQPCFG_MODEL_JSON_PAGE_CACHE": str(args.model_json_page_cache),
+    }
+    if args.model_cache_dir is not None:
+        agent_env["CQPCFG_MODEL_CACHE_DIR"] = str(args.model_cache_dir)
+    if not use_job_context(args):
+        agent_env.update(
+            {
+                "CQPCFG_TARGETS_PATH": str(targets_path),
+                "CQPCFG_SOURCE_MODE": args.source_mode,
+                "CQPCFG_CONTROL_CONNECT": args.control_connect,
+                "CQPCFG_BATCH_CONNECT": args.batch_connect,
+                "CQPCFG_ACK_CONNECT": args.ack_connect,
+                "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+            }
+        )
+        if args.model_connect is not None:
+            agent_env["CQPCFG_MODEL_CONNECT"] = args.model_connect
+            agent_env["CQPCFG_MODEL_ID"] = args.model_id
+        else:
+            agent_env["CQPCFG_MODEL_PATH"] = str(model_path)
     command = [
         python,
-        str(scripts_dir / "node_agent.py"),
-        "--node-id",
-        node_id,
-        "--role-connect",
-        args.role_connect,
-        "--work-delay-seconds",
-        str(args.worker_delay_seconds),
-        "--hash-delay-seconds",
-        str(args.hash_delay_seconds),
-        "--consumer-drain-quiet-ms",
-        str(args.consumer_drain_quiet_ms),
-        "--consumer-drain-timeout-ms",
-        str(args.consumer_drain_timeout_ms),
-        "--role-reply-timeout-ms",
-        str(args.role_reply_timeout_ms),
-        "--metrics-flush-interval-seconds",
-        str(args.metrics_flush_interval_seconds),
-        "--experiment-start-monotonic",
-        str(experiment_started_at),
-        "--metrics-path",
-        str(metrics_path),
-        "--hits-path",
-        str(hits_path),
+        str(scripts_dir / "services" / "node_agent.py"),
     ]
-    command.extend(["--model-json-page-cache", str(args.model_json_page_cache)])
-    if use_job_context(args):
-        if args.model_cache_dir is not None:
-            command.extend(["--model-cache-dir", str(args.model_cache_dir)])
-    elif args.model_connect is not None:
-        command.extend(
-            [
-                "--targets-path",
-                str(targets_path),
-                "--source-mode",
-                args.source_mode,
-                "--control-connect",
-                args.control_connect,
-                "--batch-connect",
-                args.batch_connect,
-                "--ack-connect",
-                args.ack_connect,
-                "--demand-window",
-                str(args.demand_window),
-                "--model-connect",
-                args.model_connect,
-                "--model-id",
-                args.model_id,
-            ]
-        )
-        if args.model_cache_dir is not None:
-            command.extend(["--model-cache-dir", str(args.model_cache_dir)])
-    else:
-        command.extend(
-            [
-                "--targets-path",
-                str(targets_path),
-                "--source-mode",
-                args.source_mode,
-                "--control-connect",
-                args.control_connect,
-                "--batch-connect",
-                args.batch_connect,
-                "--ack-connect",
-                args.ack_connect,
-                "--demand-window",
-                str(args.demand_window),
-                "--model-path",
-                str(model_path),
-            ]
-        )
     return AgentProcess(
         node_id=node_id,
-        process=subprocess.Popen(command, env=env, text=True),
+        process=subprocess.Popen(command, env=agent_env, text=True),
         metrics_path=metrics_path,
         hits_path=hits_path,
     )
@@ -431,7 +400,7 @@ def start_tracker(
 ) -> subprocess.Popen[str]:
     command = [
         python,
-        str(scripts_dir / "tracker.py"),
+        str(scripts_dir / "services" / "tracker.py"),
         "--model-path",
         str(model_path),
         "--targets-path",

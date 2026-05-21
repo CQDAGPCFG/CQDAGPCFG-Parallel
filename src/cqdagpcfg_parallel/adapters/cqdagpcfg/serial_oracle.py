@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from CQDAGPCFG import GuessRecord, OptimizedCQDAGEnumerator
+from CQDAGPCFG.enumeration.optimized.builders import BlockFactoryBuilder
 from CQDAGPCFG.cpp_backend import CppOptimizedCQDAGEnumerator, cpp_backend_available
 
 from cqdagpcfg_parallel.protocol import stable_digest
@@ -16,14 +17,24 @@ class SerialOracleResult:
 
 
 class SerialCQDAGOracle:
-    def __init__(self, model, *, prefer_cpp: bool = True) -> None:
+    def __init__(
+        self,
+        model,
+        *,
+        prefer_cpp: bool = True,
+        factory_builder: BlockFactoryBuilder | None = None,
+    ) -> None:
         self.model = model
         self.prefer_cpp = prefer_cpp
+        self.factory_builder = factory_builder
 
     def enumerator(self):
-        if self.prefer_cpp and cpp_backend_available():
+        if self.factory_builder is None and self.prefer_cpp and cpp_backend_available():
             return CppOptimizedCQDAGEnumerator(self.model)
-        return OptimizedCQDAGEnumerator(self.model)
+        return OptimizedCQDAGEnumerator(
+            self.model,
+            factory_builder=self.factory_builder,
+        )
 
     def iter_records(self, limit: int) -> Iterable[GuessRecord]:
         if limit < 0:

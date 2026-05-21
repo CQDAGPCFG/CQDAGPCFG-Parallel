@@ -11,6 +11,10 @@ from typing import Protocol
 from .manifest import model_fingerprint
 
 
+DEFAULT_MODEL_CHUNK_SIZE = 1 << 20
+DEFAULT_FILE_HASH_BLOCK_SIZE = 1 << 20
+
+
 @dataclass(frozen=True, slots=True)
 class ModelArtifactManifest:
     model_id: str
@@ -80,7 +84,7 @@ class InMemoryModelArtifactStore:
         *,
         model_id: str = "cqdagpcfg-model",
         artifact_uri: str | None = None,
-        chunk_size: int = 1 << 20,
+        chunk_size: int = DEFAULT_MODEL_CHUNK_SIZE,
     ) -> ModelArtifactManifest:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -157,7 +161,7 @@ class FileModelArtifactStore:
         *,
         model_id: str = "cqdagpcfg-model",
         artifact_uri: str | None = None,
-        chunk_size: int = 1 << 20,
+        chunk_size: int = DEFAULT_MODEL_CHUNK_SIZE,
     ) -> "FileModelArtifactStore":
         store = cls()
         store.put_file(
@@ -174,7 +178,7 @@ class FileModelArtifactStore:
         *,
         model_id: str = "cqdagpcfg-model",
         artifact_uri: str | None = None,
-        chunk_size: int = 1 << 20,
+        chunk_size: int = DEFAULT_MODEL_CHUNK_SIZE,
     ) -> ModelArtifactManifest:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -380,7 +384,7 @@ class BoundedModelPageCache:
             self._evictions += 1
 
 
-def file_model_fingerprint(path: Path, *, block_size: int = 1 << 20) -> str:
+def file_model_fingerprint(path: Path, *, block_size: int = DEFAULT_FILE_HASH_BLOCK_SIZE) -> str:
     digest = sha256()
     with path.open("rb") as handle:
         while True:
@@ -405,6 +409,8 @@ def _page_offset(manifest: ModelArtifactManifest, offset: int) -> int:
 
 __all__ = [
     "BoundedModelPageCache",
+    "DEFAULT_FILE_HASH_BLOCK_SIZE",
+    "DEFAULT_MODEL_CHUNK_SIZE",
     "FileModelArtifactCache",
     "FileModelArtifactStore",
     "InMemoryModelArtifactStore",

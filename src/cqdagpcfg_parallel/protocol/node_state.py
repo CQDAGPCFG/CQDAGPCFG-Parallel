@@ -89,12 +89,6 @@ class NodeRuntimeState:
             return 0
         return max(0, self.effective_target_end - self.ready_end)
 
-    @property
-    def scheduling_gap(self) -> int:
-        if self.exhausted:
-            return 0
-        return max(0, self.effective_target_end - max(self.ready_end, self.scheduled_end))
-
     def register_demand(self, demand: Demand) -> None:
         if demand.node_id != self.node_id:
             raise ValueError("demand node_id does not match state")

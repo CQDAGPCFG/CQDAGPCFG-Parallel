@@ -12,7 +12,8 @@ services:
     <<: *cqdagpcfg-service
     command:
       - python
-      - experiments/src/prepare.py
+      - experiments/cqpcfg_experiment.py
+      - prepare
       - --source-model-path
       - /workspace/CQDAGPCFG/examples/artifacts/rockyou_train/model.json
       - --model-path
@@ -26,76 +27,37 @@ services:
       - --target-rank
       - "7"
 
-  hash-consumer-0:
-    <<: *cqdagpcfg-service
-    depends_on:
-      prepare:
-        condition: service_completed_successfully
-    command:
-      - python
-      - experiments/src/hash_consumer.py
-      - --targets-path
-      - /artifacts/targets.json
-      - --batch-connect
-      - cqpcfg://tracker:5556
-      - --ack-connect
-      - cqpcfg://tracker:5558
-      - --consumer-id
-      - hash-consumer-0
-      - --hits-path
-      - /artifacts/hits-0.json
-      - --overall-timeout-seconds
-      - "60"
-
-  hash-consumer-1:
-    <<: *cqdagpcfg-service
-    depends_on:
-      prepare:
-        condition: service_completed_successfully
-    command:
-      - python
-      - experiments/src/hash_consumer.py
-      - --targets-path
-      - /artifacts/targets.json
-      - --batch-connect
-      - cqpcfg://tracker:5556
-      - --ack-connect
-      - cqpcfg://tracker:5558
-      - --consumer-id
-      - hash-consumer-1
-      - --hits-path
-      - /artifacts/hits-1.json
-      - --overall-timeout-seconds
-      - "60"
-
   tracker:
     <<: *cqdagpcfg-service
     depends_on:
       prepare:
         condition: service_completed_successfully
-      hash-consumer-0:
-        condition: service_started
-      hash-consumer-1:
-        condition: service_started
     command:
       - python
-      - experiments/src/tracker.py
+      - experiments/cqpcfg_experiment.py
+      - tracker
       - --model-path
       - /artifacts/model.json
       - --targets-path
       - /artifacts/targets.json
-      - --control-bind
+      - --bind
       - cqpcfg://0.0.0.0:5555
-      - --batch-bind
-      - cqpcfg://0.0.0.0:5556
-      - --ack-bind
-      - cqpcfg://0.0.0.0:5558
-      - --consumer-count
-      - "2"
-      - --expected-workers
+      - --advertise-host
+      - tracker
+      - --total-nodes
+      - "5"
+      - --initial-generators
       - "3"
+      - --initial-consumers
+      - "2"
+      - --source-mode
+      - structure
       - --timeout-seconds
       - "60"
+      - --metrics-path
+      - /artifacts/metrics/tracker.json
+      - --metrics-flush-interval-seconds
+      - "0.25"
       - --checkpoint-path
       - /artifacts/tracker.checkpoint.json
       - --checkpoint-stable-log-path
@@ -105,94 +67,188 @@ services:
     ports:
       - "5555:5555"
       - "5556:5556"
+      - "5557:5557"
       - "5558:5558"
+      - "5559:5559"
 
-  generator-0:
+  node-0:
     <<: *cqdagpcfg-service
     depends_on:
       tracker:
         condition: service_started
-    command:
-      - python
-      - experiments/src/generator_worker.py
-      - --model-path
-      - /artifacts/model.json
-      - --targets-path
-      - /artifacts/targets.json
-      - --control-connect
-      - cqpcfg://tracker:5555
-      - --worker-id
-      - generator-0
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-0
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-0.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-0.json
+    command: python experiments/cqpcfg_experiment.py worker
 
-  generator-1:
+  node-1:
     <<: *cqdagpcfg-service
     depends_on:
       tracker:
         condition: service_started
-    command:
-      - python
-      - experiments/src/generator_worker.py
-      - --model-path
-      - /artifacts/model.json
-      - --targets-path
-      - /artifacts/targets.json
-      - --control-connect
-      - cqpcfg://tracker:5555
-      - --worker-id
-      - generator-1
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-1
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-1.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-1.json
+    command: python experiments/cqpcfg_experiment.py worker
 
-  generator-2:
+  node-2:
     <<: *cqdagpcfg-service
     depends_on:
       tracker:
         condition: service_started
-    command:
-      - python
-      - experiments/src/generator_worker.py
-      - --model-path
-      - /artifacts/model.json
-      - --targets-path
-      - /artifacts/targets.json
-      - --control-connect
-      - cqpcfg://tracker:5555
-      - --worker-id
-      - generator-2
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-2
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-2.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-2.json
+    command: python experiments/cqpcfg_experiment.py worker
 
-  generator-late:
+  node-3:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-3
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-3.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-3.json
+    command: python experiments/cqpcfg_experiment.py worker
+
+  node-4:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-4
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-4.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-4.json
+    command: python experiments/cqpcfg_experiment.py worker
+
+  node-late:
     <<: *cqdagpcfg-service
     profiles:
       - fault
     depends_on:
       tracker:
         condition: service_started
+    environment:
+      CQPCFG_CONNECT: cqpcfg://tracker:5555
+      CQPCFG_MODEL_CACHE_DIR: /artifacts/model-cache
+      CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS: "60"
+      CQPCFG_ROLE_REPLY_TIMEOUT_MS: "1000"
+      CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS: "0.25"
+      CQPCFG_NODE_ID: node-late
+      CQPCFG_METRICS_PATH: /artifacts/metrics/node-late.json
+      CQPCFG_HITS_PATH: /artifacts/hits-node-late.json
+    command: python experiments/cqpcfg_experiment.py worker
+
+  metrics-exporter:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
     command:
       - python
-      - experiments/src/generator_worker.py
-      - --model-path
-      - /artifacts/model.json
-      - --targets-path
-      - /artifacts/targets.json
-      - --control-connect
-      - cqpcfg://tracker:5555
-      - --worker-id
-      - generator-late
+      - experiments/cqpcfg_experiment.py
+      - metrics
+      - --metrics-dir
+      - /artifacts/metrics
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "9108"
+    ports:
+      - "9108:9108"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      metrics-exporter:
+        condition: service_started
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    depends_on:
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3300:3000"
 
   verify-hits:
     <<: *cqdagpcfg-service
     depends_on:
-      hash-consumer-0:
+      node-0:
         condition: service_completed_successfully
-      hash-consumer-1:
+      node-1:
+        condition: service_completed_successfully
+      node-2:
+        condition: service_completed_successfully
+      node-3:
+        condition: service_completed_successfully
+      node-4:
         condition: service_completed_successfully
     command:
       - python
-      - experiments/src/verify_hits.py
+      - experiments/cqpcfg_experiment.py
+      - verify
       - --targets-path
       - /artifacts/targets.json
       - --hits-path
-      - /artifacts/hits-0.json
+      - /artifacts/hits-node-0.json
       - --hits-path
-      - /artifacts/hits-1.json
+      - /artifacts/hits-node-1.json
+      - --hits-path
+      - /artifacts/hits-node-2.json
+      - --hits-path
+      - /artifacts/hits-node-3.json
+      - --hits-path
+      - /artifacts/hits-node-4.json
 
 volumes:
   artifacts:
+  grafana-data:
+  prometheus-data:

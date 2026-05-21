@@ -11,7 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from time import monotonic
 
-from common import ensure_project_paths, experiment_src_dir, repo_root, write_json
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from shared.common import ensure_project_paths, experiment_src_dir, repo_root, write_json
 
 ensure_project_paths()
 
@@ -206,7 +210,7 @@ def run_local_command(
 ) -> list[str]:
     return [
         python,
-        str(scripts_dir / "run_local.py"),
+        str(scripts_dir / "scenarios" / "run_local.py"),
         "--source-model-path",
         str(args.source_model_path),
         "--work-dir",
@@ -249,7 +253,7 @@ def fault_command(
 ) -> list[str]:
     return [
         python,
-        str(scripts_dir / "fault_injection.py"),
+        str(scripts_dir / "scenarios" / "fault_injection.py"),
         "--source-model-path",
         str(args.source_model_path),
         "--work-dir",

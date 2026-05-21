@@ -9,25 +9,42 @@ from .node_state import NodeRuntimeState, NodeStateTable
 from .types import ChunkSizePolicy, NodeId, WorkItem, WorkerId
 
 
+DEFAULT_FIXED_CHUNK_SIZE = 8
+DEFAULT_MIN_CHUNK_SIZE = 1
+DEFAULT_MAX_CHUNK_SIZE = 64
+DEFAULT_ENTROPY_LAMBDA = 0.25
+DEFAULT_PRIORITY_DONATION_WEIGHT = 1.0
+DEFAULT_CHILD_MISS_PENALTY = 1.0
+DEFAULT_TARGET_CHUNK_LATENCY_SECONDS = 0.05
+DEFAULT_LATENCY_FEEDBACK_MIN = 0.5
+DEFAULT_LATENCY_FEEDBACK_MAX = 2.0
+DEFAULT_FEEDBACK_EWMA_ALPHA = 0.25
+DEFAULT_NODE_AFFINITY_BONUS = 0.5
+DEFAULT_NODE_MIGRATION_PENALTY = 0.0
+DEFAULT_MAX_PARALLEL_LEASES_PER_NODE = 2
+DEFAULT_PARALLEL_LATENCY_FACTOR = 0.5
+MIN_EFFECTIVE_COST = 1e-12
+
+
 @dataclass(frozen=True, slots=True)
 class SchedulerConfig:
     policy: ChunkSizePolicy = ChunkSizePolicy.CQDAG_ADAPTIVE
-    fixed_chunk_size: int = 8
-    min_chunk_size: int = 1
-    max_chunk_size: int = 64
-    entropy_lambda: float = 0.25
-    priority_donation_weight: float = 1.0
-    child_miss_penalty: float = 1.0
-    target_chunk_latency_seconds: float = 0.05
-    latency_feedback_min: float = 0.5
-    latency_feedback_max: float = 2.0
-    feedback_ewma_alpha: float = 0.25
+    fixed_chunk_size: int = DEFAULT_FIXED_CHUNK_SIZE
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE
+    max_chunk_size: int = DEFAULT_MAX_CHUNK_SIZE
+    entropy_lambda: float = DEFAULT_ENTROPY_LAMBDA
+    priority_donation_weight: float = DEFAULT_PRIORITY_DONATION_WEIGHT
+    child_miss_penalty: float = DEFAULT_CHILD_MISS_PENALTY
+    target_chunk_latency_seconds: float = DEFAULT_TARGET_CHUNK_LATENCY_SECONDS
+    latency_feedback_min: float = DEFAULT_LATENCY_FEEDBACK_MIN
+    latency_feedback_max: float = DEFAULT_LATENCY_FEEDBACK_MAX
+    feedback_ewma_alpha: float = DEFAULT_FEEDBACK_EWMA_ALPHA
     runtime_feedback_enabled: bool = True
     node_affinity_enabled: bool = True
-    node_affinity_bonus: float = 0.5
-    node_migration_penalty: float = 0.0
-    max_parallel_leases_per_node: int = 2
-    parallel_latency_factor: float = 0.5
+    node_affinity_bonus: float = DEFAULT_NODE_AFFINITY_BONUS
+    node_migration_penalty: float = DEFAULT_NODE_MIGRATION_PENALTY
+    max_parallel_leases_per_node: int = DEFAULT_MAX_PARALLEL_LEASES_PER_NODE
+    parallel_latency_factor: float = DEFAULT_PARALLEL_LATENCY_FACTOR
 
     def __post_init__(self) -> None:
         if self.fixed_chunk_size <= 0:
@@ -253,14 +270,14 @@ class PriorityCostScheduler:
         self._last_worker_by_node[node_id] = worker_id
 
     def _effective_cost(self, state: NodeRuntimeState) -> float:
-        cost = max(state.estimated_cost, 1e-12)
+        cost = max(state.estimated_cost, MIN_EFFECTIVE_COST)
         if not self.config.runtime_feedback_enabled or state.feedback_count == 0:
             return cost
 
         cost *= 1.0 + self.config.child_miss_penalty * state.child_miss_rate
         if state.chunk_latency_ewma > self.config.target_chunk_latency_seconds:
             cost *= state.chunk_latency_ewma / self.config.target_chunk_latency_seconds
-        return max(cost, 1e-12)
+        return max(cost, MIN_EFFECTIVE_COST)
 
     def _chunk_size_for_gap(self, state: NodeRuntimeState, gap: int) -> int:
         if gap <= 0:
@@ -318,7 +335,22 @@ def _cqdag_adaptive_chunk_size(
 
 
 __all__ = [
+    "DEFAULT_CHILD_MISS_PENALTY",
+    "DEFAULT_ENTROPY_LAMBDA",
+    "DEFAULT_FEEDBACK_EWMA_ALPHA",
+    "DEFAULT_FIXED_CHUNK_SIZE",
+    "DEFAULT_LATENCY_FEEDBACK_MAX",
+    "DEFAULT_LATENCY_FEEDBACK_MIN",
+    "DEFAULT_MAX_CHUNK_SIZE",
+    "DEFAULT_MAX_PARALLEL_LEASES_PER_NODE",
+    "DEFAULT_MIN_CHUNK_SIZE",
+    "DEFAULT_NODE_AFFINITY_BONUS",
+    "DEFAULT_NODE_MIGRATION_PENALTY",
+    "DEFAULT_PARALLEL_LATENCY_FACTOR",
+    "DEFAULT_PRIORITY_DONATION_WEIGHT",
+    "DEFAULT_TARGET_CHUNK_LATENCY_SECONDS",
     "GapOnlyScheduler",
+    "MIN_EFFECTIVE_COST",
     "PriorityCostScheduler",
     "ScheduleStats",
     "SchedulerConfig",

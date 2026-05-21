@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from common import (
+_EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_SRC) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_SRC))
+
+from shared.common import (
     digest_guess,
     ensure_project_paths,
     load_training_passwords,

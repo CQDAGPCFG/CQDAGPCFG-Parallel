@@ -3,14 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from inspect import signature
 from threading import Event
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from cqdagpcfg_parallel.protocol import NodeId, SchedulerConfig, WorkerId
 from cqdagpcfg_parallel.runtime import CandidateBatch
-from cqdagpcfg_parallel.runtime.worker import LocalResultSource
-from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint
+from cqdagpcfg_parallel.runtime.worker import LazyLocalResultSource, LocalResultSource
+from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, ZmqEndpointBundle
 
-from .runner import SourceFactory, run_distributed_protocol
+from .node_agent import NodeAgent, NodeAgentStats, NodeAgentStatsCallback
+from .resources import WorkerResourceSpec, parse_byte_size
+from .role_control import RoleClient
+from .runner import run_distributed_protocol
 from .tracker import DistributedProtocolConfig, DistributedProtocolTracker, DistributedRunResult
 from .worker import DistributedProtocolWorker, DistributedWorkerStats
 
@@ -122,6 +125,7 @@ class AnnotatedWorker:
     wait_sleep_seconds: float
     work_delay_seconds: float
     model_fingerprint: str | None = None
+    resources: WorkerResourceSpec = WorkerResourceSpec()
 
     def build(self, *, context: Any | None = None) -> DistributedProtocolWorker:
         return DistributedProtocolWorker(
@@ -139,6 +143,63 @@ class AnnotatedWorker:
 
     def __call__(self) -> LocalResultSource:
         return self.generator.source_for(self.worker_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AnnotatedNodeAgent:
+    generator: AnnotatedGenerator
+    consumer: AnnotatedConsumer
+    node_id: str
+    control_connect: ZmqEndpoint
+    batch_connect: ZmqEndpoint
+    role_connect: ZmqEndpoint
+    ack_connect: ZmqEndpoint | None
+    resources: WorkerResourceSpec
+    role_reply_timeout_ms: int
+    model_fingerprint: str | None = None
+    work_delay_seconds: float = 0.0
+    receive_timeout_ms: int = 100
+    consumer_drain_quiet_ms: int = 200
+    consumer_drain_timeout_ms: int = 2000
+    idle_sleep_seconds: float = 0.01
+    role_refresh_interval_seconds: float = 0.05
+    stats_flush_interval_seconds: float = 0.25
+    stats_callback: NodeAgentStatsCallback | None = None
+
+    def build(self) -> NodeAgent:
+        role_client = RoleClient(
+            node_id=self.node_id,
+            endpoint=self.role_connect,
+            reply_timeout_ms=self.role_reply_timeout_ms,
+        )
+        source = LazyLocalResultSource(
+            lambda: self.generator.source_for(WorkerId(self.node_id))
+        )
+        return NodeAgent(
+            node_id=self.node_id,
+            role_client=role_client,
+            control_endpoint=self.control_connect,
+            batch_endpoint=self.batch_connect,
+            ack_endpoint=self.ack_connect,
+            source=source,
+            consume_batch=self.consumer.publish,
+            model_fingerprint=self.model_fingerprint,
+            work_delay_seconds=self.work_delay_seconds,
+            receive_timeout_ms=self.receive_timeout_ms,
+            consumer_drain_quiet_ms=self.consumer_drain_quiet_ms,
+            consumer_drain_timeout_ms=self.consumer_drain_timeout_ms,
+            idle_sleep_seconds=self.idle_sleep_seconds,
+            role_refresh_interval_seconds=self.role_refresh_interval_seconds,
+            stats_flush_interval_seconds=self.stats_flush_interval_seconds,
+            stats_callback=self.stats_callback,
+            resources=self.resources,
+        )
+
+    def run(self) -> NodeAgentStats:
+        return self.build().run()
+
+    def __call__(self) -> LocalResultSource:
+        return self.generator.source_for(WorkerId(self.node_id))
 
 
 def cqpcfg_generator(source_factory: WorkerSourceFactory) -> AnnotatedGenerator:
@@ -251,6 +312,13 @@ def cqpcfg_worker(
     wait_sleep_seconds: float = 0.001,
     work_delay_seconds: float = 0.0,
     model_fingerprint: str | None = None,
+    resources: WorkerResourceSpec | None = None,
+    resource_cpus: float | None = None,
+    resource_memory: str | int | None = None,
+    resource_gpus: int | None = None,
+    resource_gpu_memory: str | int | None = None,
+    model_json_page_cache: int | None = None,
+    resource_labels: Mapping[str, str] | None = None,
 ) -> Callable[[AnnotatedGenerator], AnnotatedWorker]:
     parsed_connect = _coerce_bind_or_connect(
         primary=connect,
@@ -259,6 +327,15 @@ def cqpcfg_worker(
         label="connect",
     )
     parsed_worker_id = WorkerId(str(worker_id))
+    parsed_resources = _coerce_worker_resources(
+        resources=resources,
+        resource_cpus=resource_cpus,
+        resource_memory=resource_memory,
+        resource_gpus=resource_gpus,
+        resource_gpu_memory=resource_gpu_memory,
+        model_json_page_cache=model_json_page_cache,
+        resource_labels=resource_labels,
+    )
 
     def decorator(generator: AnnotatedGenerator) -> AnnotatedWorker:
         _require_generator(generator)
@@ -269,6 +346,76 @@ def cqpcfg_worker(
             wait_sleep_seconds=wait_sleep_seconds,
             work_delay_seconds=work_delay_seconds,
             model_fingerprint=model_fingerprint,
+            resources=parsed_resources,
+        )
+
+    return decorator
+
+
+def cqpcfg_node_agent(
+    *,
+    connect: str | None = None,
+    control_connect: str | ZmqEndpoint | None = None,
+    batch_connect: str | ZmqEndpoint | None = None,
+    role_connect: str | ZmqEndpoint | None = None,
+    ack_connect: str | ZmqEndpoint | None = None,
+    node_id: str | WorkerId,
+    role_reply_timeout_ms: int = 100,
+    model_fingerprint: str | None = None,
+    work_delay_seconds: float = 0.0,
+    receive_timeout_ms: int = 100,
+    consumer_drain_quiet_ms: int = 200,
+    consumer_drain_timeout_ms: int = 2000,
+    idle_sleep_seconds: float = 0.01,
+    role_refresh_interval_seconds: float = 0.05,
+    stats_flush_interval_seconds: float = 0.25,
+    stats_callback: NodeAgentStatsCallback | None = None,
+    resources: WorkerResourceSpec | None = None,
+    resource_cpus: float | None = None,
+    resource_memory: str | int | None = None,
+    resource_gpus: int | None = None,
+    resource_gpu_memory: str | int | None = None,
+    model_json_page_cache: int | None = None,
+    resource_labels: Mapping[str, str] | None = None,
+) -> Callable[[type[Any]], AnnotatedNodeAgent]:
+    endpoints = _coerce_node_agent_endpoints(
+        connect=connect,
+        control_connect=control_connect,
+        batch_connect=batch_connect,
+        role_connect=role_connect,
+        ack_connect=ack_connect,
+    )
+    parsed_resources = _coerce_worker_resources(
+        resources=resources,
+        resource_cpus=resource_cpus,
+        resource_memory=resource_memory,
+        resource_gpus=resource_gpus,
+        resource_gpu_memory=resource_gpu_memory,
+        model_json_page_cache=model_json_page_cache,
+        resource_labels=resource_labels,
+    )
+
+    def decorator(candidate: type[Any]) -> AnnotatedNodeAgent:
+        generator, resolved_consumer = _resolve_node_agent_components(candidate)
+        return AnnotatedNodeAgent(
+            generator=generator,
+            consumer=resolved_consumer,
+            node_id=str(node_id),
+            control_connect=endpoints.control,
+            batch_connect=endpoints.batch,
+            role_connect=endpoints.role,
+            ack_connect=endpoints.ack,
+            resources=parsed_resources,
+            role_reply_timeout_ms=role_reply_timeout_ms,
+            model_fingerprint=model_fingerprint,
+            work_delay_seconds=work_delay_seconds,
+            receive_timeout_ms=receive_timeout_ms,
+            consumer_drain_quiet_ms=consumer_drain_quiet_ms,
+            consumer_drain_timeout_ms=consumer_drain_timeout_ms,
+            idle_sleep_seconds=idle_sleep_seconds,
+            role_refresh_interval_seconds=role_refresh_interval_seconds,
+            stats_flush_interval_seconds=stats_flush_interval_seconds,
+            stats_callback=stats_callback,
         )
 
     return decorator
@@ -295,6 +442,147 @@ def _coerce_bind_or_connect(
     return _coerce_endpoint(selected, bind=bind)
 
 
+def _coerce_worker_resources(
+    *,
+    resources: WorkerResourceSpec | None,
+    resource_cpus: float | None,
+    resource_memory: str | int | None,
+    resource_gpus: int | None,
+    resource_gpu_memory: str | int | None,
+    model_json_page_cache: int | None,
+    resource_labels: Mapping[str, str] | None,
+) -> WorkerResourceSpec:
+    granular_resource_args = (
+        resource_cpus,
+        resource_memory,
+        resource_gpus,
+        resource_gpu_memory,
+        model_json_page_cache,
+    )
+    has_granular_resource_args = any(value is not None for value in granular_resource_args)
+    if resources is not None and (has_granular_resource_args or resource_labels):
+        raise ValueError("use either resources=... or resource_* arguments, not both")
+    if resources is not None:
+        return resources
+    return WorkerResourceSpec(
+        cpu_cores=resource_cpus,
+        memory_bytes=parse_byte_size(resource_memory),
+        gpu_count=resource_gpus,
+        gpu_memory_bytes=parse_byte_size(resource_gpu_memory),
+        model_json_page_cache=model_json_page_cache,
+        labels=dict(resource_labels or {}),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeAgentEndpoints:
+    control: ZmqEndpoint
+    batch: ZmqEndpoint
+    role: ZmqEndpoint
+    ack: ZmqEndpoint | None
+
+
+def _coerce_node_agent_endpoints(
+    *,
+    connect: str | None,
+    control_connect: str | ZmqEndpoint | None,
+    batch_connect: str | ZmqEndpoint | None,
+    role_connect: str | ZmqEndpoint | None,
+    ack_connect: str | ZmqEndpoint | None,
+) -> _NodeAgentEndpoints:
+    if connect is not None:
+        bundle = ZmqEndpointBundle.from_base_uri(connect)
+        control_connect = control_connect or bundle.control
+        batch_connect = batch_connect or bundle.batch
+        role_connect = role_connect or bundle.role
+        ack_connect = ack_connect or bundle.ack
+    if control_connect is None:
+        raise ValueError("control_connect is required when connect is not provided")
+    if batch_connect is None:
+        raise ValueError("batch_connect is required when connect is not provided")
+    if role_connect is None:
+        raise ValueError("role_connect is required when connect is not provided")
+    return _NodeAgentEndpoints(
+        control=_coerce_endpoint(control_connect, bind=False),
+        batch=_coerce_endpoint(batch_connect, bind=False),
+        role=_coerce_endpoint(role_connect, bind=False),
+        ack=_coerce_endpoint(ack_connect, bind=False) if ack_connect is not None else None,
+    )
+
+
+def _resolve_node_agent_components(
+    candidate: type[Any],
+) -> tuple[AnnotatedGenerator, AnnotatedConsumer]:
+    if not isinstance(candidate, type):
+        raise TypeError("@cqpcfg_node_agent must decorate a class")
+
+    instance = candidate()
+    generator = _single_component(
+        _bind_class_components(instance, AnnotatedGenerator),
+        component_name="generator",
+        decorator_name="@cqpcfg_generator",
+    )
+    consumer = _single_component(
+        _bind_class_components(instance, AnnotatedConsumer),
+        component_name="consumer",
+        decorator_name="@cqpcfg_consumer",
+    )
+    assert isinstance(generator, AnnotatedGenerator)
+    assert isinstance(consumer, AnnotatedConsumer)
+    return generator, consumer
+
+
+def _bind_class_components(
+    instance: object,
+    component_type: type[AnnotatedGenerator] | type[AnnotatedConsumer],
+) -> list[AnnotatedGenerator] | list[AnnotatedConsumer]:
+    components = []
+    for value in vars(type(instance)).values():
+        if not isinstance(value, component_type):
+            continue
+        if isinstance(value, AnnotatedGenerator):
+            components.append(
+                AnnotatedGenerator(
+                    factory=_bind_callable(value.factory, instance),
+                )
+            )
+        else:
+            components.append(
+                AnnotatedConsumer(
+                    handler=_bind_callable(value.handler, instance),
+                    close_handler=(
+                        _bind_callable(value.close_handler, instance)
+                        if value.close_handler is not None
+                        else None
+                    ),
+                )
+            )
+    return components
+
+
+def _bind_callable(func: Callable[..., Any], instance: object) -> Callable[..., Any]:
+    bind = getattr(func, "__get__", None)
+    if not callable(bind):
+        return func
+    return bind(instance, type(instance))
+
+
+def _single_component(
+    components: list[AnnotatedGenerator] | list[AnnotatedConsumer],
+    *,
+    component_name: str,
+    decorator_name: str,
+    required: bool = True,
+) -> AnnotatedGenerator | AnnotatedConsumer | None:
+    if len(components) == 1:
+        return components[0]
+    if len(components) > 1:
+        raise ValueError(f"node agent class must define exactly one {decorator_name} method")
+    if required:
+        raise ValueError(f"node agent class must define a {decorator_name} {component_name}")
+    return None
+
+
 def _call_source_factory(
     source_factory: WorkerSourceFactory,
     worker_id: WorkerId,
@@ -313,11 +601,13 @@ __all__ = [
     "AnnotatedDistributedProtocol",
     "AnnotatedConsumer",
     "AnnotatedGenerator",
+    "AnnotatedNodeAgent",
     "AnnotatedTracker",
     "AnnotatedWorker",
     "cqpcfg_consumer",
     "cqpcfg_distributed",
     "cqpcfg_generator",
+    "cqpcfg_node_agent",
     "cqpcfg_tracker",
     "cqpcfg_worker",
 ]

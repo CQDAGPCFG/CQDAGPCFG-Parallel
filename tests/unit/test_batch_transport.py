@@ -14,6 +14,7 @@ from cqdagpcfg_parallel.runtime import (
     JsonCandidateBatchCodec,
     MemoryBatchSink,
     ZmqEndpoint,
+    ZmqEndpointBundle,
     ZmqPullBatchAckSource,
     ZmqPullBatchSource,
     ZmqPushBatchAckSink,
@@ -241,3 +242,16 @@ def test_cqpcfg_uri_maps_to_tcp_endpoint() -> None:
     assert not endpoint.bind
     assert endpoint.high_watermark == 3
     assert endpoint.linger_ms == 4
+
+
+def test_endpoint_bundle_derives_protocol_subchannels() -> None:
+    bundle = ZmqEndpointBundle.from_base_uri(
+        "cqpcfg://0.0.0.0:5555?hwm=3",
+        advertise_host="tracker.example",
+    )
+
+    assert bundle.control == "cqpcfg://tracker.example:5555?hwm=3"
+    assert bundle.batch == "cqpcfg://tracker.example:5556?hwm=3"
+    assert bundle.role == "cqpcfg://tracker.example:5557?hwm=3"
+    assert bundle.ack == "cqpcfg://tracker.example:5558?hwm=3"
+    assert bundle.model == "cqpcfg://tracker.example:5559?hwm=3"

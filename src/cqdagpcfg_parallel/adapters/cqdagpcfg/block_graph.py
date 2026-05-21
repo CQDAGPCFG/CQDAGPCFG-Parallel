@@ -12,6 +12,7 @@ from CQDAGPCFG.enumeration.optimized.blocks import (
     SharedBlock,
     SingleConsumerBlock,
 )
+from CQDAGPCFG.enumeration.optimized.builders import BlockFactoryBuilder
 from CQDAGPCFG.enumeration.optimized.factory import OptimizedBlockFactory
 from CQDAGPCFG.enumeration.types import flatten_rank_key
 
@@ -41,6 +42,7 @@ from .serial_oracle import SerialCQDAGOracle
 
 ROOT_NODE_ID = NodeId("root")
 _SOURCE_SKIP_ACK_WINDOW = 64
+_SERIAL_PROBABILITY_ROUND_DIGITS = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +79,7 @@ class CQDAGRecordSource:
         node_id: NodeId = ROOT_NODE_ID,
         max_records: int,
         prefer_cpp: bool = True,
+        factory_builder: BlockFactoryBuilder | None = None,
     ) -> None:
         if max_records < 0:
             raise ValueError("max_records cannot be negative")
@@ -84,7 +87,12 @@ class CQDAGRecordSource:
         self.node_id = node_id
         self.max_records = max_records
         self.prefer_cpp = prefer_cpp
-        self.oracle = SerialCQDAGOracle(model, prefer_cpp=prefer_cpp)
+        self.factory_builder = factory_builder
+        self.oracle = SerialCQDAGOracle(
+            model,
+            prefer_cpp=prefer_cpp,
+            factory_builder=factory_builder,
+        )
         self._iterator = iter(self.oracle.iter_records(max_records))
         self._cache: list[GuessRecord] = []
         self._cache_base = 0
@@ -168,7 +176,11 @@ class CQDAGRecordSource:
         self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
 
     def _restart_from_zero(self) -> None:
-        self.oracle = SerialCQDAGOracle(self.model, prefer_cpp=self.prefer_cpp)
+        self.oracle = SerialCQDAGOracle(
+            self.model,
+            prefer_cpp=self.prefer_cpp,
+            factory_builder=self.factory_builder,
+        )
         self._iterator = iter(self.oracle.iter_records(self.max_records))
         self._cache = []
         self._cache_base = 0
@@ -423,7 +435,11 @@ class CQDAGBlockGraphAdapter:
     def serial_order_key(self, record: GuessRecord) -> tuple[float, int, tuple[int, ...]]:
         # Match CQDAGPCFG's probability ordering while absorbing tiny log/product
         # roundoff differences between structure-local streams.
-        return (-round(record.prob, 15), record.structure_index, record.ranks)
+        return (
+            -round(record.prob, _SERIAL_PROBABILITY_ROUND_DIGITS),
+            record.structure_index,
+            record.ranks,
+        )
 
     def model_entropy(self) -> float:
         return sum(self._slot_entropy(symbol) for symbol in self.model.slot_tables)

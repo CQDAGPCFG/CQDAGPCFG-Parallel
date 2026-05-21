@@ -38,7 +38,7 @@ def workspace_root() -> Path:
 
 
 def experiment_src_dir() -> Path:
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parents[1]
 
 
 def ensure_project_paths() -> None:
