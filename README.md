@@ -17,8 +17,9 @@ src/cqdagpcfg_parallel/
   protocol/            # protocol state machine, chunk, lease, demand
   simulation/          # deterministic simulator and semantic checks
   runtime/             # local workers, threaded executor, metrics
-  control_plane/       # future HTTP/WebSocket/gRPC control plane
-  storage/             # future checkpoint and durable chunk manifest
+  distributed/         # ZeroMQ tracker/worker distributed executor
+  control_plane/       # worker registration and heartbeat model
+  storage/             # checkpoint and durable chunk manifest types
 tests/
   unit/                # state/chunk/lease 단위 테스트
   semantic/            # serial oracle prefix 비교 테스트
@@ -35,4 +36,19 @@ experiments/           # scheduling/performance experiments
 python -m pip install -e ../CQDAGPCFG
 python -m pip install -e .[dev]
 python -m pytest
+```
+
+## Annotation API
+
+```python
+from cqdagpcfg_parallel.distributed import cqpcfg_distributed, cqpcfg_generator
+
+
+@cqpcfg_distributed(limit=80, worker_count=3, policy="entropy_adaptive")
+@cqpcfg_generator
+def source(worker_id):
+    return make_local_result_source(worker_id)
+
+
+result, workers = source.run()
 ```

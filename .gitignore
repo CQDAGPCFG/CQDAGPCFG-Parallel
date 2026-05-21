@@ -17,6 +17,7 @@ dist/
 
 artifacts/
 checkpoints/
+experiments/results/
 *.sqlite3
 *.db
 *.tmp

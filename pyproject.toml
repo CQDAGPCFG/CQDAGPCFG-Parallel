@@ -16,12 +16,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+zmq = [
+  "pyzmq>=25"
+]
 dev = [
-  "pytest>=8"
+  "pytest>=8",
+  "pyzmq>=25"
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+cqdagpcfg_parallel = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

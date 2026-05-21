@@ -1,0 +1,198 @@
+x-cqdagpcfg-service: &cqdagpcfg-service
+  build:
+    context: ../..
+    dockerfile: experiments/docker/Dockerfile
+  volumes:
+    - ../../:/workspace/CQDAGPCFG-Parallel:ro
+    - ../../../CQDAGPCFG:/workspace/CQDAGPCFG:ro
+    - artifacts:/artifacts
+
+services:
+  prepare:
+    <<: *cqdagpcfg-service
+    command:
+      - python
+      - experiments/src/prepare.py
+      - --source-model-path
+      - /workspace/CQDAGPCFG/examples/artifacts/rockyou_train/model.json
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --limit
+      - "80"
+      - --target-rank
+      - "0"
+      - --target-rank
+      - "7"
+
+  hash-consumer-0:
+    <<: *cqdagpcfg-service
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    command:
+      - python
+      - experiments/src/hash_consumer.py
+      - --targets-path
+      - /artifacts/targets.json
+      - --batch-connect
+      - cqpcfg://tracker:5556
+      - --ack-connect
+      - cqpcfg://tracker:5558
+      - --consumer-id
+      - hash-consumer-0
+      - --hits-path
+      - /artifacts/hits-0.json
+      - --overall-timeout-seconds
+      - "60"
+
+  hash-consumer-1:
+    <<: *cqdagpcfg-service
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    command:
+      - python
+      - experiments/src/hash_consumer.py
+      - --targets-path
+      - /artifacts/targets.json
+      - --batch-connect
+      - cqpcfg://tracker:5556
+      - --ack-connect
+      - cqpcfg://tracker:5558
+      - --consumer-id
+      - hash-consumer-1
+      - --hits-path
+      - /artifacts/hits-1.json
+      - --overall-timeout-seconds
+      - "60"
+
+  tracker:
+    <<: *cqdagpcfg-service
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+      hash-consumer-0:
+        condition: service_started
+      hash-consumer-1:
+        condition: service_started
+    command:
+      - python
+      - experiments/src/tracker.py
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --control-bind
+      - cqpcfg://0.0.0.0:5555
+      - --batch-bind
+      - cqpcfg://0.0.0.0:5556
+      - --ack-bind
+      - cqpcfg://0.0.0.0:5558
+      - --consumer-count
+      - "2"
+      - --expected-workers
+      - "3"
+      - --timeout-seconds
+      - "60"
+      - --checkpoint-path
+      - /artifacts/tracker.checkpoint.json
+      - --checkpoint-stable-log-path
+      - /artifacts/stable-records.jsonl
+      - --batch-checkpoint-path
+      - /artifacts/batch.checkpoint.json
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+      - "5558:5558"
+
+  generator-0:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
+    command:
+      - python
+      - experiments/src/generator_worker.py
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --control-connect
+      - cqpcfg://tracker:5555
+      - --worker-id
+      - generator-0
+
+  generator-1:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
+    command:
+      - python
+      - experiments/src/generator_worker.py
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --control-connect
+      - cqpcfg://tracker:5555
+      - --worker-id
+      - generator-1
+
+  generator-2:
+    <<: *cqdagpcfg-service
+    depends_on:
+      tracker:
+        condition: service_started
+    command:
+      - python
+      - experiments/src/generator_worker.py
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --control-connect
+      - cqpcfg://tracker:5555
+      - --worker-id
+      - generator-2
+
+  generator-late:
+    <<: *cqdagpcfg-service
+    profiles:
+      - fault
+    depends_on:
+      tracker:
+        condition: service_started
+    command:
+      - python
+      - experiments/src/generator_worker.py
+      - --model-path
+      - /artifacts/model.json
+      - --targets-path
+      - /artifacts/targets.json
+      - --control-connect
+      - cqpcfg://tracker:5555
+      - --worker-id
+      - generator-late
+
+  verify-hits:
+    <<: *cqdagpcfg-service
+    depends_on:
+      hash-consumer-0:
+        condition: service_completed_successfully
+      hash-consumer-1:
+        condition: service_completed_successfully
+    command:
+      - python
+      - experiments/src/verify_hits.py
+      - --targets-path
+      - /artifacts/targets.json
+      - --hits-path
+      - /artifacts/hits-0.json
+      - --hits-path
+      - /artifacts/hits-1.json
+
+volumes:
+  artifacts:

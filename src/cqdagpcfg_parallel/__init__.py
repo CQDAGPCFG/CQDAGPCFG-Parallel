@@ -1,5 +1,16 @@
-"""Parallel protocol experiments built on top of the CQDAGPCFG library."""
+"""Memory-bounded distributed protocol runtime for CQDAGPCFG."""
+
+from .distributed import NodeAgent, RoleClient, RoleController
+from .runtime import CandidateBatch, CandidateBatchSink, CandidateBatchSource
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+__all__ = [
+    "CandidateBatch",
+    "CandidateBatchSink",
+    "CandidateBatchSource",
+    "NodeAgent",
+    "RoleClient",
+    "RoleController",
+    "__version__",
+]
