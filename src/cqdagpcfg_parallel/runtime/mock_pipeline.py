@@ -7,6 +7,8 @@ from typing import Iterable
 
 from CQDAGPCFG import GuessRecord
 
+from cqdagpcfg_parallel.protocol import stable_record_string
+
 from .batching import make_candidate_batches
 from .candidate_queue import BoundedCandidateQueue
 
@@ -118,7 +120,7 @@ def run_candidate_pipeline(
                     completed_ids.append(batch.batch_id)
                     if config.collect_outputs:
                         collected_stable_records.extend(
-                            record.stable_string() for record in batch.records
+                            stable_record_string(record) for record in batch.records
                         )
                     inflight_batches -= 1
                     inflight_payload_bytes -= batch.payload_bytes

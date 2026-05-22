@@ -55,6 +55,7 @@ from .node_bootstrap import (
     NodeEndpointConfig,
     expand_node_endpoints,
     fetch_job_context,
+    job_payload_from_job_context,
     resolve_node_id,
     safe_node_filename,
     targets_from_job_context,
@@ -71,6 +72,7 @@ from .role_allocator import (
     RoleAllocationInput,
     RoleAllocationPlan,
     RoleAssignment,
+    RoleSwitchPayback,
     ThroughputOptimalRoleAllocator,
 )
 from .tracker import DistributedProtocolConfig, DistributedProtocolTracker, DistributedRunResult
@@ -105,6 +107,7 @@ __all__ = [
     "RoleAllocationInput",
     "RoleAllocationPlan",
     "RoleAssignment",
+    "RoleSwitchPayback",
     "RoleClient",
     "RoleControlReply",
     "RoleControlStats",
@@ -132,6 +135,7 @@ __all__ = [
     "content_digest",
     "expand_node_endpoints",
     "fetch_job_context",
+    "job_payload_from_job_context",
     "ready_message",
     "retire_message",
     "migrate_abort_message",

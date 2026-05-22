@@ -28,8 +28,10 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     cqdagpcfg_remote,
     cqdagpcfg_tracker as cqdagpcfg_tracker_adapter,
 )
+from cqdagpcfg_parallel.adapters.cqdagpcfg.tracker_service import (
+    effective_max_parallel_leases_per_node,
+)
 from cqdagpcfg_parallel.runtime import CandidateBatch, publish_record_batches
-from cqdagpcfg_parallel.runtime import HashTargetSet
 from cqdagpcfg_parallel.simulation import SequenceRecordSource
 
 
@@ -151,7 +153,7 @@ def test_cqdagpcfg_node_agent_annotation_is_user_facing() -> None:
         connect="cqpcfg://127.0.0.1:5555",
         node_id="node-0",
         metrics_dir=Path("/tmp/metrics"),
-        hits_dir=Path("/tmp/hits"),
+        outputs_dir=Path("/tmp/outputs"),
     )
 
     @cqdagpcfg_node_agent(config)
@@ -174,7 +176,7 @@ def test_cqdagpcfg_node_agent_annotation_accepts_overrides() -> None:
         connect="cqpcfg://127.0.0.1:5555",
         node_id="node-0",
         metrics_dir=Path("/tmp/metrics"),
-        hits_dir=Path("/tmp/hits"),
+        outputs_dir=Path("/tmp/outputs"),
     )
 
     @cqdagpcfg_node_agent(base, node_id="node-1", resource_cpus=2.0)
@@ -190,6 +192,41 @@ def test_cqdagpcfg_node_agent_annotation_accepts_overrides() -> None:
     assert ExperimentNode.config.node_id == "node-1"
     assert ExperimentNode.config.connect == base.connect
     assert ExperimentNode.config.resource_cpus == 2.0
+
+
+def test_cqdagpcfg_tracker_can_read_advanced_options_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("CQPCFG_ACK_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("CQPCFG_BATCH_SIZE", "64")
+    monkeypatch.setenv("CQPCFG_CONSUMER_MIN_GPUS", "1")
+    monkeypatch.setenv("CQPCFG_DISABLE_RECLAIM", "true")
+
+    @cqdagpcfg_tracker_adapter(
+        env_prefix="CQPCFG",
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+        total_nodes=3,
+    )
+    class ExperimentTracker:
+        pass
+
+    assert isinstance(ExperimentTracker, AnnotatedCQDAGPCFGTracker)
+    assert ExperimentTracker.config.model_path == Path("/tmp/model.json")
+    assert ExperimentTracker.config.job_spec_path == Path("/tmp/job-spec.json")
+    assert ExperimentTracker.config.total_nodes == 3
+    assert ExperimentTracker.config.ack_timeout_seconds == 12.5
+    assert ExperimentTracker.config.batch_size == 64
+    assert ExperimentTracker.config.consumer_min_gpus == 1
+    assert ExperimentTracker.config.disable_reclaim is True
+
+
+def test_cqdagpcfg_tracker_rejects_config_with_env_prefix() -> None:
+    config = CqdagTrackerServiceConfig(
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+    )
+
+    with pytest.raises(ValueError, match="config or env_prefix"):
+        cqdagpcfg_tracker_adapter(config, env_prefix="CQPCFG")
 
 
 def test_cqdagpcfg_consumer_can_handle_candidates_without_batch_metadata() -> None:
@@ -232,12 +269,43 @@ def test_cqdagpcfg_consumer_can_handle_candidates_without_batch_metadata() -> No
     ]
 
 
+def test_cqdagpcfg_consumer_treats_string_result_as_generic_value() -> None:
+    records = (
+        GuessRecord(
+            prob=1.0,
+            guess="g0",
+            structure_index=0,
+            structure_name="A",
+            ranks=(0,),
+        ),
+    )
+    batch = CandidateBatch.from_records(batch_id=7, start_rank=10, records=records)
+
+    @cqdagpcfg_consumer
+    def consume(guess: str):
+        return "digest-0" if guess == "g0" else None
+
+    assert consume.handler(batch) == [
+        {
+            "batch_id": 7,
+            "offset": 0,
+            "rank": 10,
+            "guess": "g0",
+            "prob": 1.0,
+            "structure_index": 0,
+            "structure_name": "A",
+            "ranks": (0,),
+            "value": "digest-0",
+        }
+    ]
+
+
 def test_cqdagpcfg_remote_infers_ray_style_node_methods() -> None:
     base = CqdagNodeAgentServiceConfig(
         connect="cqpcfg://127.0.0.1:5555",
         node_id="node-0",
         metrics_dir=Path("/tmp/metrics"),
-        hits_dir=Path("/tmp/hits"),
+        outputs_dir=Path("/tmp/outputs"),
     )
 
     @cqdagpcfg_remote(base, num_cpus=2.0, memory="4g", num_gpus=1)
@@ -312,7 +380,7 @@ def test_cqdagpcfg_remote_rejects_config_with_env_prefix() -> None:
         connect="cqpcfg://127.0.0.1:5555",
         node_id="node-0",
         metrics_dir=Path("/tmp/metrics"),
-        hits_dir=Path("/tmp/hits"),
+        outputs_dir=Path("/tmp/outputs"),
     )
 
     with pytest.raises(ValueError, match="config or env_prefix"):
@@ -477,37 +545,12 @@ def test_cqdagpcfg_remote_accepts_bare_ray_style_decoration() -> None:
     assert isinstance(BareNode.node_class.__dict__["consume"], AnnotatedConsumer)
 
 
-def test_hash_target_set_matches_tracker_provided_digest() -> None:
-    targets = HashTargetSet(
-        {
-            "algorithm": "sha256",
-            "targets": [
-                {
-                    "rank": 3,
-                    "guess": "g0",
-                    "hash": "f21b0ef89d8ee5daf6ba6cd441652a647229941e85b1537b5c35ede6b4d519a8",
-                }
-            ],
-        }
-    )
-
-    digest = "f21b0ef89d8ee5daf6ba6cd441652a647229941e85b1537b5c35ede6b4d519a8"
-
-    assert targets.matches_for_digest(digest) == [
-        {
-            "target_rank": 3,
-            "hash": digest,
-        }
-    ]
-    assert targets.matches_for_digest("missing") == []
-
-
 def test_cqdagpcfg_node_agent_requires_explicit_generator_and_consumer() -> None:
     config = CqdagNodeAgentServiceConfig(
         connect="cqpcfg://127.0.0.1:5555",
         node_id="node-0",
         metrics_dir=Path("/tmp/metrics"),
-        hits_dir=Path("/tmp/hits"),
+        outputs_dir=Path("/tmp/outputs"),
     )
 
     with pytest.raises(ValueError, match="@cqdagpcfg_generator"):
@@ -530,7 +573,7 @@ def test_cqdagpcfg_node_agent_requires_explicit_generator_and_consumer() -> None
 def test_cqdagpcfg_tracker_annotation_is_user_facing() -> None:
     config = CqdagTrackerServiceConfig(
         model_path=Path("/tmp/model.json"),
-        targets_path=Path("/tmp/targets.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
         bind="cqpcfg://0.0.0.0:5555",
     )
 
@@ -550,7 +593,7 @@ def test_cqdagpcfg_tracker_annotation_is_user_facing() -> None:
 def test_cqdagpcfg_tracker_annotation_accepts_overrides() -> None:
     base = CqdagTrackerServiceConfig(
         model_path=Path("/tmp/model.json"),
-        targets_path=Path("/tmp/targets.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
         batch_size=16,
     )
 
@@ -561,6 +604,24 @@ def test_cqdagpcfg_tracker_annotation_accepts_overrides() -> None:
     assert ExperimentTracker.config.model_path == base.model_path
     assert ExperimentTracker.config.batch_size == 32
     assert ExperimentTracker.config.timeout_seconds == 10.0
+
+
+def test_root_mode_caps_parallel_leases_for_serial_stream() -> None:
+    root = CqdagTrackerServiceConfig(
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+        source_mode="root",
+        max_parallel_leases_per_node=8,
+    )
+    structure = CqdagTrackerServiceConfig(
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+        source_mode="structure",
+        max_parallel_leases_per_node=8,
+    )
+
+    assert effective_max_parallel_leases_per_node(root) == 1
+    assert effective_max_parallel_leases_per_node(structure) == 8
 
 
 def test_node_agent_annotation_accepts_explicit_subchannel_connects() -> None:

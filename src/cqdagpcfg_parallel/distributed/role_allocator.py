@@ -50,11 +50,13 @@ class RoleAllocationInput:
     generator_rate_per_node: float
     consumer_rate_per_node: float
     current_generator_count: int | None = None
+    remaining_candidates: int | None = None
     pending_candidates: int = 0
     max_pending_candidates: int = 0
     generator_idle_ratio: float = 0.0
     consumer_idle_ratio: float = 0.0
     migration_cost_per_role_swap: float = 0.0
+    role_swap_cost_seconds: float = 1.0
     cqdag_frontier_pressure: float = 0.0
     cqdag_priority_pressure: float = 0.0
     cqdag_reclaim_pressure: float = 0.0
@@ -71,6 +73,8 @@ class RoleAllocationInput:
             0 <= self.current_generator_count <= self.total_nodes
         ):
             raise ValueError("current_generator_count must be within total_nodes")
+        if self.remaining_candidates is not None and self.remaining_candidates < 0:
+            raise ValueError("remaining_candidates cannot be negative")
         if self.pending_candidates < 0:
             raise ValueError("pending_candidates cannot be negative")
         if self.max_pending_candidates < 0:
@@ -81,6 +85,8 @@ class RoleAllocationInput:
             raise ValueError("consumer_idle_ratio must be between 0 and 1")
         if self.migration_cost_per_role_swap < 0.0:
             raise ValueError("migration_cost_per_role_swap cannot be negative")
+        if self.role_swap_cost_seconds < 0.0:
+            raise ValueError("role_swap_cost_seconds cannot be negative")
         if not 0.0 <= self.cqdag_frontier_pressure <= 1.0:
             raise ValueError("cqdag_frontier_pressure must be between 0 and 1")
         if not 0.0 <= self.cqdag_priority_pressure <= 1.0:
@@ -112,6 +118,17 @@ class RoleAllocationPlan:
     cqdag_frontier_pressure: float = 0.0
     cqdag_reclaim_pressure: float = 0.0
     cqdag_page_locality: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RoleSwitchPayback:
+    should_switch: bool
+    current_seconds: float
+    planned_seconds: float
+    saved_seconds: float
+    swap_count: int
+    remaining_candidates: int | None
+    reason: str
 
 
 class ThroughputOptimalRoleAllocator:
@@ -176,6 +193,77 @@ class ThroughputOptimalRoleAllocator:
         generation_rate = generator_count * snapshot.generator_rate_per_node
         consumption_rate = consumer_count * snapshot.consumer_rate_per_node
         return min(generation_rate, consumption_rate)
+
+    def payback_for(
+        self,
+        snapshot: RoleAllocationInput,
+        plan: RoleAllocationPlan,
+        current_generator_count: int,
+    ) -> RoleSwitchPayback:
+        if plan.generator_count == current_generator_count:
+            return RoleSwitchPayback(
+                should_switch=False,
+                current_seconds=0.0,
+                planned_seconds=0.0,
+                saved_seconds=0.0,
+                swap_count=0,
+                remaining_candidates=snapshot.remaining_candidates,
+                reason="unchanged",
+            )
+        if snapshot.remaining_candidates is None:
+            return RoleSwitchPayback(
+                should_switch=True,
+                current_seconds=float("inf"),
+                planned_seconds=0.0,
+                saved_seconds=float("inf"),
+                swap_count=abs(plan.generator_count - current_generator_count),
+                remaining_candidates=None,
+                reason="unknown_remaining",
+            )
+        if snapshot.remaining_candidates <= 0:
+            return RoleSwitchPayback(
+                should_switch=False,
+                current_seconds=0.0,
+                planned_seconds=0.0,
+                saved_seconds=0.0,
+                swap_count=abs(plan.generator_count - current_generator_count),
+                remaining_candidates=snapshot.remaining_candidates,
+                reason="no_remaining_work",
+            )
+
+        current_throughput = self.throughput_for(snapshot, current_generator_count)
+        planned_throughput = plan.expected_throughput
+        if planned_throughput <= current_throughput:
+            return RoleSwitchPayback(
+                should_switch=False,
+                current_seconds=(
+                    snapshot.remaining_candidates / max(current_throughput, 1e-9)
+                ),
+                planned_seconds=(
+                    snapshot.remaining_candidates / max(planned_throughput, 1e-9)
+                ),
+                saved_seconds=0.0,
+                swap_count=abs(plan.generator_count - current_generator_count),
+                remaining_candidates=snapshot.remaining_candidates,
+                reason="no_throughput_gain",
+            )
+
+        swap_count = abs(plan.generator_count - current_generator_count)
+        current_seconds = snapshot.remaining_candidates / max(current_throughput, 1e-9)
+        planned_seconds = (
+            snapshot.remaining_candidates / max(planned_throughput, 1e-9)
+            + swap_count * snapshot.role_swap_cost_seconds
+        )
+        saved_seconds = current_seconds - planned_seconds
+        return RoleSwitchPayback(
+            should_switch=saved_seconds > 0.0,
+            current_seconds=current_seconds,
+            planned_seconds=planned_seconds,
+            saved_seconds=saved_seconds,
+            swap_count=swap_count,
+            remaining_candidates=snapshot.remaining_candidates,
+            reason="positive_payback" if saved_seconds > 0.0 else "negative_payback",
+        )
 
     def _optimal_generator_count(self, snapshot: RoleAllocationInput) -> int:
         min_generators = self.config.min_generators

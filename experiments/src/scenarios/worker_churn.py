@@ -35,7 +35,7 @@ class AgentProcess:
     node_id: str
     process: subprocess.Popen[str]
     metrics_path: Path
-    hits_path: Path
+    outputs_path: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,24 +120,33 @@ def main() -> None:
         f"{scripts_dir}:{root / 'src'}:{root.parent}:{env.get('PYTHONPATH', '')}"
     )
     python = sys.executable
-    model_path = work_dir / "model.json"
-    targets_path = work_dir / "targets.json"
+    model_path = args.source_model_path or work_dir / "model.json"
+    job_spec_path = work_dir / "job-spec.json"
     tracker_metrics_path = metrics_dir / "tracker.json"
+
+    if args.source_model_path is None:
+        run_checked(
+            [
+                python,
+                str(scripts_dir / "tools" / "train_model.py"),
+                "--model-path",
+                str(model_path),
+            ],
+            env=env,
+        )
 
     prepare_cmd = [
         python,
         str(scripts_dir / "tools" / "prepare.py"),
-        "--model-path",
+        "--source-model-path",
         str(model_path),
-        "--targets-path",
-        str(targets_path),
+        "--job-spec-path",
+        str(job_spec_path),
         "--limit",
         str(args.limit),
         "--hash-algorithm",
         args.hash_algorithm,
     ]
-    if args.source_model_path is not None:
-        prepare_cmd.extend(["--source-model-path", str(args.source_model_path)])
     for rank in args.target_rank or []:
         prepare_cmd.extend(["--target-rank", str(rank)])
     run_checked(prepare_cmd, env=env)
@@ -151,7 +160,7 @@ def main() -> None:
     changes = parse_changes(args.change, node_ids)
     if not changes and not args.no_default_changes:
         changes = default_changes(args.total_nodes)
-    job_context = build_job_context(args, targets_path) if use_job_context(args) else None
+    job_context = build_job_context(args, job_spec_path) if use_job_context(args) else None
 
     experiment_started_at = monotonic()
     agents: list[AgentProcess] = []
@@ -170,7 +179,7 @@ def main() -> None:
             python=python,
             scripts_dir=scripts_dir,
             model_path=model_path,
-            targets_path=targets_path,
+            job_spec_path=job_spec_path,
             work_dir=work_dir,
             metrics_dir=metrics_dir,
             node_id=node_id,
@@ -191,7 +200,7 @@ def main() -> None:
         python=python,
         scripts_dir=scripts_dir,
         model_path=model_path,
-        targets_path=targets_path,
+        job_spec_path=job_spec_path,
         metrics_path=tracker_metrics_path,
         env=env,
     )
@@ -258,9 +267,9 @@ def main() -> None:
                 print(f"process failed with code {code}: {command}", file=sys.stderr)
             raise SystemExit(1)
 
-        hit_paths = ensure_hit_reports(work_dir, node_ids)
-        verify_hash_hits(targets_path, hit_paths)
-        summary = summarize_run(work_dir, tracker_metrics_path, hit_paths)
+        output_paths = ensure_hit_reports(work_dir, node_ids)
+        verify_hash_hits(job_spec_path, output_paths)
+        summary = summarize_run(work_dir, tracker_metrics_path, output_paths)
         write_json(work_dir / "churn_summary.json", summary)
         print_summary(summary)
         print_overhead_summary(
@@ -334,7 +343,7 @@ def start_agent(
     python: str,
     scripts_dir: Path,
     model_path: Path,
-    targets_path: Path,
+    job_spec_path: Path,
     work_dir: Path,
     metrics_dir: Path,
     node_id: str,
@@ -342,7 +351,7 @@ def start_agent(
     env: dict[str, str],
 ) -> AgentProcess:
     metrics_path = metrics_dir / f"{node_id}.json"
-    hits_path = work_dir / f"hits-{node_id}.json"
+    outputs_path = work_dir / f"outputs-{node_id}.json"
     agent_env = {
         **env,
         "CQPCFG_NODE_ID": node_id,
@@ -355,7 +364,7 @@ def start_agent(
         "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
         "CQPCFG_EXPERIMENT_START_MONOTONIC": str(experiment_started_at),
         "CQPCFG_METRICS_PATH": str(metrics_path),
-        "CQPCFG_HITS_PATH": str(hits_path),
+        "CQPCFG_OUTPUTS_PATH": str(outputs_path),
         "CQPCFG_MODEL_JSON_PAGE_CACHE": str(args.model_json_page_cache),
     }
     if args.model_cache_dir is not None:
@@ -363,7 +372,7 @@ def start_agent(
     if not use_job_context(args):
         agent_env.update(
             {
-                "CQPCFG_TARGETS_PATH": str(targets_path),
+                "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
                 "CQPCFG_SOURCE_MODE": args.source_mode,
                 "CQPCFG_CONTROL_CONNECT": args.control_connect,
                 "CQPCFG_BATCH_CONNECT": args.batch_connect,
@@ -384,7 +393,7 @@ def start_agent(
         node_id=node_id,
         process=subprocess.Popen(command, env=agent_env, text=True),
         metrics_path=metrics_path,
-        hits_path=hits_path,
+        outputs_path=outputs_path,
     )
 
 
@@ -394,78 +403,59 @@ def start_tracker(
     python: str,
     scripts_dir: Path,
     model_path: Path,
-    targets_path: Path,
+    job_spec_path: Path,
     metrics_path: Path,
     env: dict[str, str],
 ) -> subprocess.Popen[str]:
-    command = [
-        python,
-        str(scripts_dir / "services" / "tracker.py"),
-        "--model-path",
-        str(model_path),
-        "--targets-path",
-        str(targets_path),
-        "--model-id",
-        args.model_id,
-        "--source-mode",
-        args.source_mode,
-        "--control-bind",
-        args.control_bind,
-        "--batch-bind",
-        args.batch_bind,
-        "--ack-bind",
-        args.ack_bind,
-        "--consumer-count",
-        str(args.total_nodes),
-        "--demand-window",
-        str(args.demand_window),
-        "--max-chunk-size",
-        str(args.max_chunk_size),
-        "--max-parallel-leases-per-node",
-        str(args.max_parallel_leases_per_node),
-        "--batch-size",
-        str(args.batch_size),
-        "--max-batch-payload-bytes",
-        str(args.max_batch_payload_bytes),
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-        "--ack-timeout-seconds",
-        str(args.ack_timeout_seconds),
-        "--ack-retry-interval-seconds",
-        str(args.ack_retry_interval_seconds),
-        "--metrics-path",
-        str(metrics_path),
-        "--metrics-flush-interval-seconds",
-        str(args.metrics_flush_interval_seconds),
-    ]
+    tracker_env = {
+        **env,
+        "CQPCFG_MODEL_PATH": str(model_path),
+        "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
+        "CQPCFG_MODEL_ID": args.model_id,
+        "CQPCFG_SOURCE_MODE": args.source_mode,
+        "CQPCFG_CONTROL_BIND": args.control_bind,
+        "CQPCFG_BATCH_BIND": args.batch_bind,
+        "CQPCFG_ACK_BIND": args.ack_bind,
+        "CQPCFG_CONSUMER_COUNT": str(args.total_nodes),
+        "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+        "CQPCFG_MAX_CHUNK_SIZE": str(args.max_chunk_size),
+        "CQPCFG_MAX_PARALLEL_LEASES_PER_NODE": str(args.max_parallel_leases_per_node),
+        "CQPCFG_BATCH_SIZE": str(args.batch_size),
+        "CQPCFG_MAX_BATCH_PAYLOAD_BYTES": str(args.max_batch_payload_bytes),
+        "CQPCFG_TIMEOUT_SECONDS": str(args.timeout_seconds),
+        "CQPCFG_ACK_TIMEOUT_SECONDS": str(args.ack_timeout_seconds),
+        "CQPCFG_ACK_RETRY_INTERVAL_SECONDS": str(args.ack_retry_interval_seconds),
+        "CQPCFG_METRICS_PATH": str(metrics_path),
+        "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
+    }
     if args.model_serve_bind is not None:
-        command.extend(
-            [
-                "--model-serve-bind",
-                args.model_serve_bind,
-                "--model-chunk-size",
-                str(args.model_chunk_size),
-                "--model-slot-page-size",
-                str(args.model_slot_page_size),
-                "--model-structure-page-size",
-                str(args.model_structure_page_size),
-            ]
+        tracker_env.update(
+            {
+                "CQPCFG_MODEL_SERVE_BIND": args.model_serve_bind,
+                "CQPCFG_MODEL_CHUNK_SIZE": str(args.model_chunk_size),
+                "CQPCFG_MODEL_SLOT_PAGE_SIZE": str(args.model_slot_page_size),
+                "CQPCFG_MODEL_STRUCTURE_PAGE_SIZE": str(args.model_structure_page_size),
+            },
         )
-    return subprocess.Popen(command, env=env, text=True)
+    return subprocess.Popen(
+        [python, str(scripts_dir / "services" / "tracker.py")],
+        env=tracker_env,
+        text=True,
+    )
 
 
 def use_job_context(args: argparse.Namespace) -> bool:
     return args.model_connect is not None or args.model_serve_bind is not None
 
 
-def build_job_context(args: argparse.Namespace, targets_path: Path) -> JobContext:
+def build_job_context(args: argparse.Namespace, job_spec_path: Path) -> JobContext:
     model_connect = args.model_connect
     if model_connect is None:
         if args.model_serve_bind is None:
             raise RuntimeError("model serve endpoint is required for JobContext")
         model_connect = connect_uri_from_bind(args.model_serve_bind)
-    return JobContext.from_targets_payload(
-        read_json(targets_path),
+    return JobContext.from_job_payload(
+        read_json(job_spec_path),
         job_id="worker-churn",
         model_id=args.model_id,
         model_connect=model_connect,
@@ -501,24 +491,24 @@ def reap_finished(
 
 
 def ensure_hit_reports(work_dir: Path, node_ids: tuple[str, ...]) -> tuple[Path, ...]:
-    hit_paths = tuple(work_dir / f"hits-{node_id}.json" for node_id in node_ids)
-    for path in hit_paths:
+    output_paths = tuple(work_dir / f"outputs-{node_id}.json" for node_id in node_ids)
+    for path in output_paths:
         if not path.exists():
-            write_json(path, {"hits": []})
-    return hit_paths
+            write_json(path, {"consumer_outputs": []})
+    return output_paths
 
 
 def summarize_run(
     work_dir: Path,
     tracker_metrics_path: Path,
-    hit_paths: tuple[Path, ...],
+    output_paths: tuple[Path, ...],
 ) -> dict:
-    targets = read_json(work_dir / "targets.json")
+    targets = read_json(work_dir / "job-spec.json")
     tracker = read_json(tracker_metrics_path)
     hits = []
-    for path in hit_paths:
+    for path in output_paths:
         if path.exists():
-            hits.extend(read_json(path).get("hits", []))
+            hits.extend(read_json(path).get("consumer_outputs", []))
     first_hit_by_target: dict[str, dict] = {}
     for hit in hits:
         key = str(hit["target_rank"])

@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-import json
 import logging
+import os
 from dataclasses import dataclass, replace
 from inspect import signature
 from pathlib import Path
 from threading import Event, Thread
-from time import monotonic, perf_counter, sleep
+from time import monotonic, sleep
 from typing import Any, Callable, Mapping
 
-from CQDAGPCFG import GuessRecord, load_model
+from CQDAGPCFG import load_model
 
 from cqdagpcfg_parallel.distributed import (
     DistributedProtocolConfig,
     DistributedProtocolTracker,
     JobContext,
+    CqdagAwareElasticRoleAllocator,
     RoleController,
+    RoleAllocationInput,
     RoleResourcePolicy,
     WorkerResourceSpec,
     parse_byte_size,
@@ -29,17 +31,12 @@ from cqdagpcfg_parallel.storage import (
     CompactDistributedTrackerCheckpointWriter,
     DistributedTrackerCheckpoint,
     FilePagedModelArtifactStore,
+    ModelManifest,
 )
 from cqdagpcfg_parallel.runtime import (
-    BatchAck,
-    BatchAckStatus,
-    BatchRetryLedger,
-    BatchState,
-    CandidateBatch,
     DurableBatchCheckpoint,
     ZmqModelArtifactServer,
     ZmqPullBatchAckSource,
-    guess_payload_bytes,
 )
 from cqdagpcfg_parallel.runtime.zmq_transport import (
     ZmqEndpoint,
@@ -48,6 +45,8 @@ from cqdagpcfg_parallel.runtime.zmq_transport import (
 )
 
 from .block_graph import CQDAGBlockGraphAdapter
+from .job_spec import CQDAGJobSpec
+from .tracker_publisher import BatchRetryPayload, StreamingRecordBatchPublisher
 
 
 LOGGER = logging.getLogger("cqdagpcfg.tracker")
@@ -56,7 +55,7 @@ LOGGER = logging.getLogger("cqdagpcfg.tracker")
 @dataclass(slots=True)
 class CqdagTrackerServiceConfig:
     model_path: Path
-    targets_path: Path
+    job_spec_path: Path
     model_id: str = "cqdagpcfg-e2e-model"
     model_serve_bind: str | None = None
     model_chunk_size: int = 1 << 20
@@ -79,6 +78,10 @@ class CqdagTrackerServiceConfig:
     initial_generators: int | None = None
     initial_consumers: int | None = None
     late_worker_role: str = "generator"
+    role_heartbeat_timeout_seconds: float = 5.0
+    disable_elastic_role_allocation: bool = False
+    role_rebalance_interval_seconds: float = 0.5
+    role_switch_min_improvement: float = 0.05
     generator_min_cpus: float | None = None
     generator_min_memory: str | None = None
     generator_min_gpus: int | None = None
@@ -92,6 +95,7 @@ class CqdagTrackerServiceConfig:
     expected_workers: int | None = None
     shutdown_grace_seconds: float = 0.5
     metrics_path: Path | None = None
+    outputs_path: Path | None = None
     metrics_flush_interval_seconds: float = 0.25
     checkpoint_path: Path | None = None
     resume_checkpoint_path: Path | None = None
@@ -137,6 +141,12 @@ class CqdagTrackerServiceConfig:
             raise ValueError("model_structure_page_size must be positive")
         if self.late_worker_role not in {"generator", "consumer", "idle"}:
             raise ValueError("late_worker_role must be generator, consumer, or idle")
+        if self.role_heartbeat_timeout_seconds <= 0.0:
+            raise ValueError("role_heartbeat_timeout_seconds must be positive")
+        if self.role_rebalance_interval_seconds <= 0.0:
+            raise ValueError("role_rebalance_interval_seconds must be positive")
+        if self.role_switch_min_improvement < 0.0:
+            raise ValueError("role_switch_min_improvement cannot be negative")
         if self.source_mode not in {"root", "structure"}:
             raise ValueError("source_mode must be root or structure")
 
@@ -144,10 +154,10 @@ class CqdagTrackerServiceConfig:
 @dataclass(frozen=True, slots=True)
 class CQDAGPCFGTrackerJob:
     model_path: Path
-    targets_path: Path
+    job_spec_path: Path
     model_id: str
     limit: int
-    target_count: int
+    job_payload_items: int
     source_mode: str
     control_bind: str
     batch_bind: str | None
@@ -165,7 +175,7 @@ class CQDAGPCFGTrackerSummary:
     source_mode: str
     protocol_nodes: int
     expected_workers: int | None
-    hash_consumers: int
+    consumer_count: int
     digest: str
     serial_digest: str
     emitted_records: int
@@ -177,6 +187,12 @@ class CQDAGPCFGTrackerSummary:
     affinity_misses: int
     elapsed_seconds: float
     assigned_records_by_node: tuple[tuple[Any, int], ...]
+
+
+def effective_max_parallel_leases_per_node(args: CqdagTrackerServiceConfig) -> int:
+    if args.source_mode == "root":
+        return 1
+    return args.max_parallel_leases_per_node
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,10 +283,22 @@ class AnnotatedCQDAGPCFGTracker:
 
 def cqdagpcfg_tracker(
     config: CqdagTrackerServiceConfig | None = None,
+    *,
+    env_prefix: str | None = None,
     **overrides,
 ) -> Callable[[type[Any]], AnnotatedCQDAGPCFGTracker]:
+    if env_prefix is not None and not isinstance(env_prefix, str):
+        raise TypeError("env_prefix must be a string")
     if config is None:
-        resolved_config = CqdagTrackerServiceConfig(**overrides)
+        values = (
+            _tracker_config_values_from_env(env_prefix)
+            if env_prefix is not None
+            else {}
+        )
+        values.update(overrides)
+        resolved_config = CqdagTrackerServiceConfig(**values)
+    elif env_prefix is not None:
+        raise ValueError("use either config or env_prefix, not both")
     elif overrides:
         resolved_config = replace(config, **overrides)
     else:
@@ -287,6 +315,108 @@ def cqdagpcfg_tracker(
     return decorator
 
 
+def _tracker_config_values_from_env(prefix: str) -> dict[str, Any]:
+    normalized_prefix = prefix.rstrip("_")
+    values: dict[str, Any] = {}
+    readers: dict[str, Callable[[str], Any]] = {
+        "model_path": _env_path,
+        "job_spec_path": _env_path,
+        "model_id": _env_str,
+        "model_serve_bind": _env_str,
+        "model_chunk_size": _env_int,
+        "model_slot_page_size": _env_int,
+        "model_structure_page_size": _env_int,
+        "bind": _env_str,
+        "advertise_host": _env_str,
+        "control_bind": _env_str,
+        "public_control_connect": _env_str,
+        "batch_bind": _env_str,
+        "batch_connect": _env_str,
+        "public_batch_connect": _env_str,
+        "ack_bind": _env_str,
+        "public_ack_connect": _env_str,
+        "public_model_connect": _env_str,
+        "role_bind": _env_str,
+        "total_nodes": _env_int,
+        "min_generators": _env_int,
+        "min_consumers": _env_int,
+        "initial_generators": _env_int,
+        "initial_consumers": _env_int,
+        "late_worker_role": _env_str,
+        "role_heartbeat_timeout_seconds": _env_float,
+        "disable_elastic_role_allocation": _env_bool,
+        "role_rebalance_interval_seconds": _env_float,
+        "role_switch_min_improvement": _env_float,
+        "generator_min_cpus": _env_float,
+        "generator_min_memory": _env_str,
+        "generator_min_gpus": _env_int,
+        "consumer_min_cpus": _env_float,
+        "consumer_min_memory": _env_str,
+        "consumer_min_gpus": _env_int,
+        "consumer_count": _env_int,
+        "ack_timeout_seconds": _env_float,
+        "ack_retry_interval_seconds": _env_float,
+        "batch_startup_grace_seconds": _env_float,
+        "expected_workers": _env_int,
+        "shutdown_grace_seconds": _env_float,
+        "metrics_path": _env_path,
+        "outputs_path": _env_path,
+        "metrics_flush_interval_seconds": _env_float,
+        "checkpoint_path": _env_path,
+        "resume_checkpoint_path": _env_path,
+        "checkpoint_stable_log_path": _env_path,
+        "checkpoint_interval_records": _env_int,
+        "batch_checkpoint_path": _env_path,
+        "resume_batch_checkpoint_path": _env_path,
+        "source_mode": _env_str,
+        "demand_window": _env_int,
+        "max_chunk_size": _env_int,
+        "max_parallel_leases_per_node": _env_int,
+        "disable_node_affinity": _env_bool,
+        "node_affinity_bonus": _env_float,
+        "batch_size": _env_int,
+        "max_batch_payload_bytes": _env_int,
+        "timeout_seconds": _env_float,
+        "disable_reclaim": _env_bool,
+    }
+    for field_name, reader in readers.items():
+        env_name = f"{normalized_prefix}_{field_name.upper()}"
+        value = os.environ.get(env_name)
+        if value is None or value == "":
+            continue
+        values[field_name] = reader(value)
+    return values
+
+
+def _env_str(value: str) -> str:
+    return value
+
+
+def _env_path(value: str) -> Path:
+    return Path(value)
+
+
+def _env_int(value: str) -> int:
+    return int(value)
+
+
+def _env_float(value: str) -> float:
+    return float(value)
+
+
+def _env_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def model_fingerprint_from_path(model_path: Path, *, model_id: str) -> str:
+    manifest = ModelManifest.from_json_payload(
+        model_path.read_bytes(),
+        model_id=model_id,
+        artifact_uri=str(model_path),
+    )
+    return manifest.model_fingerprint
+
+
 def _run_cqdag_tracker_service(
     config: CqdagTrackerServiceConfig,
     *,
@@ -296,14 +426,53 @@ def _run_cqdag_tracker_service(
     args = replace(config)
     apply_endpoint_bundle(args)
     tracker_hooks = _instantiate_tracker_hooks(tracker_class, args)
-    targets = read_json(args.targets_path)
-    limit = int(targets["limit"])
+    job_spec_path = args.job_spec_path
+    try:
+        job_spec = CQDAGJobSpec.read(job_spec_path)
+    except BaseException as exc:
+        _call_tracker_hook(
+            tracker_hooks,
+            "on_error",
+            CQDAGPCFGTrackerError(
+                stage="job_spec",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            ),
+        )
+        raise
+    job_payload = dict(job_spec.payload)
+    model_fingerprint = model_fingerprint_from_path(args.model_path, model_id=args.model_id)
+    expected_model_fingerprint = job_spec.model_fingerprint
+    if (
+        expected_model_fingerprint is not None
+        and expected_model_fingerprint != model_fingerprint
+    ):
+        _call_tracker_hook(
+            tracker_hooks,
+            "on_error",
+            CQDAGPCFGTrackerError(
+                stage="model_fingerprint",
+                error_type="RuntimeError",
+                message=(
+                    "tracker model fingerprint does not match job spec: "
+                    f"{model_fingerprint} != {expected_model_fingerprint}"
+                ),
+            ),
+        )
+        raise RuntimeError(
+            "tracker model fingerprint does not match job spec: "
+            f"{model_fingerprint} != {expected_model_fingerprint}"
+        )
+    job_payload["model_fingerprint"] = model_fingerprint
+    job_spec = job_spec.with_model_fingerprint(model_fingerprint)
+    limit = job_spec.limit
+    job_payload_items = job_payload_item_count(job_payload)
     log_event(
         LOGGER,
         logging.INFO,
         "tracker.start",
         model_path=args.model_path,
-        targets_path=args.targets_path,
+        job_spec_path=job_spec_path,
         model_id=args.model_id,
         limit=limit,
         source_mode=args.source_mode,
@@ -314,18 +483,18 @@ def _run_cqdag_tracker_service(
         model_serve_bind=args.model_serve_bind,
         expected_workers=args.expected_workers,
         total_nodes=args.total_nodes,
-        target_count=len(targets.get("targets", ())),
-        model_fingerprint=targets.get("model_fingerprint"),
+        job_payload_items=job_payload_items,
+        model_fingerprint=model_fingerprint,
     )
     _call_tracker_hook(
         tracker_hooks,
         "on_start",
         CQDAGPCFGTrackerJob(
             model_path=args.model_path,
-            targets_path=args.targets_path,
+            job_spec_path=job_spec_path,
             model_id=args.model_id,
             limit=limit,
-            target_count=len(targets.get("targets", ())),
+            job_payload_items=job_payload_items,
             source_mode=args.source_mode,
             control_bind=args.control_bind,
             batch_bind=args.batch_bind,
@@ -334,11 +503,11 @@ def _run_cqdag_tracker_service(
             model_serve_bind=args.model_serve_bind,
             expected_workers=args.expected_workers,
             total_nodes=args.total_nodes,
-            model_fingerprint=targets.get("model_fingerprint"),
+            model_fingerprint=model_fingerprint,
         ),
     )
     model_server = start_model_artifact_server(args)
-    role_controller = start_role_controller(args, targets, tracker_hooks=tracker_hooks)
+    role_controller = start_role_controller(args, job_payload, tracker_hooks=tracker_hooks)
     model = load_model(args.model_path)
     adapter = CQDAGBlockGraphAdapter(model)
     if args.source_mode == "structure":
@@ -357,6 +526,7 @@ def _run_cqdag_tracker_service(
                 estimated_cost=root_node.estimated_cost,
             ),
         )
+    max_parallel_leases_per_node = effective_max_parallel_leases_per_node(args)
     log_event(
         LOGGER,
         logging.INFO,
@@ -365,7 +535,8 @@ def _run_cqdag_tracker_service(
         source_mode=args.source_mode,
         demand_window=args.demand_window,
         max_chunk_size=args.max_chunk_size,
-        max_parallel_leases_per_node=args.max_parallel_leases_per_node,
+        max_parallel_leases_per_node=max_parallel_leases_per_node,
+        requested_max_parallel_leases_per_node=args.max_parallel_leases_per_node,
         node_affinity_enabled=not args.disable_node_affinity,
         reclaim_enabled=not args.disable_reclaim,
     )
@@ -373,7 +544,7 @@ def _run_cqdag_tracker_service(
     config = DistributedProtocolConfig(
         scheduler=SchedulerConfig(
             max_chunk_size=args.max_chunk_size,
-            max_parallel_leases_per_node=args.max_parallel_leases_per_node,
+            max_parallel_leases_per_node=max_parallel_leases_per_node,
             node_affinity_enabled=not args.disable_node_affinity,
             node_affinity_bonus=args.node_affinity_bonus,
         ),
@@ -382,7 +553,7 @@ def _run_cqdag_tracker_service(
         demand_window=args.demand_window,
         record_order_key=adapter.serial_order_key,
         reclaim_emitted_chunks=not args.disable_reclaim,
-        model_fingerprint=targets.get("model_fingerprint"),
+        model_fingerprint=model_fingerprint,
     )
     tracker = DistributedProtocolTracker(
         endpoint=ZmqEndpoint.from_uri(args.control_bind, bind=True),
@@ -428,19 +599,39 @@ def _run_cqdag_tracker_service(
                 ack_source=ack_source,
                 batch_size=args.batch_size,
                 max_batch_payload_bytes=args.max_batch_payload_bytes,
+                role_metrics_provider=lambda: role_controller_metrics(role_controller),
+                extra_metrics_provider=lambda: _tracker_metrics_snapshot(tracker_hooks),
+                batch_publish_callback=lambda batch: _call_tracker_hook(
+                    tracker_hooks,
+                    "on_candidate_batch",
+                    batch,
+                ),
                 ack_retry_interval_seconds=args.ack_retry_interval_seconds,
-                batch_retry_callback=lambda event: _call_tracker_hook(
+                batch_retry_callback=lambda payload: _call_tracker_hook(
                     tracker_hooks,
                     "on_batch_retry",
-                    event,
+                    _batch_retry_event(payload),
                 ),
                 metrics_path=args.metrics_path,
                 metrics_flush_interval_seconds=args.metrics_flush_interval_seconds,
+                outputs_path=args.outputs_path,
                 initial_start_rank=0 if resume_checkpoint is None else resume_checkpoint.emitted_count,
                 initial_batch_id=0 if resume_checkpoint is None else resume_checkpoint.emitted_count,
                 batch_checkpoint_path=args.batch_checkpoint_path,
                 resume_batch_checkpoint=resume_batch_checkpoint,
             )
+            if role_controller is not None:
+                role_controller["metrics_callback"][0] = lambda: publisher.write_metrics(
+                    final=False,
+                    force=True,
+                )
+                role_controller["rebalance_callback"][0] = lambda: rebalance_elastic_roles(
+                    args,
+                    role_controller,
+                    publisher,
+                    limit=limit,
+                )
+                publisher.write_metrics(final=False, force=True)
             publisher.republish_pending()
 
             def checkpoint_callback(checkpoint: DistributedTrackerCheckpoint) -> None:
@@ -482,13 +673,13 @@ def _run_cqdag_tracker_service(
             )
             elapsed = monotonic() - started_at
 
-            if result.digest != targets["serial_digest"]:
+            if result.digest != job_spec.serial_digest:
                 log_event(
                     LOGGER,
                     logging.ERROR,
                     "tracker.digest_mismatch",
                     digest=result.digest,
-                    serial_digest=targets["serial_digest"],
+                    serial_digest=job_spec.serial_digest,
                     emitted_records=result.emitted_count,
                 )
                 _call_tracker_hook(
@@ -504,9 +695,21 @@ def _run_cqdag_tracker_service(
 
             publisher.set_protocol_result(result)
             publisher.flush()
-            publisher.wait_for_acks(timeout_seconds=args.ack_timeout_seconds)
-            hash_consumers = end_of_stream_consumer_count(args, role_controller)
-            sink.publish_end_of_stream(hash_consumers)
+            try:
+                publisher.wait_for_acks(timeout_seconds=args.ack_timeout_seconds)
+            except BaseException as exc:
+                _call_tracker_hook(
+                    tracker_hooks,
+                    "on_error",
+                    CQDAGPCFGTrackerError(
+                        stage="batch_ack",
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    ),
+                )
+                raise
+            consumer_count = end_of_stream_consumer_count(args, role_controller)
+            sink.publish_end_of_stream(consumer_count)
             publisher.write_metrics(final=True)
             log_event(
                 LOGGER,
@@ -517,7 +720,7 @@ def _run_cqdag_tracker_service(
                 published_payload_bytes=publisher.published_payload_bytes,
                 republished_batches=publisher.republished_batches,
                 completed_batches=publisher.completed_batches,
-                hash_consumers=hash_consumers,
+                consumer_count=consumer_count,
             )
     finally:
         if role_controller is not None:
@@ -559,11 +762,11 @@ def _run_cqdag_tracker_service(
         source_mode=args.source_mode,
         protocol_nodes=len(protocol_nodes),
         expected_workers=expected_workers,
-        hash_consumers=hash_consumers,
+        consumer_count=consumer_count,
         digest=result.digest,
-        serial_digest=targets["serial_digest"],
+        serial_digest=job_spec.serial_digest,
         emitted_records=result.emitted_count,
-        collected_outputs=len(result.outputs),
+        collected_outputs=len(publisher.consumer_outputs),
         resident_records=result.stats.resident_records,
         peak_resident_records=result.stats.peak_resident_records,
         reclaimed_records=result.stats.reclaimed_records,
@@ -615,6 +818,35 @@ def _call_tracker_hook(instance, name: str, payload: object) -> None:
     raise TypeError(f"tracker hook {name} must accept zero or one argument")
 
 
+def _tracker_metrics_snapshot(instance) -> Mapping[str, object]:
+    if instance is None:
+        return {}
+    hook = getattr(instance, "metrics_snapshot", None)
+    if hook is None:
+        return {}
+    if not callable(hook):
+        raise TypeError("tracker hook metrics_snapshot must be callable")
+    payload = hook()
+    if payload is None:
+        return {}
+    if not isinstance(payload, Mapping):
+        raise TypeError("tracker hook metrics_snapshot must return a mapping")
+    return payload
+
+
+def _batch_retry_event(payload: BatchRetryPayload) -> CQDAGPCFGBatchRetryEvent:
+    return CQDAGPCFGBatchRetryEvent(
+        batch_id=payload.batch_id,
+        start_rank=payload.start_rank,
+        end_rank=payload.end_rank,
+        reason=payload.reason,
+        attempts=payload.attempts,
+        pending_batches=payload.pending_batches,
+        consumer_id=payload.consumer_id,
+        error=payload.error,
+    )
+
+
 def _print_tracker_summary(summary: CQDAGPCFGTrackerSummary) -> None:
     log_event(
         LOGGER,
@@ -624,7 +856,7 @@ def _print_tracker_summary(summary: CQDAGPCFGTrackerSummary) -> None:
         source_mode=summary.source_mode,
         protocol_nodes=summary.protocol_nodes,
         expected_workers=summary.expected_workers,
-        hash_consumers=summary.hash_consumers,
+        consumer_count=summary.consumer_count,
         digest=summary.digest,
         digest_match=summary.digest == summary.serial_digest,
         emitted_records=summary.emitted_records,
@@ -707,14 +939,12 @@ def stop_model_artifact_server(handle) -> None:
 
 def start_role_controller(
     args: CqdagTrackerServiceConfig,
-    targets: dict,
+    job_payload: dict,
     *,
     tracker_hooks=None,
 ):
     if args.role_bind is None:
         return None
-    if args.model_serve_bind is None and args.public_model_connect is None:
-        raise ValueError("role_bind requires model_serve_bind or public_model_connect")
 
     generator_count, consumer_count = resolve_initial_role_counts(args)
     log_event(
@@ -726,21 +956,23 @@ def start_role_controller(
         initial_consumers=consumer_count,
         late_worker_role=args.late_worker_role,
     )
-    job_context = JobContext.from_targets_payload(
-        targets,
-        job_id=args.model_id,
-        model_id=args.model_id,
-        model_connect=args.public_model_connect
-        or advertised_connect_uri(args.model_serve_bind, args.advertise_host),
-        control_connect=args.public_control_connect
-        or advertised_connect_uri(args.control_bind, args.advertise_host),
-        batch_connect=args.public_batch_connect
-        or advertised_connect_uri(args.batch_bind or args.batch_connect, args.advertise_host),
-        ack_connect=args.public_ack_connect
-        or advertised_connect_uri(args.ack_bind, args.advertise_host),
-        source_mode=args.source_mode,
-        demand_window=args.demand_window,
-    )
+    job_context = None
+    if args.model_serve_bind is not None or args.public_model_connect is not None:
+        job_context = JobContext.from_job_payload(
+            job_payload,
+            job_id=args.model_id,
+            model_id=args.model_id,
+            model_connect=args.public_model_connect
+            or advertised_connect_uri(args.model_serve_bind, args.advertise_host),
+            control_connect=args.public_control_connect
+            or advertised_connect_uri(args.control_bind, args.advertise_host),
+            batch_connect=args.public_batch_connect
+            or advertised_connect_uri(args.batch_bind or args.batch_connect, args.advertise_host),
+            ack_connect=args.public_ack_connect
+            or advertised_connect_uri(args.ack_bind, args.advertise_host),
+            source_mode=args.source_mode,
+            demand_window=args.demand_window,
+        )
     controller = RoleController(
         endpoint=ZmqEndpoint.from_uri(args.role_bind, bind=True, linger_ms=0),
         roles={},
@@ -755,18 +987,43 @@ def start_role_controller(
     stop_event = Event()
     known_nodes: set[str] = set()
     last_role_by_node: dict[str, str] = {}
+    last_current_role_by_node: dict[str, str | None] = {}
     hook_failures: list[BaseException] = []
+    metrics_callback: list[Callable[[], None] | None] = [None]
+    rebalance_callback: list[Callable[[], bool] | None] = [None]
+    last_rebalance_at: list[float] = [0.0]
 
     def serve() -> None:
         while not stop_event.is_set():
             try:
                 controller.poll(timeout_ms=100)
-                _emit_role_controller_events(
+                expired_nodes = controller.expire_stale_nodes(
+                    timeout_seconds=args.role_heartbeat_timeout_seconds,
+                )
+                changed = _emit_role_controller_events(
                     controller,
                     tracker_hooks=tracker_hooks,
                     known_nodes=known_nodes,
                     last_role_by_node=last_role_by_node,
+                    last_current_role_by_node=last_current_role_by_node,
                 )
+                if expired_nodes:
+                    changed = True
+                    _emit_role_controller_expirations(
+                        expired_nodes,
+                        tracker_hooks=tracker_hooks,
+                        known_nodes=known_nodes,
+                        last_role_by_node=last_role_by_node,
+                        last_current_role_by_node=last_current_role_by_node,
+                    )
+                if (
+                    rebalance_callback[0] is not None
+                    and monotonic() - last_rebalance_at[0] >= args.role_rebalance_interval_seconds
+                ):
+                    last_rebalance_at[0] = monotonic()
+                    changed = rebalance_callback[0]() or changed
+                if changed and metrics_callback[0] is not None:
+                    metrics_callback[0]()
             except BaseException as exc:
                 hook_failures.append(exc)
                 stop_event.set()
@@ -781,7 +1038,11 @@ def start_role_controller(
         "thread": thread,
         "known_nodes": known_nodes,
         "last_role_by_node": last_role_by_node,
+        "last_current_role_by_node": last_current_role_by_node,
         "hook_failures": hook_failures,
+        "metrics_callback": metrics_callback,
+        "rebalance_callback": rebalance_callback,
+        "last_rebalance_at": last_rebalance_at,
     }
 
 
@@ -844,13 +1105,19 @@ def _emit_role_controller_events(
     tracker_hooks,
     known_nodes: set[str],
     last_role_by_node: dict[str, str],
-) -> None:
+    last_current_role_by_node: dict[str, str | None],
+) -> bool:
+    changed = False
     for node_id, status in sorted(controller.status_by_node.items()):
         resources = _status_resources(status)
         role = _effective_role(controller, node_id, resources)
         current_role = _status_current_role(status)
+        if last_current_role_by_node.get(node_id) != current_role:
+            last_current_role_by_node[node_id] = current_role
+            changed = True
         if node_id not in known_nodes:
             known_nodes.add(node_id)
+            changed = True
             log_event(
                 LOGGER,
                 logging.INFO,
@@ -877,6 +1144,7 @@ def _emit_role_controller_events(
         previous_role = last_role_by_node.get(node_id)
         if previous_role != role:
             last_role_by_node[node_id] = role
+            changed = True
             log_event(
                 LOGGER,
                 logging.INFO,
@@ -898,6 +1166,43 @@ def _emit_role_controller_events(
                     resources=resources,
                 ),
             )
+    return changed
+
+
+def _emit_role_controller_expirations(
+    expired_nodes: tuple[tuple[str, str, dict], ...],
+    *,
+    tracker_hooks,
+    known_nodes: set[str],
+    last_role_by_node: dict[str, str],
+    last_current_role_by_node: dict[str, str | None],
+) -> None:
+    for node_id, role, status in expired_nodes:
+        known_nodes.discard(node_id)
+        last_role_by_node.pop(node_id, None)
+        last_current_role_by_node.pop(node_id, None)
+        current_role = _status_current_role(status)
+        resources = _status_resources(status)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "tracker.node_leave",
+            node_id=node_id,
+            assigned_role=role,
+            current_role=current_role,
+            reason="heartbeat_timeout",
+        )
+        _call_tracker_hook(
+            tracker_hooks,
+            "on_node_leave",
+            CQDAGPCFGNodeEvent(
+                node_id=node_id,
+                role=role,
+                current_role=current_role,
+                reason="heartbeat_timeout",
+                resources=resources,
+            ),
+        )
 
 
 def _effective_role(controller, node_id: str, resources: WorkerResourceSpec) -> str:
@@ -966,6 +1271,304 @@ def effective_expected_workers(args: CqdagTrackerServiceConfig, role_controller)
     return int(role_controller["generator_count"])
 
 
+def role_controller_metrics(role_controller) -> dict[str, int]:
+    if role_controller is None:
+        return {
+            "assigned_generator_nodes": 0,
+            "assigned_consumer_nodes": 0,
+            "assigned_idle_nodes": 0,
+            "current_generator_nodes": 0,
+            "current_consumer_nodes": 0,
+            "current_idle_nodes": 0,
+            "observed_worker_nodes": 0,
+        }
+    controller = role_controller["controller"]
+    current_counts = {"generator": 0, "consumer": 0, "idle": 0}
+    for node_id, status in controller.status_by_node.items():
+        resources = _status_resources(status)
+        role = _effective_role(controller, node_id, resources)
+        current_role = _status_current_role(status) or role
+        if current_role not in current_counts:
+            current_role = "idle"
+        current_counts[current_role] += 1
+    return {
+        "assigned_generator_nodes": controller.role_count("generator"),
+        "assigned_consumer_nodes": controller.role_count("consumer"),
+        "assigned_idle_nodes": controller.role_count("idle"),
+        "current_generator_nodes": current_counts["generator"],
+        "current_consumer_nodes": current_counts["consumer"],
+        "current_idle_nodes": current_counts["idle"],
+        "observed_worker_nodes": len(controller.status_by_node),
+    }
+
+
+def rebalance_elastic_roles(
+    args: CqdagTrackerServiceConfig,
+    role_controller,
+    publisher: StreamingRecordBatchPublisher,
+    *,
+    limit: int,
+) -> bool:
+    if args.disable_elastic_role_allocation or role_controller is None:
+        return False
+    controller = role_controller["controller"]
+    node_ids = tuple(sorted(controller.status_by_node))
+    if len(node_ids) < args.min_generators + args.min_consumers:
+        return False
+    current_generator_count = sum(
+        1
+        for node_id in node_ids
+        if _effective_role(controller, node_id, _status_resources(controller.status_by_node[node_id]))
+        == "generator"
+    )
+    current_consumer_count = sum(
+        1
+        for node_id in node_ids
+        if _effective_role(controller, node_id, _status_resources(controller.status_by_node[node_id]))
+        == "consumer"
+    )
+    if current_generator_count <= 0 or current_consumer_count <= 0:
+        return False
+    snapshot = _role_allocation_snapshot(
+        args,
+        controller,
+        publisher,
+        node_ids=node_ids,
+        current_generator_count=current_generator_count,
+        current_consumer_count=current_consumer_count,
+        limit=limit,
+    )
+    allocator = CqdagAwareElasticRoleAllocator()
+    plan = allocator.plan(snapshot)
+    desired_generators = min(
+        max(plan.generator_count, args.min_generators),
+        len(node_ids) - args.min_consumers,
+    )
+    if desired_generators == current_generator_count:
+        return False
+    current_throughput = allocator.throughput_for(snapshot, current_generator_count)
+    improvement = (
+        (plan.expected_throughput - current_throughput) / max(current_throughput, 1e-9)
+    )
+    pressure_extreme = (
+        desired_generators < current_generator_count
+        and (plan.queue_pressure >= 0.80 or plan.cqdag_reclaim_pressure >= 0.80)
+    ) or (
+        desired_generators > current_generator_count
+        and plan.cqdag_frontier_pressure >= 0.60
+    )
+    if improvement < args.role_switch_min_improvement and not pressure_extreme:
+        return False
+    payback = allocator.payback_for(snapshot, plan, current_generator_count)
+    if not payback.should_switch:
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "tracker.elastic_role_rebalance_skipped",
+            reason=payback.reason,
+            desired_generators=desired_generators,
+            current_generators=current_generator_count,
+            remaining_candidates=payback.remaining_candidates,
+            current_seconds=f"{payback.current_seconds:.6f}",
+            planned_seconds=f"{payback.planned_seconds:.6f}",
+            saved_seconds=f"{payback.saved_seconds:.6f}",
+            swap_count=payback.swap_count,
+        )
+        return False
+
+    new_roles = dict(controller.roles)
+    if desired_generators < current_generator_count:
+        for node_id in _role_switch_candidates(controller, node_ids, "generator"):
+            if current_generator_count <= desired_generators:
+                break
+            new_roles[node_id] = "consumer"
+            current_generator_count -= 1
+    else:
+        for node_id in _role_switch_candidates(controller, node_ids, "consumer"):
+            if current_generator_count >= desired_generators:
+                break
+            new_roles[node_id] = "generator"
+            current_generator_count += 1
+    if new_roles == controller.roles:
+        return False
+    controller.set_roles(new_roles)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "tracker.elastic_role_rebalance",
+        desired_generators=desired_generators,
+        desired_consumers=len(node_ids) - desired_generators,
+        expected_throughput=f"{plan.expected_throughput:.6f}",
+        current_throughput=f"{current_throughput:.6f}",
+        improvement=f"{improvement:.6f}",
+        payback_saved_seconds=f"{payback.saved_seconds:.6f}",
+        payback_current_seconds=f"{payback.current_seconds:.6f}",
+        payback_planned_seconds=f"{payback.planned_seconds:.6f}",
+        payback_swap_count=payback.swap_count,
+        remaining_candidates=payback.remaining_candidates,
+        queue_pressure=f"{plan.queue_pressure:.6f}",
+        cqdag_frontier_pressure=f"{plan.cqdag_frontier_pressure:.6f}",
+        cqdag_reclaim_pressure=f"{plan.cqdag_reclaim_pressure:.6f}",
+    )
+    return True
+
+
+def _role_allocation_snapshot(
+    args: CqdagTrackerServiceConfig,
+    controller,
+    publisher: StreamingRecordBatchPublisher,
+    *,
+    node_ids: tuple[str, ...],
+    current_generator_count: int,
+    current_consumer_count: int,
+    limit: int,
+) -> RoleAllocationInput:
+    generator_rate = 0.0
+    consumer_rate = 0.0
+    generator_waits = 0
+    generator_completed_items = 0
+    source_cached_records = 0
+    source_peak_cached_records = 0
+    source_reclaimed_records = 0
+    page_units = 0
+    consumer_idle_seconds = 0.0
+    consumer_elapsed_seconds = 0.0
+    consumed_candidates = 0
+    for node_id in node_ids:
+        status = controller.status_by_node[node_id]
+        role = _effective_role(controller, node_id, _status_resources(status))
+        if role == "generator":
+            generator_rate += float(status.get("generation_rate", 0.0) or 0.0)
+            generator_waits += int(status.get("waits", 0) or 0)
+            generator_completed_items += int(status.get("completed_items", 0) or 0)
+            source_cached_records += int(status.get("source_cached_records", 0) or 0)
+            source_peak_cached_records += int(status.get("source_peak_cached_records", 0) or 0)
+            source_reclaimed_records += int(status.get("source_reclaimed_records", 0) or 0)
+            page_units += int(status.get("source_dag_repository_active_units", 0) or 0)
+            page_units += int(status.get("source_dag_stream_active_units", 0) or 0)
+        elif role == "consumer":
+            consumer_rate += float(status.get("consumer_rate", 0.0) or 0.0)
+            consumer_idle_seconds += float(status.get("network_poll_seconds", 0.0) or 0.0)
+            consumer_elapsed_seconds += float(status.get("elapsed_seconds", 0.0) or 0.0)
+            consumed_candidates += int(status.get("consumed_candidates", 0) or 0)
+
+    pending_candidates = max(0, publisher.published_candidates - consumed_candidates)
+    remaining_candidates = max(0, limit - publisher.published_candidates)
+    max_pending_candidates = args.batch_size * max(1, current_consumer_count) * 4
+    queue_pressure = _bounded_ratio(pending_candidates, max_pending_candidates)
+    generator_rate_per_node = max(generator_rate / current_generator_count, 1e-9)
+    consumer_rate_per_node = max(consumer_rate / current_consumer_count, 1e-9)
+    generator_idle_ratio = _bounded_ratio(
+        generator_waits,
+        generator_waits + generator_completed_items,
+    )
+    consumer_idle_ratio = _bounded_ratio(consumer_idle_seconds, consumer_elapsed_seconds)
+    cache_pressure = _bounded_ratio(
+        source_cached_records,
+        max(source_cached_records, source_peak_cached_records, 1),
+    )
+    reclaim_pressure = max(
+        queue_pressure,
+        cache_pressure
+        * (
+            1.0
+            - _bounded_ratio(
+                source_reclaimed_records,
+                source_reclaimed_records + source_cached_records,
+            )
+        ),
+    )
+    frontier_pressure = _bounded_ratio(
+        (1.0 - queue_pressure) * consumer_idle_ratio
+        + max(0.0, consumer_rate_per_node - generator_rate_per_node)
+        / max(generator_rate_per_node + consumer_rate_per_node, 1e-9),
+        1.0,
+    )
+    priority_pressure = 1.0 - _bounded_ratio(
+        publisher.published_candidates,
+        max(1, int(publisher.protocol_metrics.get("emitted_records", 0) or 0)),
+    )
+    page_locality = _bounded_ratio(
+        page_units,
+        max(1, current_generator_count * args.model_slot_page_size),
+    )
+    return RoleAllocationInput(
+        total_nodes=len(node_ids),
+        generator_rate_per_node=generator_rate_per_node,
+        consumer_rate_per_node=consumer_rate_per_node,
+        current_generator_count=current_generator_count,
+        remaining_candidates=remaining_candidates,
+        pending_candidates=pending_candidates,
+        max_pending_candidates=max_pending_candidates,
+        generator_idle_ratio=generator_idle_ratio,
+        consumer_idle_ratio=consumer_idle_ratio,
+        migration_cost_per_role_swap=args.batch_size,
+        role_swap_cost_seconds=_role_swap_cost_seconds(args),
+        cqdag_frontier_pressure=frontier_pressure,
+        cqdag_priority_pressure=priority_pressure,
+        cqdag_reclaim_pressure=reclaim_pressure,
+        cqdag_page_locality=page_locality,
+    )
+
+
+def _role_swap_cost_seconds(args: CqdagTrackerServiceConfig) -> float:
+    return max(
+        args.role_rebalance_interval_seconds,
+        args.batch_startup_grace_seconds,
+        0.5,
+    )
+
+
+def _role_switch_candidates(controller, node_ids: tuple[str, ...], role: str) -> tuple[str, ...]:
+    selected = tuple(
+        node_id
+        for node_id in node_ids
+        if _effective_role(controller, node_id, _status_resources(controller.status_by_node[node_id]))
+        == role
+    )
+    if role == "generator":
+        return tuple(
+            sorted(
+                selected,
+                key=lambda node_id: (
+                    int(controller.status_by_node[node_id].get("source_cached_records", 0) or 0)
+                    + int(
+                        controller.status_by_node[node_id].get(
+                            "source_dag_repository_active_units",
+                            0,
+                        )
+                        or 0
+                    )
+                    + int(
+                        controller.status_by_node[node_id].get(
+                            "source_dag_stream_active_units",
+                            0,
+                        )
+                        or 0
+                    ),
+                    int(controller.status_by_node[node_id].get("completed_records", 0) or 0),
+                    node_id,
+                ),
+            )
+        )
+    return tuple(
+        sorted(
+            selected,
+            key=lambda node_id: (
+                -float(controller.status_by_node[node_id].get("network_poll_seconds", 0.0) or 0.0),
+                float(controller.status_by_node[node_id].get("consumer_rate", 0.0) or 0.0),
+                node_id,
+            ),
+        )
+    )
+
+
+def _bounded_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return 0.0
+    return min(1.0, max(0.0, numerator / denominator))
+
+
 def end_of_stream_consumer_count(args: CqdagTrackerServiceConfig, role_controller) -> int:
     if role_controller is None:
         if args.consumer_count is None:
@@ -1001,6 +1604,13 @@ def advertised_connect_uri(uri: str | None, advertise_host: str) -> str:
     return uri
 
 
+def job_payload_item_count(payload: Mapping[str, Any]) -> int:
+    targets = payload.get("targets")
+    if isinstance(targets, (tuple, list)):
+        return len(targets)
+    return len(payload)
+
+
 def apply_endpoint_bundle(args: CqdagTrackerServiceConfig) -> None:
     if args.bind is None:
         return
@@ -1018,324 +1628,6 @@ def apply_endpoint_bundle(args: CqdagTrackerServiceConfig) -> None:
     args.public_batch_connect = public_bundle.batch
     args.public_ack_connect = public_bundle.ack
     args.public_model_connect = public_bundle.model
-
-
-class StreamingRecordBatchPublisher:
-    def __init__(
-        self,
-        sink: ZmqPushBatchSink,
-        *,
-        ack_source: ZmqPullBatchAckSource,
-        batch_size: int,
-        max_batch_payload_bytes: int,
-        ack_retry_interval_seconds: float,
-        metrics_path: Path | None,
-        metrics_flush_interval_seconds: float,
-        batch_retry_callback: Callable[[CQDAGPCFGBatchRetryEvent], None] | None = None,
-        initial_start_rank: int = 0,
-        initial_batch_id: int = 0,
-        batch_checkpoint_path: Path | None = None,
-        resume_batch_checkpoint: DurableBatchCheckpoint | None = None,
-    ) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if max_batch_payload_bytes <= 0:
-            raise ValueError("max_batch_payload_bytes must be positive")
-        if ack_retry_interval_seconds <= 0.0:
-            raise ValueError("ack_retry_interval_seconds must be positive")
-        self.sink = sink
-        self.ack_source = ack_source
-        self.batch_size = batch_size
-        self.max_batch_payload_bytes = max_batch_payload_bytes
-        self.ack_retry_interval_seconds = ack_retry_interval_seconds
-        self.batch_retry_callback = batch_retry_callback
-        self.metrics_path = metrics_path
-        self.metrics_flush_interval_seconds = metrics_flush_interval_seconds
-        self.started_at = monotonic()
-        self.next_metrics_write_at = 0.0
-        self.batch_checkpoint_path = batch_checkpoint_path
-        self.batch_id = initial_batch_id
-        self.start_rank = initial_start_rank
-        self.current: list[GuessRecord] = []
-        self.current_payload = 0
-        self.published_batches = 0
-        self.published_candidates = 0
-        self.published_payload_bytes = 0
-        self.ledger = BatchRetryLedger()
-        self.inflight_batches: dict[int, CandidateBatch] = {}
-        self.last_publish_at_by_batch: dict[int, float] = {}
-        if resume_batch_checkpoint is not None:
-            self.batch_id = max(self.batch_id, resume_batch_checkpoint.next_batch_id)
-            self.start_rank = max(
-                self.start_rank,
-                resume_batch_checkpoint.next_start_rank,
-            )
-            self.ledger = resume_batch_checkpoint.ledger
-            self.inflight_batches = dict(resume_batch_checkpoint.inflight_batches)
-            self.last_publish_at_by_batch = {
-                batch_id: 0.0 for batch_id in self.inflight_batches
-            }
-        self.ack_messages = 0
-        self.ack_failures = 0
-        self.republished_batches = 0
-        self.completed_batches = 0
-        self.protocol_metrics: dict[str, int] = {}
-        self.metrics_write_count = 0
-        self.metrics_write_seconds = 0.0
-        self._write_batch_checkpoint()
-        self.write_metrics(final=False)
-
-    def publish(self, record: GuessRecord) -> None:
-        record_bytes = guess_payload_bytes(record.guess)
-        if record_bytes > self.max_batch_payload_bytes:
-            raise ValueError("single guess exceeds max_batch_payload_bytes")
-        if self.current and (
-            len(self.current) >= self.batch_size
-            or self.current_payload + record_bytes > self.max_batch_payload_bytes
-        ):
-            self.flush()
-        self.current.append(record)
-        self.current_payload += record_bytes
-
-    def flush(self) -> None:
-        if not self.current:
-            self.drain_acks(timeout_ms=0)
-            self.republish_stale()
-            return
-        batch = CandidateBatch.from_records(
-            batch_id=self.batch_id,
-            start_rank=self.start_rank,
-            records=self.current,
-        )
-        self.ledger.publish(batch)
-        self.inflight_batches[batch.batch_id] = batch
-        self.sink.publish(batch)
-        self.last_publish_at_by_batch[batch.batch_id] = monotonic()
-        self.batch_id += 1
-        self.start_rank += len(self.current)
-        self.published_batches += 1
-        self.published_candidates += len(self.current)
-        self.published_payload_bytes += batch.payload_bytes
-        self.current = []
-        self.current_payload = 0
-        self.drain_acks(timeout_ms=0)
-        self.republish_stale()
-        self._write_batch_checkpoint()
-        self.write_metrics(final=False)
-
-    def republish_pending(self) -> None:
-        for batch_id, batch in sorted(self.inflight_batches.items()):
-            entry = self.ledger.entry(batch_id)
-            if entry is None or entry.state == BatchState.DONE:
-                continue
-            self.sink.publish(batch)
-            self.last_publish_at_by_batch[batch_id] = monotonic()
-            self.republished_batches += 1
-            self._notify_batch_retry(
-                batch,
-                reason="resume_pending",
-                attempts=entry.attempts,
-                consumer_id=entry.consumer_id,
-            )
-        self._write_batch_checkpoint()
-        self.write_metrics(final=False)
-
-    def drain_acks(self, *, timeout_ms: int) -> None:
-        first = True
-        while True:
-            ack = self.ack_source.receive(timeout_ms=timeout_ms if first else 0)
-            first = False
-            if ack is None:
-                return
-            self._handle_ack(ack)
-
-    def wait_for_acks(self, *, timeout_seconds: float) -> None:
-        deadline = monotonic() + timeout_seconds
-        while self.inflight_batches:
-            remaining = deadline - monotonic()
-            if remaining <= 0.0:
-                pending = sorted(self.inflight_batches)
-                raise TimeoutError(f"timed out waiting for batch ack: {pending}")
-            self.drain_acks(timeout_ms=min(100, max(1, int(remaining * 1000))))
-            self.republish_stale()
-
-    def republish_stale(self) -> None:
-        now = monotonic()
-        republished = False
-        for batch_id, batch in sorted(self.inflight_batches.items()):
-            entry = self.ledger.entry(batch_id)
-            if entry is None or entry.state == BatchState.DONE:
-                continue
-            last_publish_at = self.last_publish_at_by_batch.get(batch_id, 0.0)
-            if now - last_publish_at < self.ack_retry_interval_seconds:
-                continue
-            self.sink.publish(batch)
-            self.last_publish_at_by_batch[batch_id] = now
-            self.republished_batches += 1
-            self._notify_batch_retry(
-                batch,
-                reason="ack_timeout",
-                attempts=entry.attempts,
-                consumer_id=entry.consumer_id,
-            )
-            republished = True
-        if republished:
-            self._write_batch_checkpoint()
-            self.write_metrics(final=False)
-
-    def _handle_ack(self, ack: BatchAck) -> None:
-        batch = self.inflight_batches.get(ack.batch_id)
-        if batch is None:
-            return
-        entry = self.ledger.entry(ack.batch_id)
-        if entry is None:
-            return
-        if entry.state != BatchState.DONE:
-            self.ledger.start(ack.batch_id, consumer_id=ack.consumer_id)
-        self.ack_messages += 1
-        if ack.status == BatchAckStatus.DONE:
-            self.ledger.complete(ack.batch_id, consumer_id=ack.consumer_id)
-            del self.inflight_batches[ack.batch_id]
-            self.last_publish_at_by_batch.pop(ack.batch_id, None)
-            self.completed_batches += 1
-            self._write_batch_checkpoint()
-            return
-
-        failed_entry = self.ledger.fail(ack.batch_id, consumer_id=ack.consumer_id)
-        self.ack_failures += 1
-        self.sink.publish(batch)
-        self.last_publish_at_by_batch[ack.batch_id] = monotonic()
-        self.republished_batches += 1
-        self._notify_batch_retry(
-            batch,
-            reason="consumer_failed",
-            attempts=failed_entry.attempts,
-            consumer_id=ack.consumer_id,
-            error=ack.error,
-        )
-        self._write_batch_checkpoint()
-
-    def set_protocol_result(self, result) -> None:
-        self.protocol_metrics = {
-            "emitted_records": result.emitted_count,
-            "collected_outputs": len(result.outputs),
-            "chunkstore_resident_records": result.stats.resident_records,
-            "chunkstore_peak_resident_records": result.stats.peak_resident_records,
-            "chunkstore_reclaimed_records": result.stats.reclaimed_records,
-            "scheduler_affinity_hits": result.stats.affinity_hits,
-            "scheduler_affinity_misses": result.stats.affinity_misses,
-            "expired_leases": result.expired_leases,
-            "automatic_migrations": result.automatic_migrations,
-            "failed_migration_triggers": result.failed_migration_triggers,
-        }
-
-    def write_metrics(self, *, final: bool) -> None:
-        if self.metrics_path is None:
-            return
-        now = monotonic()
-        if not final and now < self.next_metrics_write_at:
-            return
-        self.next_metrics_write_at = now + self.metrics_flush_interval_seconds
-        elapsed = max(monotonic() - self.started_at, 1e-12)
-        network = self.sink.stats
-        ack_network = self.ack_source.stats
-        ledger = self.ledger.stats
-        started_at = perf_counter()
-        write_json(
-            self.metrics_path,
-            {
-                "role": "tracker",
-                "published_batches": self.published_batches,
-                "published_candidates": self.published_candidates,
-                "published_payload_bytes": self.published_payload_bytes,
-                "candidate_rate": self.published_candidates / elapsed,
-                "network_messages": network.messages,
-                "network_batch_messages": network.batch_messages,
-                "network_end_messages": network.end_messages,
-                "network_bytes": network.bytes,
-                "network_serialize_seconds": network.serialize_seconds,
-                "network_send_seconds": network.send_seconds,
-                "ack_messages": self.ack_messages,
-                "ack_failures": self.ack_failures,
-                "ack_completed_batches": self.completed_batches,
-                "ack_republished_batches": self.republished_batches,
-                "ack_pending_batches": len(self.inflight_batches),
-                "ack_network_messages": ack_network.messages,
-                "ack_network_bytes": ack_network.bytes,
-                "ack_network_recv_seconds": ack_network.recv_seconds,
-                "ack_network_deserialize_seconds": ack_network.deserialize_seconds,
-                "ledger_published": ledger.published,
-                "ledger_started": ledger.started,
-                "ledger_completed": ledger.completed,
-                "ledger_failed": ledger.failed,
-                "ledger_retries": ledger.retries,
-                "metrics_write_count": self.metrics_write_count,
-                "metrics_write_seconds": self.metrics_write_seconds,
-                "elapsed_seconds": elapsed,
-                "final": final,
-                **self.protocol_metrics,
-            },
-        )
-        self.metrics_write_seconds += perf_counter() - started_at
-        self.metrics_write_count += 1
-
-    def _write_batch_checkpoint(self) -> None:
-        if self.batch_checkpoint_path is None:
-            return
-        DurableBatchCheckpoint.create(
-            next_batch_id=self.batch_id,
-            next_start_rank=self.start_rank,
-            ledger=self.ledger,
-            inflight_batches=self.inflight_batches,
-        ).write_atomic(self.batch_checkpoint_path)
-
-    def _notify_batch_retry(
-        self,
-        batch: CandidateBatch,
-        *,
-        reason: str,
-        attempts: int,
-        consumer_id: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        log_event(
-            LOGGER,
-            logging.WARNING,
-            "tracker.batch_retry",
-            batch_id=batch.batch_id,
-            start_rank=batch.start_rank,
-            end_rank=batch.end_rank,
-            reason=reason,
-            attempts=attempts,
-            pending_batches=len(self.inflight_batches),
-            consumer_id=consumer_id,
-            error=error,
-        )
-        if self.batch_retry_callback is None:
-            return
-        self.batch_retry_callback(
-            CQDAGPCFGBatchRetryEvent(
-                batch_id=batch.batch_id,
-                start_rank=batch.start_rank,
-                end_rank=batch.end_rank,
-                reason=reason,
-                attempts=attempts,
-                pending_batches=len(self.inflight_batches),
-                consumer_id=consumer_id,
-                error=error,
-            )
-        )
-
-def read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
 
 
 __all__ = [

@@ -15,6 +15,7 @@ from cqdagpcfg_parallel.protocol import (
     SchedulerConfig,
     WorkerId,
     stable_digest,
+    stable_record_string,
 )
 from cqdagpcfg_parallel.runtime.worker import LocalProtocolWorker, LocalResultSource
 
@@ -65,7 +66,7 @@ class ProtocolSimulationResult:
 
     @property
     def stable_records(self) -> tuple[str, ...]:
-        return tuple(record.stable_string() for record in self.outputs)
+        return tuple(stable_record_string(record) for record in self.outputs)
 
 
 class SequenceRecordSource:

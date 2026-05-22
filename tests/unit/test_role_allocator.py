@@ -241,6 +241,44 @@ def test_dynamic_role_allocator_is_cqdag_aware_default() -> None:
     assert plan.reason == "cqdag_aware_elastic"
 
 
+def test_role_allocator_payback_blocks_short_tail_switch() -> None:
+    allocator = CqdagAwareElasticRoleAllocator()
+    snapshot = RoleAllocationInput(
+        total_nodes=5,
+        generator_rate_per_node=120.0,
+        consumer_rate_per_node=1000.0,
+        current_generator_count=3,
+        remaining_candidates=100,
+        role_swap_cost_seconds=1.0,
+    )
+    plan = allocator.plan(snapshot)
+
+    payback = allocator.payback_for(snapshot, plan, current_generator_count=3)
+
+    assert plan.generator_count == 4
+    assert not payback.should_switch
+    assert payback.reason == "negative_payback"
+
+
+def test_role_allocator_payback_allows_long_tail_switch() -> None:
+    allocator = CqdagAwareElasticRoleAllocator()
+    snapshot = RoleAllocationInput(
+        total_nodes=5,
+        generator_rate_per_node=120.0,
+        consumer_rate_per_node=1000.0,
+        current_generator_count=3,
+        remaining_candidates=10000,
+        role_swap_cost_seconds=1.0,
+    )
+    plan = allocator.plan(snapshot)
+
+    payback = allocator.payback_for(snapshot, plan, current_generator_count=3)
+
+    assert plan.generator_count == 4
+    assert payback.should_switch
+    assert payback.saved_seconds > 0.0
+
+
 def test_role_signals_build_cqdag_aware_allocation_input(tmp_path) -> None:
     tracker_metrics_path = tmp_path / "tracker.json"
     generator_metrics_path = tmp_path / "generator.json"
@@ -296,6 +334,7 @@ def test_role_signals_build_cqdag_aware_allocation_input(tmp_path) -> None:
     assert snapshot.current_generators == 1
     assert snapshot.current_consumers == 1
     assert snapshot.allocation_input.pending_candidates == 40
+    assert snapshot.allocation_input.remaining_candidates == 900
     assert snapshot.allocation_input.generator_rate_per_node == 200.0
     assert snapshot.allocation_input.consumer_rate_per_node == 120.0
     assert snapshot.allocation_input.cqdag_reclaim_pressure > 0.0

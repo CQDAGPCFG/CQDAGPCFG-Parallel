@@ -120,19 +120,22 @@ def fetch_job_context(
         role_client.close()
 
 
+def job_payload_from_job_context(job_context: JobContext) -> dict[str, Any]:
+    payload = dict(job_context.job_payload)
+    payload.setdefault("limit", job_context.limit)
+    payload.setdefault("model_fingerprint", job_context.model_fingerprint)
+    return payload
+
+
 def targets_from_job_context(job_context: JobContext) -> dict[str, Any]:
-    return {
-        "algorithm": job_context.hash_algorithm,
-        "limit": job_context.limit,
-        "model_fingerprint": job_context.model_fingerprint,
-        "targets": [dict(target) for target in job_context.targets],
-    }
+    return job_payload_from_job_context(job_context)
 
 
 __all__ = [
     "NodeEndpointConfig",
     "expand_node_endpoints",
     "fetch_job_context",
+    "job_payload_from_job_context",
     "resolve_node_id",
     "safe_node_filename",
     "targets_from_job_context",

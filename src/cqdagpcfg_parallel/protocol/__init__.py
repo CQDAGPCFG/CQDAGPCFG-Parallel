@@ -41,9 +41,11 @@ from .types import (
     EnumerationChunk,
     Lease,
     NodeId,
+    STABLE_PROBABILITY_DIGITS,
     WorkItem,
     WorkerId,
     stable_digest,
+    stable_record_string,
 )
 
 __all__ = [
@@ -83,8 +85,10 @@ __all__ = [
     "PriorityCostScheduler",
     "ScheduleStats",
     "SchedulerConfig",
+    "STABLE_PROBABILITY_DIGITS",
     "StaleLeaseError",
     "WorkItem",
     "WorkerId",
     "stable_digest",
+    "stable_record_string",
 ]

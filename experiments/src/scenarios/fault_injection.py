@@ -80,29 +80,38 @@ def main() -> None:
     )
     python = sys.executable
 
-    model_path = work_dir / "model.json"
-    targets_path = work_dir / "targets.json"
+    model_path = args.source_model_path or work_dir / "model.json"
+    job_spec_path = work_dir / "job-spec.json"
     checkpoint_path = work_dir / "tracker.checkpoint.json"
     stable_log_path = work_dir / "stable-records.jsonl"
     batch_checkpoint_path = work_dir / "batch.checkpoint.json"
     metrics_path = work_dir / "tracker.metrics.json"
 
+    if args.source_model_path is None:
+        train_cmd = [
+            python,
+            str(scripts_dir / "tools" / "train_model.py"),
+            "--model-path",
+            str(model_path),
+        ]
+        if args.train_file is not None:
+            train_cmd.extend(["--train-file", str(args.train_file)])
+        run_checked(train_cmd, env=env)
+    elif args.train_file is not None:
+        raise SystemExit("--train-file cannot be used with --source-model-path")
+
     prepare_cmd = [
         python,
         str(scripts_dir / "tools" / "prepare.py"),
-        "--model-path",
+        "--source-model-path",
         str(model_path),
-        "--targets-path",
-        str(targets_path),
+        "--job-spec-path",
+        str(job_spec_path),
         "--limit",
         str(args.limit),
         "--hash-algorithm",
         args.hash_algorithm,
     ]
-    if args.train_file is not None:
-        prepare_cmd.extend(["--train-file", str(args.train_file)])
-    if args.source_model_path is not None:
-        prepare_cmd.extend(["--source-model-path", str(args.source_model_path)])
     for rank in args.target_rank or []:
         prepare_cmd.extend(["--target-rank", str(rank)])
     run_checked(prepare_cmd, env=env)
@@ -117,21 +126,21 @@ def main() -> None:
             python=python,
             scripts_dir=scripts_dir,
             model_path=model_path,
-            targets_path=targets_path,
+            job_spec_path=job_spec_path,
             work_dir=work_dir,
             node_id=node_id,
             env=env,
         )
         for node_id in (*consumer_ids, "worker-0")
     ]
-    hit_paths = [work_dir / f"hits-{node_id}.json" for node_id in (*consumer_ids, "worker-0")]
+    output_paths = [work_dir / f"outputs-{node_id}.json" for node_id in (*consumer_ids, "worker-0")]
 
     tracker = start_tracker(
         args=args,
         python=python,
         scripts_dir=scripts_dir,
         model_path=model_path,
-        targets_path=targets_path,
+        job_spec_path=job_spec_path,
         checkpoint_path=checkpoint_path,
         stable_log_path=stable_log_path,
         batch_checkpoint_path=batch_checkpoint_path,
@@ -161,7 +170,7 @@ def main() -> None:
             python=python,
             scripts_dir=scripts_dir,
             model_path=model_path,
-            targets_path=targets_path,
+            job_spec_path=job_spec_path,
             checkpoint_path=checkpoint_path,
             stable_log_path=stable_log_path,
             batch_checkpoint_path=batch_checkpoint_path,
@@ -176,13 +185,13 @@ def main() -> None:
             python=python,
             scripts_dir=scripts_dir,
             model_path=model_path,
-            targets_path=targets_path,
+            job_spec_path=job_spec_path,
             work_dir=work_dir,
             node_id="worker-late",
             env=env,
         )
         agents.append(late_agent)
-        hit_paths.append(work_dir / "hits-worker-late.json")
+        output_paths.append(work_dir / "outputs-worker-late.json")
         print("fault recovery: tracker restarted and late worker joined")
 
         failures = wait_all([tracker, *agents], timeout_seconds=args.timeout_seconds)
@@ -190,7 +199,7 @@ def main() -> None:
             for command, code in failures:
                 print(f"process failed with code {code}: {command}", file=sys.stderr)
             raise SystemExit(1)
-        verify_hash_hits(targets_path, tuple(hit_paths))
+        verify_hash_hits(job_spec_path, tuple(output_paths))
         print("fault-injection run completed")
         print(f"  work dir          : {work_dir}")
         print(f"  checkpoint        : {checkpoint_path}")
@@ -214,7 +223,7 @@ def start_tracker(
     python: str,
     scripts_dir: Path,
     model_path: Path,
-    targets_path: Path,
+    job_spec_path: Path,
     checkpoint_path: Path,
     stable_log_path: Path,
     batch_checkpoint_path: Path,
@@ -222,50 +231,36 @@ def start_tracker(
     env: dict[str, str],
     resume: bool,
 ) -> subprocess.Popen[str]:
-    command = [
-        python,
-        str(scripts_dir / "services" / "tracker.py"),
-        "--model-path",
-        str(model_path),
-        "--targets-path",
-        str(targets_path),
-        "--control-bind",
-        args.control_bind,
-        "--batch-bind",
-        args.batch_bind,
-        "--ack-bind",
-        args.ack_bind,
-        "--consumer-count",
-        str(args.consumer_count),
-        "--demand-window",
-        str(args.demand_window),
-        "--max-chunk-size",
-        str(args.max_chunk_size),
-        "--batch-size",
-        str(args.batch_size),
-        "--max-batch-payload-bytes",
-        str(args.max_batch_payload_bytes),
-        "--checkpoint-path",
-        str(checkpoint_path),
-        "--checkpoint-stable-log-path",
-        str(stable_log_path),
-        "--batch-checkpoint-path",
-        str(batch_checkpoint_path),
-        "--metrics-path",
-        str(metrics_path),
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-    ]
+    tracker_env = {
+        **env,
+        "CQPCFG_MODEL_PATH": str(model_path),
+        "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
+        "CQPCFG_CONTROL_BIND": args.control_bind,
+        "CQPCFG_BATCH_BIND": args.batch_bind,
+        "CQPCFG_ACK_BIND": args.ack_bind,
+        "CQPCFG_CONSUMER_COUNT": str(args.consumer_count),
+        "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+        "CQPCFG_MAX_CHUNK_SIZE": str(args.max_chunk_size),
+        "CQPCFG_BATCH_SIZE": str(args.batch_size),
+        "CQPCFG_MAX_BATCH_PAYLOAD_BYTES": str(args.max_batch_payload_bytes),
+        "CQPCFG_CHECKPOINT_PATH": str(checkpoint_path),
+        "CQPCFG_CHECKPOINT_STABLE_LOG_PATH": str(stable_log_path),
+        "CQPCFG_BATCH_CHECKPOINT_PATH": str(batch_checkpoint_path),
+        "CQPCFG_METRICS_PATH": str(metrics_path),
+        "CQPCFG_TIMEOUT_SECONDS": str(args.timeout_seconds),
+    }
     if resume:
-        command.extend(
-            [
-                "--resume-checkpoint-path",
-                str(checkpoint_path),
-                "--resume-batch-checkpoint-path",
-                str(batch_checkpoint_path),
-            ]
+        tracker_env.update(
+            {
+                "CQPCFG_RESUME_CHECKPOINT_PATH": str(checkpoint_path),
+                "CQPCFG_RESUME_BATCH_CHECKPOINT_PATH": str(batch_checkpoint_path),
+            },
         )
-    return subprocess.Popen(command, env=env, text=True)
+    return subprocess.Popen(
+        [python, str(scripts_dir / "services" / "tracker.py")],
+        env=tracker_env,
+        text=True,
+    )
 
 
 def start_role_controller(
@@ -293,7 +288,7 @@ def start_agent(
     python: str,
     scripts_dir: Path,
     model_path: Path,
-    targets_path: Path,
+    job_spec_path: Path,
     work_dir: Path,
     node_id: str,
     env: dict[str, str],
@@ -305,13 +300,13 @@ def start_agent(
         "CQPCFG_NODE_ID": node_id,
         "CQPCFG_ROLE_CONNECT": args.role_connect,
         "CQPCFG_MODEL_PATH": str(model_path),
-        "CQPCFG_TARGETS_PATH": str(targets_path),
+        "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
         "CQPCFG_SOURCE_MODE": "root",
         "CQPCFG_CONTROL_CONNECT": args.control_connect,
         "CQPCFG_BATCH_CONNECT": args.batch_connect,
         "CQPCFG_ACK_CONNECT": args.ack_connect,
         "CQPCFG_METRICS_PATH": str(metrics_dir / f"{node_id}.json"),
-        "CQPCFG_HITS_PATH": str(work_dir / f"hits-{node_id}.json"),
+        "CQPCFG_OUTPUTS_PATH": str(work_dir / f"outputs-{node_id}.json"),
         "CQPCFG_HASH_DELAY_SECONDS": str(args.hash_delay_seconds),
         "CQPCFG_WORK_DELAY_SECONDS": str(args.worker_delay_seconds),
         "CQPCFG_DEMAND_WINDOW": str(args.demand_window),

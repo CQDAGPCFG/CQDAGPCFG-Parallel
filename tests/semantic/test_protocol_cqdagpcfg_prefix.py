@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import pytest
+from CQDAGPCFG import save_model
+from CQDAGPCFG.cpp_backend import cpp_backend_available
 from CQDAGPCFG.training import PCFGTrainer
 
 from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     CQDAGBlockGraphAdapter,
+    CQDAGNodeSourceConfig,
     CQDAGRecordSource,
     CQDAGStructureRecordSource,
     ROOT_NODE_ID,
     SerialCQDAGOracle,
+    build_cqdag_node_source,
+    resolve_generation_backend,
 )
 from cqdagpcfg_parallel.protocol import (
     ChunkSizePolicy,
     NodeStateTable,
     SchedulerConfig,
     WorkerId,
+    stable_record_string,
 )
 from cqdagpcfg_parallel.storage import StateMigrationSnapshot
 from cqdagpcfg_parallel.simulation import (
@@ -76,7 +82,9 @@ def test_protocol_loop_preserves_cqdagpcfg_serial_prefix(policy: ChunkSizePolicy
     result = simulator.run(limit)
 
     assert result.digest == baseline.digest
-    assert result.stable_records == tuple(record.stable_string() for record in baseline.outputs)
+    assert result.stable_records == tuple(
+        stable_record_string(record) for record in baseline.outputs
+    )
     assert result.stats.scheduled_items > 0
 
 
@@ -172,9 +180,79 @@ def test_cqdag_structure_source_skips_unneeded_prefix_without_caching_records() 
     assert tuple(record.stable_string() for record in skipped) == tuple(
         record.stable_string() for record in baseline
     )
-    assert stats.cached_records == end - start
-    assert stats.peak_cached_records == end - start
+    assert stats.cached_records >= end - start
+    assert stats.cached_records <= limit - start
+    assert stats.peak_cached_records >= end - start
     assert stats.reclaimed_records >= start
+
+
+def test_cpp_cqdag_structure_source_matches_python_stream_and_skip() -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    limit = min(node.cardinality, 24)
+    if limit < 8:
+        pytest.skip("toy model did not produce a large enough structure stream")
+    start = limit // 2
+    end = start + 3
+
+    baseline_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=limit,
+        adapter=adapter,
+        prefer_cpp=False,
+    )
+    baseline = baseline_source.read_range(node.node_id, 0, limit)
+
+    cpp_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=limit,
+        adapter=adapter,
+        prefer_cpp=True,
+    )
+    cpp_prefix = cpp_source.read_range(node.node_id, 0, limit)
+
+    skipping_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=limit,
+        adapter=adapter,
+        prefer_cpp=True,
+    )
+    skipped = skipping_source.read_range(node.node_id, start, end)
+    stats = skipping_source.stats()
+
+    assert tuple(record.stable_string() for record in cpp_prefix) == tuple(
+        record.stable_string() for record in baseline
+    )
+    assert tuple(record.stable_string() for record in skipped) == tuple(
+        record.stable_string() for record in baseline[start:end]
+    )
+    assert stats.cached_records >= end - start
+    assert stats.cached_records <= limit - start
+    assert stats.peak_cached_records >= end - start
+    assert stats.reclaimed_records >= start
+
+
+def test_node_source_auto_uses_cpp_for_structure_source(tmp_path) -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    model_path = tmp_path / "model.json"
+    save_model(model, model_path)
+
+    config = CQDAGNodeSourceConfig.from_explicit_model(
+        model_path=model_path,
+        model_connect=None,
+        model_id="toy",
+        source_mode="structure",
+        generation_backend="auto",
+    )
+    source = build_cqdag_node_source(config, limit=16)
+
+    assert resolve_generation_backend(config) == "cpp"
+    assert source.prefer_cpp is True
 
 
 def test_cqdag_structure_source_state_migration_resumes_stream_after_json_roundtrip() -> None:
@@ -219,7 +297,8 @@ def test_cqdag_structure_source_state_migration_resumes_stream_after_json_roundt
     assert tuple(record.stable_string() for record in prefix + suffix) == tuple(
         record.stable_string() for record in baseline
     )
-    assert migrated.streams[0].ready_end == cut
+    assert migrated.streams[0].stream_base == cut
+    assert migrated.streams[0].ready_end >= cut
     assert migrated.watermarks[0].reclaim_before == cut
 
 

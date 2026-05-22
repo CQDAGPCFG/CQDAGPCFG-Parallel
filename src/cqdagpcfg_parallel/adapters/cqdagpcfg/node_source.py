@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from CQDAGPCFG import load_model
+from CQDAGPCFG.cpp_backend import cpp_backend_available
 
 from cqdagpcfg_parallel.distributed import JobContext, WorkerResourceSpec
 from cqdagpcfg_parallel.runtime import ZmqModelArtifactClient
@@ -22,6 +24,9 @@ from .paged_source import (
 )
 
 
+CQDAGGenerationBackend = Literal["auto", "cpp", "paged", "python"]
+
+
 @dataclass(frozen=True, slots=True)
 class CQDAGNodeSourceConfig:
     model_path: Path | None
@@ -31,6 +36,7 @@ class CQDAGNodeSourceConfig:
     demand_window: int = 8
     disable_paged_source: bool = False
     model_json_page_cache: int = 128
+    generation_backend: CQDAGGenerationBackend = "auto"
 
     def __post_init__(self) -> None:
         if self.source_mode not in {"root", "structure"}:
@@ -39,6 +45,8 @@ class CQDAGNodeSourceConfig:
             raise ValueError("demand_window cannot be negative")
         if self.model_json_page_cache <= 0:
             raise ValueError("model_json_page_cache must be positive")
+        if self.generation_backend not in {"auto", "cpp", "paged", "python"}:
+            raise ValueError("generation_backend must be auto, cpp, paged, or python")
 
     @classmethod
     def from_job_context(
@@ -47,6 +55,7 @@ class CQDAGNodeSourceConfig:
         *,
         disable_paged_source: bool = False,
         model_json_page_cache: int = 128,
+        generation_backend: CQDAGGenerationBackend = "auto",
         resources: WorkerResourceSpec | None = None,
     ) -> "CQDAGNodeSourceConfig":
         return cls(
@@ -57,6 +66,7 @@ class CQDAGNodeSourceConfig:
             demand_window=job_context.demand_window,
             disable_paged_source=disable_paged_source,
             model_json_page_cache=_resource_page_cache(model_json_page_cache, resources),
+            generation_backend=generation_backend,
         )
 
     @classmethod
@@ -70,6 +80,7 @@ class CQDAGNodeSourceConfig:
         demand_window: int = 8,
         disable_paged_source: bool = False,
         model_json_page_cache: int = 128,
+        generation_backend: CQDAGGenerationBackend = "auto",
         resources: WorkerResourceSpec | None = None,
     ) -> "CQDAGNodeSourceConfig":
         if model_path is None and model_connect is None:
@@ -82,6 +93,7 @@ class CQDAGNodeSourceConfig:
             demand_window=demand_window,
             disable_paged_source=disable_paged_source,
             model_json_page_cache=_resource_page_cache(model_json_page_cache, resources),
+            generation_backend=generation_backend,
         )
 
 
@@ -92,7 +104,8 @@ def build_cqdag_node_source(
     limit: int,
     expected_fingerprint: str | None = None,
 ):
-    if config.model_path is None and not config.disable_paged_source:
+    backend = resolve_generation_backend(config)
+    if backend == "paged":
         model = build_paged_model(
             endpoint=config.model_connect,
             model_id=config.model_id,
@@ -102,7 +115,7 @@ def build_cqdag_node_source(
             expected_fingerprint is not None
             and model.paged_manifest.model_fingerprint != expected_fingerprint
         ):
-            raise RuntimeError("paged model fingerprint does not match targets")
+            raise RuntimeError("paged model fingerprint does not match job spec")
         if config.source_mode == "structure":
             return PagedCQDAGStructureRecordSource(
                 model,
@@ -125,11 +138,35 @@ def build_cqdag_node_source(
             model,
             max_records_per_structure=limit + config.demand_window,
             adapter=adapter,
+            prefer_cpp=backend == "cpp",
         )
     return CQDAGRecordSource(
         model,
         max_records=limit + config.demand_window,
+        prefer_cpp=backend == "cpp",
     )
+
+
+def resolve_generation_backend(
+    config: CQDAGNodeSourceConfig,
+) -> CQDAGGenerationBackend:
+    if config.disable_paged_source and config.generation_backend == "paged":
+        raise ValueError("disable_paged_source cannot be used with generation_backend=paged")
+    if config.generation_backend == "python":
+        return "python"
+    if config.generation_backend == "paged":
+        return "paged"
+    if config.generation_backend == "cpp":
+        if not cpp_backend_available():
+            raise RuntimeError(
+                "generation_backend=cpp requires the CQDAGPCFG C++ backend to be built"
+            )
+        return "cpp"
+    if config.disable_paged_source:
+        return "cpp" if cpp_backend_available() else "python"
+    if cpp_backend_available():
+        return "cpp"
+    return "paged"
 
 
 def resolve_cqdag_model_path(
@@ -143,7 +180,7 @@ def resolve_cqdag_model_path(
             expected_fingerprint is not None
             and file_model_fingerprint(config.model_path) != expected_fingerprint
         ):
-            raise RuntimeError("local model fingerprint does not match targets")
+            raise RuntimeError("local model fingerprint does not match job spec")
         return config.model_path
     cache_dir = (
         model_cache_dir
@@ -159,7 +196,7 @@ def resolve_cqdag_model_path(
         expected_fingerprint is not None
         and manifest.model_fingerprint != expected_fingerprint
     ):
-        raise RuntimeError("fetched model fingerprint does not match targets")
+        raise RuntimeError("fetched model fingerprint does not match job spec")
     return model_path
 
 
@@ -173,7 +210,9 @@ def _resource_page_cache(
 
 
 __all__ = [
+    "CQDAGGenerationBackend",
     "CQDAGNodeSourceConfig",
     "build_cqdag_node_source",
+    "resolve_generation_backend",
     "resolve_cqdag_model_path",
 ]

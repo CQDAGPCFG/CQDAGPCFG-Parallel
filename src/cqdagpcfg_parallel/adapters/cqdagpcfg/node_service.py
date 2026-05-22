@@ -23,9 +23,9 @@ from cqdagpcfg_parallel.distributed import (
     cqpcfg_generator,
     expand_node_endpoints,
     fetch_job_context,
+    job_payload_from_job_context,
     resolve_node_id,
     safe_node_filename,
-    targets_from_job_context,
     worker_resources,
 )
 from cqdagpcfg_parallel.framework_logging import (
@@ -35,14 +35,18 @@ from cqdagpcfg_parallel.framework_logging import (
 from cqdagpcfg_parallel.protocol import NodeId, WorkerId
 from cqdagpcfg_parallel.runtime import (
     CandidateBatch,
-    HashTargetSet,
     LazyLocalResultSource,
     LocalResultSource,
-    NodeAgentJsonReporter,
 )
 from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint
 
-from .node_source import CQDAGNodeSourceConfig, build_cqdag_node_source
+from .node_reporting import NodeAgentJsonReporter
+from .node_source import (
+    CQDAGGenerationBackend,
+    CQDAGNodeSourceConfig,
+    build_cqdag_node_source,
+    resolve_generation_backend,
+)
 
 
 LOGGER = logging.getLogger("cqdagpcfg.node")
@@ -64,33 +68,33 @@ class CqdagNodeAgentServiceConfig:
     resource_gpus: int | None = None
     resource_gpu_memory: str | None = None
     disable_paged_source: bool = False
-    targets_path: Path | None = None
+    generation_backend: CQDAGGenerationBackend = "auto"
+    job_spec_path: Path | None = None
     source_mode: str = "root"
     control_connect: str = "cqpcfg://127.0.0.1:5555"
     batch_connect: str = "cqpcfg://127.0.0.1:5556"
     ack_connect: str = "cqpcfg://127.0.0.1:5558"
     demand_window: int = 8
     work_delay_seconds: float = 0.0
-    hash_delay_seconds: float = 0.0
     receive_timeout_ms: int = 100
     consumer_drain_quiet_ms: int = 200
     consumer_drain_timeout_ms: int = 2000
     idle_sleep_seconds: float = 0.01
     role_refresh_interval_seconds: float = 0.05
+    role_refresh_max_interval_seconds: float = 1.0
+    role_control_overhead_budget: float = 0.01
     role_reply_timeout_ms: int = 100
     job_bootstrap_timeout_seconds: float = 30.0
     metrics_flush_interval_seconds: float = 0.25
     experiment_start_monotonic: float | None = None
     metrics_path: Path | None = None
     metrics_dir: Path | None = None
-    hits_path: Path | None = None
-    hits_dir: Path | None = None
+    outputs_path: Path | None = None
+    outputs_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.model_json_page_cache <= 0:
             raise ValueError("model_json_page_cache must be positive")
-        if self.hash_delay_seconds < 0.0:
-            raise ValueError("hash_delay_seconds cannot be negative")
         if self.work_delay_seconds < 0.0:
             raise ValueError("work_delay_seconds cannot be negative")
         if self.receive_timeout_ms < 0:
@@ -103,6 +107,13 @@ class CqdagNodeAgentServiceConfig:
             raise ValueError("idle_sleep_seconds cannot be negative")
         if self.role_refresh_interval_seconds <= 0.0:
             raise ValueError("role_refresh_interval_seconds must be positive")
+        if self.role_refresh_max_interval_seconds < self.role_refresh_interval_seconds:
+            raise ValueError(
+                "role_refresh_max_interval_seconds must be greater than or equal to "
+                "role_refresh_interval_seconds",
+            )
+        if not 0.0 < self.role_control_overhead_budget <= 1.0:
+            raise ValueError("role_control_overhead_budget must be in (0, 1]")
         if self.role_reply_timeout_ms < 0:
             raise ValueError("role_reply_timeout_ms cannot be negative")
         if self.job_bootstrap_timeout_seconds < 0.0:
@@ -113,10 +124,12 @@ class CqdagNodeAgentServiceConfig:
             raise ValueError("demand_window cannot be negative")
         if self.source_mode not in {"root", "structure"}:
             raise ValueError("source_mode must be root or structure")
+        if self.generation_backend not in {"auto", "cpp", "paged", "python"}:
+            raise ValueError("generation_backend must be auto, cpp, paged, or python")
         if self.metrics_path is not None and self.metrics_dir is not None:
             raise ValueError("metrics_path and metrics_dir cannot both be set")
-        if self.hits_path is not None and self.hits_dir is not None:
-            raise ValueError("hits_path and hits_dir cannot both be set")
+        if self.outputs_path is not None and self.outputs_dir is not None:
+            raise ValueError("outputs_path and outputs_dir cannot both be set")
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +161,7 @@ class CQDAGCandidate:
             record=record,
         )
 
-    def hit_info(self) -> dict[str, Any]:
+    def output_metadata(self) -> dict[str, Any]:
         return {
             "batch_id": self.batch_id,
             "offset": self.offset,
@@ -165,35 +178,34 @@ class CQDAGCandidate:
 class CQDAGPCFGNodeContext:
     config: CqdagNodeAgentServiceConfig
     node_id: str
-    targets: Mapping[str, Any]
-    target_hashes: HashTargetSet
+    job_payload: Mapping[str, Any]
     source_config: CQDAGNodeSourceConfig
     control_connect: str
     batch_connect: str
     role_connect: str
     ack_connect: str | None
     started_at: float
-    _hits: list[dict[str, Any]]
+    _consumer_outputs: list[dict[str, Any]]
     reporter: NodeAgentJsonReporter
 
     @property
     def model_fingerprint(self) -> str | None:
-        fingerprint = self.targets.get("model_fingerprint")
+        fingerprint = self.job_payload.get("model_fingerprint")
         return None if fingerprint is None else str(fingerprint)
 
     @property
-    def hit_count(self) -> int:
-        return len(self._hits)
+    def output_count(self) -> int:
+        return len(self._consumer_outputs)
 
     @property
-    def hits(self) -> tuple[Mapping[str, Any], ...]:
-        return tuple(dict(hit) for hit in self._hits)
+    def consumer_outputs(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(dict(output) for output in self._consumer_outputs)
 
     def build_source(self) -> LocalResultSource:
         return build_cqdag_node_source(
             self.source_config,
             model_cache_dir=self.config.model_cache_dir,
-            limit=int(self.targets["limit"]),
+            limit=int(self.job_payload["limit"]),
             expected_fingerprint=self.model_fingerprint,
         )
 
@@ -251,8 +263,8 @@ def cqdagpcfg_node_agent(
     """Declare a CQDAGPCFG elastic node with a user-visible decorator.
 
     The decorated class is intentionally just the user's declaration site. The
-    default CQDAGPCFG source, hash consumer, role hot-swap, model paging, and
-    metrics wiring are provided by this adapter.
+    default CQDAGPCFG source, candidate consumer, role hot-swap, model paging,
+    and metrics wiring are provided by this adapter.
     """
 
     if config is None:
@@ -678,6 +690,7 @@ def _run_cqdag_node_agent_service(
         role_connect=context.role_connect,
         ack_connect=context.ack_connect,
         model_fingerprint=context.model_fingerprint,
+        generation_backend=resolve_generation_backend(context.source_config),
         cpu_cores=resources.cpu_cores,
         memory_bytes=resources.memory_bytes,
         gpu_count=resources.gpu_count,
@@ -707,6 +720,8 @@ def _run_cqdag_node_agent_service(
         consumer_drain_timeout_ms=config.consumer_drain_timeout_ms,
         idle_sleep_seconds=config.idle_sleep_seconds,
         role_refresh_interval_seconds=config.role_refresh_interval_seconds,
+        role_refresh_max_interval_seconds=config.role_refresh_max_interval_seconds,
+        role_control_overhead_budget=config.role_control_overhead_budget,
         stats_flush_interval_seconds=config.metrics_flush_interval_seconds,
         stats_callback=context.reporter.write,
         resources=resources,
@@ -725,7 +740,7 @@ def _run_cqdag_node_agent_service(
         consumer_sessions=stats.consumer_sessions,
         completed_records=stats.completed_records,
         consumed_candidates=stats.consumed_candidates,
-        hits=context.hit_count,
+        consumer_outputs=context.output_count,
         source_peak_cached_records=stats.source_peak_cached_records,
         source_reclaimed_records=stats.source_reclaimed_records,
         network_bytes=stats.network_bytes,
@@ -755,12 +770,12 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
         suffix=".json",
         label="metrics",
     )
-    hits_path = _resolve_output_path(
-        explicit_path=config.hits_path,
-        directory=config.hits_dir,
+    outputs_path = _resolve_output_path(
+        explicit_path=config.outputs_path,
+        directory=config.outputs_dir,
         node_id=node_id,
         suffix=".json",
-        label="hits",
+        label="outputs",
     )
 
     resources = worker_resources(
@@ -770,7 +785,8 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
         resource_gpu_memory=config.resource_gpu_memory,
         model_json_page_cache=config.model_json_page_cache,
     )
-    if config.targets_path is None:
+    job_spec_path = config.job_spec_path
+    if job_spec_path is None:
         bootstrap_reply = fetch_job_context(
             node_id=node_id,
             role_connect=endpoints.role_connect,
@@ -795,10 +811,11 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
             ack_connect=job_context.ack_connect,
             model_connect=job_context.model_connect,
         )
-        targets = targets_from_job_context(job_context)
+        job_payload = job_payload_from_job_context(job_context)
         source_config = CQDAGNodeSourceConfig.from_job_context(
             job_context,
             disable_paged_source=config.disable_paged_source,
+            generation_backend=config.generation_backend,
             model_json_page_cache=config.model_json_page_cache,
             resources=resources,
         )
@@ -806,13 +823,13 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
         batch_connect = job_context.batch_connect
         ack_connect = job_context.ack_connect
     else:
-        targets = _read_json(config.targets_path)
+        job_payload = _read_json(job_spec_path)
         log_event(
             LOGGER,
             logging.INFO,
             "node.explicit_job_loaded",
             node_id=node_id,
-            targets_path=config.targets_path,
+            job_spec_path=job_spec_path,
             model_path=config.model_path,
             model_connect=endpoints.model_connect,
             source_mode=config.source_mode,
@@ -824,6 +841,7 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
             source_mode=config.source_mode,
             demand_window=config.demand_window,
             disable_paged_source=config.disable_paged_source,
+            generation_backend=config.generation_backend,
             model_json_page_cache=config.model_json_page_cache,
             resources=resources,
         )
@@ -831,8 +849,8 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
         batch_connect = endpoints.batch_connect
         ack_connect = endpoints.ack_connect
 
-    limit = int(targets["limit"])
-    hits: list[dict[str, Any]] = []
+    limit = int(job_payload["limit"])
+    consumer_outputs: list[dict[str, Any]] = []
     started_at = (
         monotonic()
         if config.experiment_start_monotonic is None
@@ -840,23 +858,21 @@ def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeCon
     )
     reporter = NodeAgentJsonReporter(
         metrics_path=metrics_path,
-        hits_path=hits_path,
-        algorithm=str(targets["algorithm"]),
+        outputs_path=outputs_path,
         limit=limit,
-        hits_provider=lambda: hits,
+        outputs_provider=lambda: consumer_outputs,
     )
     return CQDAGPCFGNodeContext(
         config=config,
         node_id=node_id,
-        targets=targets,
-        target_hashes=HashTargetSet(targets),
+        job_payload=job_payload,
         source_config=source_config,
         control_connect=control_connect,
         batch_connect=batch_connect,
         role_connect=endpoints.role_connect,
         ack_connect=ack_connect,
         started_at=started_at,
-        _hits=hits,
+        _consumer_outputs=consumer_outputs,
         reporter=reporter,
     )
 
@@ -928,27 +944,29 @@ def _node_agent_config_from_env(prefix: str) -> CqdagNodeAgentServiceConfig:
         "resource_gpus": _env_int,
         "resource_gpu_memory": _env_str,
         "disable_paged_source": _env_bool,
-        "targets_path": _env_path,
+        "generation_backend": _env_str,
+        "job_spec_path": _env_path,
         "source_mode": _env_str,
         "control_connect": _env_str,
         "batch_connect": _env_str,
         "ack_connect": _env_str,
         "demand_window": _env_int,
         "work_delay_seconds": _env_float,
-        "hash_delay_seconds": _env_float,
         "receive_timeout_ms": _env_int,
         "consumer_drain_quiet_ms": _env_int,
         "consumer_drain_timeout_ms": _env_int,
         "idle_sleep_seconds": _env_float,
         "role_refresh_interval_seconds": _env_float,
+        "role_refresh_max_interval_seconds": _env_float,
+        "role_control_overhead_budget": _env_float,
         "role_reply_timeout_ms": _env_int,
         "job_bootstrap_timeout_seconds": _env_float,
         "metrics_flush_interval_seconds": _env_float,
         "experiment_start_monotonic": _env_float,
         "metrics_path": _env_path,
         "metrics_dir": _env_path,
-        "hits_path": _env_path,
-        "hits_dir": _env_path,
+        "outputs_path": _env_path,
+        "outputs_dir": _env_path,
     }
     for field_name, reader in readers.items():
         env_name = f"{normalized_prefix}_{field_name.upper()}"
@@ -1064,9 +1082,9 @@ def _capture_consumer_results(
     consumer: AnnotatedConsumer,
     context: CQDAGPCFGNodeContext,
 ) -> AnnotatedConsumer:
-    def handler(batch: CandidateBatch) -> None:
+    def handler(batch: CandidateBatch):
         result = consumer.handler(batch)
-        _record_consumer_result(context, batch, result)
+        return _record_consumer_result(context, batch, result)
 
     return AnnotatedConsumer(
         handler=handler,
@@ -1078,51 +1096,50 @@ def _record_consumer_result(
     context: CQDAGPCFGNodeContext,
     batch: CandidateBatch,
     result: object,
-) -> None:
+) -> tuple[dict[str, Any], ...]:
     if result is None:
-        return
+        return ()
+    if isinstance(result, str):
+        output = _normalize_consumer_output(context, batch, {"value": result})
+        context._consumer_outputs.append(output)
+        return (output,)
     if isinstance(result, Mapping):
-        context._hits.extend(_normalize_consumer_hit(context, batch, result))
-        return
+        output = _normalize_consumer_output(context, batch, result)
+        context._consumer_outputs.append(output)
+        return (output,)
     if not isinstance(result, Iterable) or isinstance(result, (str, bytes)):
         raise TypeError(
             "@cqdagpcfg_consumer must return None, a mapping, or an iterable of mappings"
         )
+    outputs: list[dict[str, Any]] = []
     for item in result:
         if not isinstance(item, Mapping):
             raise TypeError(
                 "@cqdagpcfg_consumer returned an iterable containing a non-mapping item"
             )
-        context._hits.extend(_normalize_consumer_hit(context, batch, item))
+        output = _normalize_consumer_output(context, batch, item)
+        context._consumer_outputs.append(output)
+        outputs.append(output)
+    return tuple(outputs)
 
 
-def _normalize_consumer_hit(
+def _normalize_consumer_output(
     context: CQDAGPCFGNodeContext,
     batch: CandidateBatch,
-    hit: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    normalized = dict(hit)
+    output: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(output)
     offset = normalized.get("offset")
     if offset is not None:
         candidate = CQDAGCandidate.from_batch(batch, int(offset))
-        metadata = candidate.hit_info()
+        metadata = candidate.output_metadata()
         metadata.update(normalized)
         normalized = metadata
     else:
         normalized.setdefault("batch_id", batch.batch_id)
     normalized.setdefault("node_id", context.node_id)
     normalized.setdefault("elapsed_seconds", monotonic() - context.started_at)
-    if "target_rank" in normalized:
-        return [normalized]
-    digest = normalized.get("hash")
-    if digest is None:
-        return [normalized]
-    matched_hits = []
-    for match in context.target_hashes.matches_for_digest(str(digest)):
-        enriched = dict(normalized)
-        enriched.update(match)
-        matched_hits.append(enriched)
-    return matched_hits
+    return normalized
 
 
 def _wrap_cqdagpcfg_consumer(
@@ -1140,7 +1157,7 @@ def _wrap_cqdagpcfg_consumer(
             raise TypeError("@cqdagpcfg_consumer expected a CandidateBatch from the runtime")
         batch = args[-1]
         prefix = args[:-1]
-        hits: list[dict[str, Any]] = []
+        outputs: list[dict[str, Any]] = []
         for offset in range(len(batch.records)):
             candidate = CQDAGCandidate.from_batch(batch, offset)
             if first_param_name == "guess":
@@ -1149,8 +1166,8 @@ def _wrap_cqdagpcfg_consumer(
                 result = consumer_handler(*prefix, candidate.record)
             else:
                 result = consumer_handler(*prefix, candidate)
-            hits.extend(_candidate_result_to_hits(candidate, result))
-        return hits
+            outputs.extend(_candidate_result_to_outputs(candidate, result))
+        return outputs
 
     return candidate_consumer
 
@@ -1178,46 +1195,47 @@ def _business_parameters(handler: Callable[..., object]):
     ]
 
 
-def _candidate_result_to_hits(
+def _candidate_result_to_outputs(
     candidate: CQDAGCandidate,
     result: object,
 ) -> list[dict[str, Any]]:
     if result is None or result is False:
         return []
     if result is True:
-        return [candidate.hit_info()]
+        return [candidate.output_metadata()]
     if isinstance(result, str):
-        hit = candidate.hit_info()
-        hit["hash"] = result
-        return [hit]
+        output = candidate.output_metadata()
+        output["value"] = result
+        return [output]
     if isinstance(result, Mapping):
-        hit = candidate.hit_info()
-        hit.update(dict(result))
-        return [hit]
+        output = candidate.output_metadata()
+        output.update(dict(result))
+        return [output]
     if not isinstance(result, Iterable) or isinstance(result, (str, bytes)):
         raise TypeError(
-            "@cqdagpcfg_consumer must return None, bool, a mapping, or an iterable of mappings"
+            "@cqdagpcfg_consumer must return None, bool, str, a mapping, "
+            "or an iterable of output values"
         )
-    hits = []
+    outputs = []
     for item in result:
         if item is None or item is False:
             continue
         if item is True:
-            hits.append(candidate.hit_info())
+            outputs.append(candidate.output_metadata())
             continue
         if isinstance(item, str):
-            hit = candidate.hit_info()
-            hit["hash"] = item
-            hits.append(hit)
+            output = candidate.output_metadata()
+            output["value"] = item
+            outputs.append(output)
             continue
         if not isinstance(item, Mapping):
             raise TypeError(
-                "@cqdagpcfg_consumer returned an iterable containing a non-mapping item"
+                "@cqdagpcfg_consumer returned an iterable containing an unsupported item"
             )
-        hit = candidate.hit_info()
-        hit.update(dict(item))
-        hits.append(hit)
-    return hits
+        output = candidate.output_metadata()
+        output.update(dict(item))
+        outputs.append(output)
+    return outputs
 
 
 def _validate_component_declarations(node_class: type[Any]) -> None:
@@ -1262,12 +1280,20 @@ def _instantiate_node_class(
 ) -> object:
     parameters = signature(node_class).parameters
     if len(parameters) == 1:
-        return node_class(context)
+        parameter_name = next(iter(parameters))
+        if parameter_name in {"job_payload", "payload"}:
+            instance = node_class(context.job_payload)
+        else:
+            instance = node_class(context)
+        setattr(instance, "context", context)
+        return instance
     if len(parameters) == 0:
         instance = node_class()
         setattr(instance, "context", context)
         return instance
-    raise TypeError("cqdagpcfg node class must accept zero arguments or context")
+    raise TypeError(
+        "cqdagpcfg node class must accept zero arguments, context, or job_payload"
+    )
 
 
 def _bind_class_components(

@@ -29,7 +29,6 @@ from .batch_transport import (
 )
 from .candidate_batch import CandidateBatch, guess_payload_bytes
 from .candidate_queue import BoundedCandidateQueue, CandidateQueueStats, QueueWatermark
-from .hash_targets import HashTargetConsumer, HashTargetSet, NodeAgentJsonReporter, digest_guess
 from .mock_pipeline import PipelineConfig, PipelineStats, run_candidate_pipeline
 from .model_transport import (
     DEFAULT_MODEL_FETCH_RETRIES,
@@ -83,8 +82,6 @@ __all__ = [
     "DEFAULT_ZMQ_HIGH_WATERMARK",
     "DEFAULT_ZMQ_LINGER_MS",
     "DurableBatchCheckpoint",
-    "HashTargetConsumer",
-    "HashTargetSet",
     "JsonCandidateBatchCodec",
     "JsonBatchAckCodec",
     "JsonModelFetchCodec",
@@ -98,7 +95,6 @@ __all__ = [
     "ModelFetchRequest",
     "ModelFetchResponse",
     "ModelFetchTimeoutError",
-    "NodeAgentJsonReporter",
     "PipelineConfig",
     "PipelineStats",
     "QueueWatermark",
@@ -112,7 +108,6 @@ __all__ = [
     "ZmqModelArtifactClient",
     "ZmqModelArtifactServer",
     "WorkerRunResult",
-    "digest_guess",
     "guess_payload_bytes",
     "make_candidate_batches",
     "publish_candidate_batches",

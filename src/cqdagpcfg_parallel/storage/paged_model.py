@@ -171,7 +171,7 @@ class FilePagedModelArtifactStore(FileModelArtifactStore):
 
         slot_manifests: list[PagedSlotTableManifest] = []
         for symbol, table in sorted(slot_tables_raw.items()):
-            entries = tuple(dict(entry) for entry in table["entries"])
+            entries = _normalized_slot_entries(table)
             page_count = ceil(len(entries) / slot_page_size) if entries else 0
             slot_manifest = PagedSlotTableManifest(
                 symbol=symbol,
@@ -280,6 +280,26 @@ def _slot_access_weight(entries: tuple[Mapping[str, Any], ...]) -> float:
         if prob > 0.0:
             entropy -= prob * log(prob)
     return max(entropy, MIN_SLOT_ACCESS_WEIGHT)
+
+
+def _normalized_slot_entries(
+    table: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    entries = tuple(dict(entry) for entry in table["entries"])
+    if not entries:
+        return ()
+    unknown_prob = float(table.get("unknown_prob", 0.0))
+    total = sum(float(entry["prob"]) for entry in entries)
+    if total <= 0.0:
+        raise ValueError("slot table has non-positive total probability")
+    visible_mass = 1.0 - unknown_prob
+    return tuple(
+        {
+            **entry,
+            "prob": (float(entry["prob"]) / total) * visible_mass,
+        }
+        for entry in entries
+    )
 
 
 def _fingerprint_dirname(fingerprint: str) -> str:

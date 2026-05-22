@@ -20,7 +20,7 @@ from .worker import DistributedProtocolWorker, DistributedWorkerStats
 
 ConfigFactory = Callable[[], DistributedProtocolConfig | None]
 WorkerSourceFactory = Callable[..., LocalResultSource]
-ConsumerHandler = Callable[[CandidateBatch], None]
+ConsumerHandler = Callable[[CandidateBatch], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +42,10 @@ class AnnotatedConsumer:
     role: str = "consumer"
     closed: bool = False
 
-    def publish(self, batch: CandidateBatch) -> None:
+    def publish(self, batch: CandidateBatch) -> object:
         if self.closed:
             raise RuntimeError("cannot publish to a closed annotated consumer")
-        self.handler(batch)
+        return self.handler(batch)
 
     def close(self) -> None:
         if self.closed:
@@ -54,8 +54,8 @@ class AnnotatedConsumer:
         if self.close_handler is not None:
             self.close_handler()
 
-    def __call__(self, batch: CandidateBatch) -> None:
-        self.publish(batch)
+    def __call__(self, batch: CandidateBatch) -> object:
+        return self.publish(batch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +163,8 @@ class AnnotatedNodeAgent:
     consumer_drain_timeout_ms: int = 2000
     idle_sleep_seconds: float = 0.01
     role_refresh_interval_seconds: float = 0.05
+    role_refresh_max_interval_seconds: float = 1.0
+    role_control_overhead_budget: float = 0.01
     stats_flush_interval_seconds: float = 0.25
     stats_callback: NodeAgentStatsCallback | None = None
 
@@ -190,6 +192,8 @@ class AnnotatedNodeAgent:
             consumer_drain_timeout_ms=self.consumer_drain_timeout_ms,
             idle_sleep_seconds=self.idle_sleep_seconds,
             role_refresh_interval_seconds=self.role_refresh_interval_seconds,
+            role_refresh_max_interval_seconds=self.role_refresh_max_interval_seconds,
+            role_control_overhead_budget=self.role_control_overhead_budget,
             stats_flush_interval_seconds=self.stats_flush_interval_seconds,
             stats_callback=self.stats_callback,
             resources=self.resources,
@@ -368,6 +372,8 @@ def cqpcfg_node_agent(
     consumer_drain_timeout_ms: int = 2000,
     idle_sleep_seconds: float = 0.01,
     role_refresh_interval_seconds: float = 0.05,
+    role_refresh_max_interval_seconds: float = 1.0,
+    role_control_overhead_budget: float = 0.01,
     stats_flush_interval_seconds: float = 0.25,
     stats_callback: NodeAgentStatsCallback | None = None,
     resources: WorkerResourceSpec | None = None,
@@ -414,6 +420,8 @@ def cqpcfg_node_agent(
             consumer_drain_timeout_ms=consumer_drain_timeout_ms,
             idle_sleep_seconds=idle_sleep_seconds,
             role_refresh_interval_seconds=role_refresh_interval_seconds,
+            role_refresh_max_interval_seconds=role_refresh_max_interval_seconds,
+            role_control_overhead_budget=role_control_overhead_budget,
             stats_flush_interval_seconds=stats_flush_interval_seconds,
             stats_callback=stats_callback,
         )

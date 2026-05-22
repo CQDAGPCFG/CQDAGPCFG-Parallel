@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from math import log, prod
 from typing import Any, Iterable, Sequence
 
 from CQDAGPCFG import GuessRecord
+from CQDAGPCFG.cpp_backend import CppOptimizedCQDAGEnumerator
 from CQDAGPCFG.enumeration.optimized.blocks import (
     LeafBlock,
     LocalMergedBlock,
@@ -21,6 +23,7 @@ from cqdagpcfg_parallel.protocol import (
     NodeId,
     NodeSchedulingFeatures,
     NodeStateTable,
+    STABLE_PROBABILITY_DIGITS,
     WorkerId,
 )
 from cqdagpcfg_parallel.storage import (
@@ -42,7 +45,7 @@ from .serial_oracle import SerialCQDAGOracle
 
 ROOT_NODE_ID = NodeId("root")
 _SOURCE_SKIP_ACK_WINDOW = 64
-_SERIAL_PROBABILITY_ROUND_DIGITS = 15
+_SERIAL_PROBABILITY_SIGNIFICANT_DIGITS = STABLE_PROBABILITY_DIGITS
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +81,7 @@ class CQDAGRecordSource:
         *,
         node_id: NodeId = ROOT_NODE_ID,
         max_records: int,
-        prefer_cpp: bool = True,
+        prefer_cpp: bool = False,
         factory_builder: BlockFactoryBuilder | None = None,
     ) -> None:
         if max_records < 0:
@@ -94,8 +97,12 @@ class CQDAGRecordSource:
             factory_builder=factory_builder,
         )
         self._iterator = iter(self.oracle.iter_records(max_records))
+        self._lookahead_record: GuessRecord | None = None
         self._cache: list[GuessRecord] = []
         self._cache_base = 0
+        self._raw_index = 0
+        self._raw_buffer: deque[GuessRecord] = deque()
+        self._lookahead_record: GuessRecord | None = None
         self._peak_cached_records = 0
         self._reclaimed_records = 0
         self.exhausted = False
@@ -154,23 +161,26 @@ class CQDAGRecordSource:
             self._cache_base = reclaim_end
             self._reclaimed_records += reclaimed
         while self._cache_base < index and not self.exhausted:
-            try:
-                next(self._iterator)
-            except StopIteration:
-                self.exhausted = True
+            group = self._next_canonical_group()
+            if not group:
                 return
-            self._cache_base += 1
-            self._reclaimed_records += 1
+            skip_count = min(index - self._cache_base, len(group))
+            self._cache_base += skip_count
+            self._reclaimed_records += skip_count
+            if skip_count < len(group):
+                self._cache.extend(group[skip_count:])
+                self._update_peak_cached_records()
+                return
 
     def _ensure(self, end: int) -> None:
         if end > self.max_records:
             raise RuntimeError("requested range exceeds configured source limit")
         while self._cache_base + len(self._cache) < end and not self.exhausted:
-            try:
-                self._cache.append(next(self._iterator))
-                self._update_peak_cached_records()
-            except StopIteration:
-                self.exhausted = True
+            group = self._next_canonical_group()
+            if not group:
+                return
+            self._cache.extend(group)
+            self._update_peak_cached_records()
 
     def _update_peak_cached_records(self) -> None:
         self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
@@ -182,9 +192,49 @@ class CQDAGRecordSource:
             factory_builder=self.factory_builder,
         )
         self._iterator = iter(self.oracle.iter_records(self.max_records))
+        self._lookahead_record = None
         self._cache = []
         self._cache_base = 0
         self.exhausted = False
+
+    def _next_canonical_group(self) -> tuple[GuessRecord, ...]:
+        first = self._pop_next_raw_record()
+        if first is None:
+            return ()
+        group_key = _probability_group_key(first)
+        group = [first]
+        while True:
+            record = self._pop_next_raw_record()
+            if record is None:
+                break
+            if _probability_group_key(record) != group_key:
+                self._lookahead_record = record
+                break
+            group.append(record)
+        return tuple(sorted(group, key=_canonical_tie_key))
+
+    def _pop_next_raw_record(self) -> GuessRecord | None:
+        if self._lookahead_record is not None:
+            record = self._lookahead_record
+            self._lookahead_record = None
+            return record
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            self.exhausted = True
+            return None
+
+
+def _probability_group_key(record: GuessRecord) -> str:
+    return f"{record.prob:.{_SERIAL_PROBABILITY_SIGNIFICANT_DIGITS}g}"
+
+
+def _probability_sort_value(record: GuessRecord) -> float:
+    return float(_probability_group_key(record))
+
+
+def _canonical_tie_key(record: GuessRecord) -> tuple[int, tuple[int, ...], str]:
+    return (record.structure_index, record.ranks, record.guess)
 
 
 class CQDAGStructureRecordSource:
@@ -196,17 +246,20 @@ class CQDAGStructureRecordSource:
         *,
         max_records_per_structure: int,
         adapter: "CQDAGBlockGraphAdapter | None" = None,
+        prefer_cpp: bool = False,
     ) -> None:
         if max_records_per_structure < 0:
             raise ValueError("max_records_per_structure cannot be negative")
         self.model = model
         self.max_records_per_structure = max_records_per_structure
+        self.prefer_cpp = prefer_cpp
         self.adapter = CQDAGBlockGraphAdapter(model) if adapter is None else adapter
-        self.factory = OptimizedBlockFactory(model)
+        self.factory = None if prefer_cpp else OptimizedBlockFactory(model)
+        self.cpp_enumerator = CppOptimizedCQDAGEnumerator(model) if prefer_cpp else None
         self._descriptors = {
             descriptor.node_id: descriptor for descriptor in self.adapter.structure_nodes()
         }
-        self._streams: dict[NodeId, _StructureLocalStream] = {}
+        self._streams: dict[NodeId, _StructureLocalStream | _CppStructureLocalStream] = {}
 
     def read_range(
         self,
@@ -233,7 +286,7 @@ class CQDAGStructureRecordSource:
             cached_records=sum(stream.cached_records for stream in self._streams.values()),
             peak_cached_records=sum(stream.peak_cached_records for stream in self._streams.values()),
             reclaimed_records=sum(stream.reclaimed_records for stream in self._streams.values()),
-            dag_repository_active_units=self.factory.active_units(),
+            dag_repository_active_units=self._repository_active_units(),
             dag_stream_active_units=sum(stream.active_units for stream in self._streams.values()),
         )
 
@@ -248,7 +301,7 @@ class CQDAGStructureRecordSource:
     ) -> StateMigrationSnapshot:
         streams = self._selected_streams(node_ids)
         block_snapshots = _capture_reachable_blocks(
-            tuple(stream.block for _, stream in streams)
+            tuple(stream.block for _, stream in streams if hasattr(stream, "block"))
         )
         return StateMigrationSnapshot.create(
             model_fingerprint=model_fingerprint,
@@ -272,21 +325,27 @@ class CQDAGStructureRecordSource:
         ):
             raise ValueError("snapshot model_fingerprint does not match target source")
 
-        block_by_signature = dict(_iter_repository_blocks(self.factory))
+        block_by_signature = (
+            dict(_iter_repository_blocks(self.factory))
+            if self.factory is not None
+            else {}
+        )
         for stream in self._streams.values():
-            block_by_signature.setdefault(tuple(stream.structure.symbols), stream.block)
+            if hasattr(stream, "block"):
+                block_by_signature.setdefault(tuple(stream.structure.symbols), stream.block)
 
-        for block_snapshot in sorted(
-            snapshot.blocks,
-            key=lambda item: len(item.signature),
-            reverse=True,
-        ):
-            block = block_by_signature.get(block_snapshot.signature)
-            if block is None:
-                block = self.factory.resolve_block(block_snapshot.signature, share=True)
-                block_by_signature[block_snapshot.signature] = block
-            _restore_block_snapshot(block, block_snapshot)
-            _index_resolved_children(block, block_by_signature)
+        if self.factory is not None:
+            for block_snapshot in sorted(
+                snapshot.blocks,
+                key=lambda item: len(item.signature),
+                reverse=True,
+            ):
+                block = block_by_signature.get(block_snapshot.signature)
+                if block is None:
+                    block = self.factory.resolve_block(block_snapshot.signature, share=True)
+                    block_by_signature[block_snapshot.signature] = block
+                _restore_block_snapshot(block, block_snapshot)
+                _index_resolved_children(block, block_by_signature)
 
         for stream_snapshot in snapshot.streams:
             stream = self._stream_for(stream_snapshot.node_id)
@@ -299,15 +358,15 @@ class CQDAGStructureRecordSource:
     def _selected_streams(
         self,
         node_ids: Sequence[NodeId] | None,
-    ) -> tuple[tuple[NodeId, "_StructureLocalStream"], ...]:
+    ) -> tuple[tuple[NodeId, "_StructureLocalStream | _CppStructureLocalStream"], ...]:
         if node_ids is None:
             return tuple(self._streams.items())
-        selected: list[tuple[NodeId, _StructureLocalStream]] = []
+        selected: list[tuple[NodeId, _StructureLocalStream | _CppStructureLocalStream]] = []
         for node_id in node_ids:
             selected.append((node_id, self._stream_for(node_id)))
         return tuple(selected)
 
-    def _stream_for(self, node_id: NodeId) -> "_StructureLocalStream":
+    def _stream_for(self, node_id: NodeId) -> "_StructureLocalStream | _CppStructureLocalStream":
         stream = self._streams.get(node_id)
         if stream is not None:
             return stream
@@ -315,14 +374,32 @@ class CQDAGStructureRecordSource:
             descriptor = self._descriptors[node_id]
         except KeyError as exc:
             raise KeyError(f"unknown CQDAG structure source node: {node_id}") from exc
-        stream = _StructureLocalStream(
-            self.model,
-            factory=self.factory,
-            structure_index=_require_structure_index(descriptor),
-            max_records=self.max_records_per_structure,
-        )
+        structure_index = _require_structure_index(descriptor)
+        if self.cpp_enumerator is not None:
+            stream = _CppStructureLocalStream(
+                self.model,
+                enumerator=self.cpp_enumerator,
+                structure_index=structure_index,
+                max_records=self.max_records_per_structure,
+            )
+        else:
+            if self.factory is None:
+                raise RuntimeError("CQDAG structure source factory is not initialized")
+            stream = _StructureLocalStream(
+                self.model,
+                factory=self.factory,
+                structure_index=structure_index,
+                max_records=self.max_records_per_structure,
+            )
         self._streams[node_id] = stream
         return stream
+
+    def _repository_active_units(self) -> int:
+        if self.cpp_enumerator is not None:
+            return self.cpp_enumerator.active_units()
+        if self.factory is None:
+            return 0
+        return self.factory.active_units()
 
 
 class CQDAGBlockGraphAdapter:
@@ -433,10 +510,8 @@ class CQDAGBlockGraphAdapter:
                 )
 
     def serial_order_key(self, record: GuessRecord) -> tuple[float, int, tuple[int, ...]]:
-        # Match CQDAGPCFG's probability ordering while absorbing tiny log/product
-        # roundoff differences between structure-local streams.
         return (
-            -round(record.prob, _SERIAL_PROBABILITY_ROUND_DIGITS),
+            -_probability_sort_value(record),
             record.structure_index,
             record.ranks,
         )
@@ -520,6 +595,198 @@ def slot_entropy_bound(slot_table) -> float:
     return log(size)
 
 
+class _CppStructureLocalStream:
+    def __init__(
+        self,
+        model,
+        *,
+        enumerator: CppOptimizedCQDAGEnumerator,
+        structure_index: int,
+        max_records: int,
+    ) -> None:
+        self.model = model
+        self.enumerator = enumerator
+        self.structure_index = structure_index
+        self.structure = model.structures[structure_index]
+        self.max_records = max_records
+        self._cache: list[GuessRecord] = []
+        self._cache_base = 0
+        self._raw_index = 0
+        self._raw_buffer: deque[GuessRecord] = deque()
+        self._lookahead_record: GuessRecord | None = None
+        self._peak_cached_records = 0
+        self._reclaimed_records = 0
+        self.exhausted = False
+
+    def read_range(self, start: int, end: int) -> tuple[GuessRecord, ...]:
+        if start < 0 or end < start:
+            raise ValueError("invalid structure source range")
+        if start < self._cache_base:
+            raise RuntimeError("requested range was already reclaimed by the C++ source")
+        if end > self.max_records:
+            raise RuntimeError("requested range exceeds configured structure source limit")
+        if start > self.ready_end:
+            self._skip_to(start)
+        self._ensure(end)
+        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+
+    @property
+    def cached_records(self) -> int:
+        return len(self._cache)
+
+    @property
+    def peak_cached_records(self) -> int:
+        return self._peak_cached_records
+
+    @property
+    def reclaimed_records(self) -> int:
+        return self._reclaimed_records
+
+    @property
+    def active_units(self) -> int:
+        return self.enumerator.structure_active_units(self.structure_index)
+
+    @property
+    def ready_end(self) -> int:
+        return self._cache_base + len(self._cache)
+
+    def reclaim_before(self, index: int) -> int:
+        if index < 0:
+            raise ValueError("reclaim index cannot be negative")
+        ready_end = self._cache_base + len(self._cache)
+        reclaim_end = min(max(index, self._cache_base), ready_end)
+        reclaimed = reclaim_end - self._cache_base
+        if reclaimed <= 0:
+            return self._cache_base
+        del self._cache[:reclaimed]
+        self._cache_base = reclaim_end
+        self._reclaimed_records += reclaimed
+        return self._cache_base
+
+    def _skip_to(self, index: int) -> None:
+        if index <= self.ready_end:
+            return
+        self.reclaim_before(min(index, self.ready_end))
+        while self._cache_base < index:
+            group = self._next_canonical_group()
+            if not group:
+                return
+            skip_count = min(index - self._cache_base, len(group))
+            self._cache_base += skip_count
+            self._reclaimed_records += skip_count
+            if skip_count < len(group):
+                self._cache.extend(group[skip_count:])
+                self._update_peak_cached_records()
+                return
+
+    def _ensure(self, end: int) -> None:
+        while self.ready_end < end:
+            group = self._next_canonical_group()
+            if not group:
+                self.exhausted = True
+                return
+            self._cache.extend(group)
+            self._update_peak_cached_records()
+
+    def _update_peak_cached_records(self) -> None:
+        self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
+
+    def _next_canonical_group(self) -> tuple[GuessRecord, ...]:
+        first = self._pop_next_raw_record()
+        if first is None:
+            return ()
+        group_key = _probability_group_key(first)
+        group = [first]
+        while True:
+            record = self._pop_next_raw_record()
+            if record is None:
+                break
+            if _probability_group_key(record) != group_key:
+                self._lookahead_record = record
+                break
+            group.append(record)
+        return tuple(sorted(group, key=_canonical_tie_key))
+
+    def _pop_next_raw_record(self) -> GuessRecord | None:
+        if self._lookahead_record is not None:
+            record = self._lookahead_record
+            self._lookahead_record = None
+            return record
+        if self.exhausted and not self._raw_buffer:
+            return None
+        if not self._raw_buffer:
+            self._fill_raw_buffer()
+        if not self._raw_buffer:
+            return None
+        return self._raw_buffer.popleft()
+
+    def _fill_raw_buffer(self) -> None:
+        if self.exhausted or self._raw_index >= self.max_records:
+            self.exhausted = True
+            return
+        raw_start = self._raw_index
+        raw_end = min(self.max_records, raw_start + _SOURCE_SKIP_ACK_WINDOW)
+        records = tuple(
+            self.enumerator.iter_structure_records(
+                self.structure_index,
+                raw_start,
+                raw_end,
+            )
+        )
+        self._raw_index += len(records)
+        self._raw_buffer.extend(records)
+        if len(records) < raw_end - raw_start:
+            self.exhausted = True
+
+    def capture_state(self, node_id: NodeId) -> StructureStreamStateSnapshot:
+        return StructureStreamStateSnapshot(
+            node_id=node_id,
+            structure_index=self.structure_index,
+            structure_name=self.structure.name,
+            symbols=tuple(self.structure.symbols),
+            root_signature=tuple(self.structure.symbols),
+            max_records=self.max_records,
+            stream_base=self._cache_base,
+            ready_end=self.ready_end,
+            consumer_id=0,
+            guess_cache=GuessRecordWindowSnapshot(
+                base=self._cache_base,
+                entries=tuple(
+                    GuessRecordSnapshot.from_record(record) for record in self._cache
+                ),
+            ),
+        )
+
+    def watermark(self, node_id: NodeId) -> NodeWatermarkSnapshot:
+        return NodeWatermarkSnapshot(
+            node_id=node_id,
+            ready_end=self.ready_end,
+            reclaim_before=self._cache_base,
+            target_end=None,
+        )
+
+    def restore_state(self, snapshot: StructureStreamStateSnapshot) -> None:
+        if snapshot.structure_index != self.structure_index:
+            raise ValueError("snapshot structure_index does not match target stream")
+        if snapshot.symbols != tuple(self.structure.symbols):
+            raise ValueError("snapshot symbols do not match target stream")
+        if snapshot.max_records > self.max_records:
+            raise ValueError("snapshot max_records exceeds target stream limit")
+        if snapshot.guess_cache.entries:
+            self._cache_base = snapshot.guess_cache.base
+            self._cache = tuple_entry_records(snapshot.guess_cache.entries)
+        else:
+            self._cache_base = snapshot.ready_end
+            self._cache = []
+        self.enumerator.advance_structure(self.structure_index, self.ready_end)
+        self._raw_index = self.ready_end
+        self._raw_buffer.clear()
+        self._lookahead_record = None
+        self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
+        self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
+        self.exhausted = False
+
+
 class _StructureLocalStream:
     def __init__(
         self,
@@ -538,6 +805,8 @@ class _StructureLocalStream:
         self.consumer_id = self.block.register_consumer()
         self._cache: list[GuessRecord] = []
         self._cache_base = 0
+        self._raw_index = 0
+        self._lookahead_record: GuessRecord | None = None
         self._peak_cached_records = 0
         self._reclaimed_records = 0
         self.exhausted = False
@@ -582,7 +851,6 @@ class _StructureLocalStream:
         reclaimed = reclaim_end - self._cache_base
         if reclaimed <= 0:
             return self._cache_base
-        self.block.ack(self.consumer_id, reclaim_end - 1)
         del self._cache[:reclaimed]
         self._cache_base = reclaim_end
         self._reclaimed_records += reclaimed
@@ -592,38 +860,24 @@ class _StructureLocalStream:
         if index <= self.ready_end:
             return
         self.reclaim_before(min(index, self.ready_end))
-        while self._cache_base < index and not self.exhausted:
-            target = min(index, self._cache_base + _SOURCE_SKIP_ACK_WINDOW)
-            try:
-                self.block.ensure_generated(target - 1)
-            except IndexError:
-                produced = max(self.block.produced_count(), self._cache_base)
-                if produced > self._cache_base:
-                    self.block.ack(self.consumer_id, produced - 1)
-                    self._reclaimed_records += produced - self._cache_base
-                    self._cache_base = produced
-                self.exhausted = True
+        while self._cache_base < index:
+            group = self._next_canonical_group()
+            if not group:
                 return
-            self.block.ack(self.consumer_id, target - 1)
-            self._reclaimed_records += target - self._cache_base
-            self._cache_base = target
+            skip_count = min(index - self._cache_base, len(group))
+            self._cache_base += skip_count
+            self._reclaimed_records += skip_count
+            if skip_count < len(group):
+                self._cache.extend(group[skip_count:])
+                self._update_peak_cached_records()
+                return
 
     def _ensure(self, end: int) -> None:
-        while self._cache_base + len(self._cache) < end and not self.exhausted:
-            index = self._cache_base + len(self._cache)
-            try:
-                if index >= self.block.produced_count():
-                    self.block.ensure_generated(index)
-                local_log_prob, rank_key = self.block.get_generated(index)
-            except IndexError:
-                self.exhausted = True
+        while self._cache_base + len(self._cache) < end:
+            group = self._next_canonical_group()
+            if not group:
                 return
-            record = self.model.record_for_log_prob(
-                self.structure_index,
-                flatten_rank_key(rank_key),
-                self.structure.log_base_prob + local_log_prob,
-            )
-            self._cache.append(record)
+            self._cache.extend(group)
             self._update_peak_cached_records()
 
     def _update_peak_cached_records(self) -> None:
@@ -635,7 +889,51 @@ class _StructureLocalStream:
         self.consumer_id = self.block.register_consumer()
         self._cache = []
         self._cache_base = 0
+        self._raw_index = 0
+        self._lookahead_record = None
         self.exhausted = False
+
+    def _next_canonical_group(self) -> tuple[GuessRecord, ...]:
+        first = self._pop_next_raw_record()
+        if first is None:
+            return ()
+        group_key = _probability_group_key(first)
+        group = [first]
+        while True:
+            record = self._pop_next_raw_record()
+            if record is None:
+                break
+            if _probability_group_key(record) != group_key:
+                self._lookahead_record = record
+                break
+            group.append(record)
+        return tuple(sorted(group, key=_canonical_tie_key))
+
+    def _pop_next_raw_record(self) -> GuessRecord | None:
+        if self._lookahead_record is not None:
+            record = self._lookahead_record
+            self._lookahead_record = None
+            return record
+        if self.exhausted:
+            return None
+        index = self._raw_index
+        if index >= self.max_records:
+            self.exhausted = True
+            return None
+        try:
+            if index >= self.block.produced_count():
+                self.block.ensure_generated(index)
+            local_log_prob, rank_key = self.block.get_generated(index)
+        except IndexError:
+            self.exhausted = True
+            return None
+        self.block.ack(self.consumer_id, index)
+        self._raw_index += 1
+        return self.model.record_for_log_prob(
+            self.structure_index,
+            flatten_rank_key(rank_key),
+            self.structure.log_base_prob + local_log_prob,
+        )
 
     def capture_state(self, node_id: NodeId) -> StructureStreamStateSnapshot:
         return StructureStreamStateSnapshot(
@@ -678,6 +976,8 @@ class _StructureLocalStream:
         else:
             self._cache_base = snapshot.ready_end
             self._cache = []
+        self._raw_index = self.ready_end
+        self._lookahead_record = None
         self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
         self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
         self.exhausted = False

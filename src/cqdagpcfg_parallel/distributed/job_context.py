@@ -10,8 +10,6 @@ class JobContext:
 
     job_id: str
     limit: int
-    hash_algorithm: str
-    targets: tuple[Mapping[str, Any], ...]
     model_id: str
     model_fingerprint: str
     model_connect: str
@@ -20,6 +18,7 @@ class JobContext:
     ack_connect: str
     source_mode: str = "root"
     demand_window: int = 8
+    job_payload: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -27,8 +26,6 @@ class JobContext:
             raise ValueError("job_id cannot be empty")
         if self.limit <= 0:
             raise ValueError("limit must be positive")
-        if not self.hash_algorithm:
-            raise ValueError("hash_algorithm cannot be empty")
         if not self.model_id:
             raise ValueError("model_id cannot be empty")
         if not self.model_fingerprint:
@@ -51,7 +48,7 @@ class JobContext:
         return f"{self.job_id}:{self.model_fingerprint}:{self.limit}"
 
     @classmethod
-    def from_targets_payload(
+    def from_job_payload(
         cls,
         payload: Mapping[str, Any],
         *,
@@ -68,8 +65,6 @@ class JobContext:
         return cls(
             job_id=job_id,
             limit=int(payload["limit"]),
-            hash_algorithm=str(payload["algorithm"]),
-            targets=tuple(dict(target) for target in payload.get("targets", ())),
             model_id=model_id,
             model_fingerprint=str(payload["model_fingerprint"]),
             model_connect=model_connect,
@@ -78,6 +73,7 @@ class JobContext:
             ack_connect=ack_connect,
             source_mode=source_mode,
             demand_window=demand_window,
+            job_payload=dict(payload),
             metadata={} if metadata is None else dict(metadata),
         )
 
@@ -86,8 +82,6 @@ class JobContext:
         return cls(
             job_id=str(payload["job_id"]),
             limit=int(payload["limit"]),
-            hash_algorithm=str(payload["hash_algorithm"]),
-            targets=tuple(dict(target) for target in payload.get("targets", ())),
             model_id=str(payload["model_id"]),
             model_fingerprint=str(payload["model_fingerprint"]),
             model_connect=str(payload["model_connect"]),
@@ -96,6 +90,7 @@ class JobContext:
             ack_connect=str(payload["ack_connect"]),
             source_mode=str(payload.get("source_mode", "root")),
             demand_window=int(payload.get("demand_window", 8)),
+            job_payload=dict(payload["job_payload"]),
             metadata=dict(payload.get("metadata", {})),
         )
 
@@ -103,8 +98,6 @@ class JobContext:
         return {
             "job_id": self.job_id,
             "limit": self.limit,
-            "hash_algorithm": self.hash_algorithm,
-            "targets": [dict(target) for target in self.targets],
             "model_id": self.model_id,
             "model_fingerprint": self.model_fingerprint,
             "model_connect": self.model_connect,
@@ -113,6 +106,7 @@ class JobContext:
             "ack_connect": self.ack_connect,
             "source_mode": self.source_mode,
             "demand_window": self.demand_window,
+            "job_payload": dict(self.job_payload),
             "metadata": dict(self.metadata),
         }
 

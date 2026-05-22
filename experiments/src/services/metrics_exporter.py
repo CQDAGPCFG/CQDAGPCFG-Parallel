@@ -4,9 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Mapping
 
 
 METRIC_PREFIX = "cqdagpcfg"
@@ -78,6 +78,8 @@ def render_prometheus_metrics(metrics_dir: Path) -> str:
             continue
         labels = _labels_for_payload(path, payload)
         lines.append(f"cqdagpcfg_metric_source_up{{{_format_labels(labels)}}} 1")
+        lines.extend(_node_role_metrics(payload, labels, emitted_types))
+        lines.extend(_candidate_sample_metrics(payload, labels, emitted_types))
         for key, value in sorted(payload.items()):
             sample = _numeric_sample(value)
             if sample is None:
@@ -108,7 +110,7 @@ def _labels_for_path(path: Path) -> dict[str, str]:
 
 
 def _labels_for_payload(path: Path, payload: Mapping[str, object]) -> dict[str, str]:
-    role = str(payload.get("role", "unknown"))
+    role = _semantic_role(payload)
     instance = str(
         payload.get("node_id")
         or payload.get("worker_id")
@@ -118,6 +120,21 @@ def _labels_for_payload(path: Path, payload: Mapping[str, object]) -> dict[str, 
     labels = _labels_for_path(path)
     labels.update({"role": role, "instance": instance})
     return labels
+
+
+def _semantic_role(payload: Mapping[str, object]) -> str:
+    role = str(payload.get("role", "unknown"))
+    if role != "node_agent":
+        return role
+    current_role = str(payload.get("current_role", "") or "")
+    desired_role = str(payload.get("desired_role", "") or "")
+    if current_role in {"generator", "consumer", "draining_consumer"}:
+        return "consumer" if current_role == "draining_consumer" else current_role
+    if desired_role in {"generator", "consumer"}:
+        return desired_role
+    if current_role:
+        return current_role
+    return role
 
 
 def _metric_name(key: str) -> str:
@@ -134,6 +151,68 @@ def _numeric_sample(value: object) -> str | None:
     if isinstance(value, int | float):
         return repr(float(value))
     return None
+
+
+def _node_role_metrics(
+    payload: Mapping[str, object],
+    base_labels: Mapping[str, str],
+    emitted_types: set[str],
+) -> list[str]:
+    current_role = payload.get("current_role")
+    if not isinstance(current_role, str) or not current_role:
+        return []
+    metric_name = f"{METRIC_PREFIX}_node_role_info"
+    lines: list[str] = []
+    if metric_name not in emitted_types:
+        lines.append(
+            "# HELP cqdagpcfg_node_role_info Node agent role assignment and current execution role.",
+        )
+        lines.append(f"# TYPE {metric_name} gauge")
+        emitted_types.add(metric_name)
+    labels = dict(base_labels)
+    labels.update(
+        {
+            "current_role": current_role,
+            "desired_role": str(payload.get("desired_role", "")),
+            "node_id": str(payload.get("node_id", labels.get("instance", ""))),
+        },
+    )
+    lines.append(f"{metric_name}{{{_format_labels(labels)}}} 1")
+    return lines
+
+
+def _candidate_sample_metrics(
+    payload: Mapping[str, object],
+    base_labels: Mapping[str, str],
+    emitted_types: set[str],
+) -> list[str]:
+    samples = payload.get("candidate_samples")
+    if not isinstance(samples, list | tuple):
+        return []
+    metric_name = f"{METRIC_PREFIX}_candidate_sample_info"
+    lines: list[str] = []
+    if metric_name not in emitted_types:
+        lines.append(
+            "# HELP cqdagpcfg_candidate_sample_info Recent candidate samples emitted by the tracker.",
+        )
+        lines.append(f"# TYPE {metric_name} gauge")
+        emitted_types.add(metric_name)
+    for sample in samples:
+        if not isinstance(sample, Mapping):
+            continue
+        labels = dict(base_labels)
+        labels.update(
+            {
+                "rank": str(sample.get("rank", "")),
+                "batch_id": str(sample.get("batch_id", "")),
+                "guess": str(sample.get("guess", "")),
+                "prob": str(sample.get("prob", "")),
+                "structure_index": str(sample.get("structure_index", "")),
+                "structure_name": str(sample.get("structure_name", "")),
+            },
+        )
+        lines.append(f"{metric_name}{{{_format_labels(labels)}}} 1")
+    return lines
 
 
 def _format_labels(labels: Mapping[str, str]) -> str:

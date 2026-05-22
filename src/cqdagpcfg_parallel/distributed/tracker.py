@@ -22,6 +22,7 @@ from cqdagpcfg_parallel.protocol import (
     StaleLeaseError,
     WorkerId,
     WorkItem,
+    stable_record_string,
 )
 from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, _require_zmq
 from cqdagpcfg_parallel.simulation import (
@@ -127,7 +128,7 @@ class DistributedRunResult:
 
     @property
     def stable_records(self) -> tuple[str, ...]:
-        return tuple(record.stable_string() for record in self.outputs)
+        return tuple(stable_record_string(record) for record in self.outputs)
 
 
 class DistributedProtocolTracker:
@@ -799,7 +800,7 @@ class _OutputCollector:
         return tuple(self._stable_records)
 
     def append(self, record: GuessRecord) -> None:
-        stable_record = record.stable_string()
+        stable_record = stable_record_string(record)
         if self._outputs is not None:
             self._outputs.append(record)
         if self._stable_records is not None:

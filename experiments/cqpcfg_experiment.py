@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 
 COMMANDS = {
+    "train-model": SRC / "tools" / "train_model.py",
     "prepare": SRC / "tools" / "prepare.py",
     "tracker": SRC / "services" / "tracker.py",
     "worker": SRC / "services" / "node_agent.py",
@@ -21,7 +22,8 @@ COMMANDS = {
 }
 
 DESCRIPTIONS = {
-    "prepare": "prepare a model and target hashes",
+    "train-model": "train a toy CQDAGPCFG model for local scenarios",
+    "prepare": "prepare experiment target hashes",
     "tracker": "run the tracker service",
     "worker": "run an elastic node-agent worker",
     "metrics": "export JSON metrics for Prometheus",
@@ -48,6 +50,15 @@ def main() -> None:
     if command == "worker" and len(args) > 1 and args[1] in {"-h", "--help"}:
         print_worker_help()
         return
+    if command == "tracker":
+        if len(args) > 1 and args[1] in {"-h", "--help"}:
+            print_tracker_help()
+            return
+        if len(args) > 1:
+            raise SystemExit(
+                "tracker service is configured with CQPCFG_* environment variables; "
+                "pass no CLI arguments",
+            )
 
     if str(SRC) not in sys.path:
         sys.path.insert(0, str(SRC))
@@ -74,8 +85,24 @@ def print_help() -> None:
     print()
     print("examples:")
     print("  python experiments/cqpcfg_experiment.py local --limit 1000")
-    print("  python experiments/cqpcfg_experiment.py tracker --model-path model.json --targets-path targets.json")
+    print("  CQPCFG_MODEL_PATH=model.json CQPCFG_JOB_SPEC_PATH=job-spec.json python experiments/cqpcfg_experiment.py tracker")
     print("  CQPCFG_CONNECT=cqpcfg://tracker:5555 python experiments/cqpcfg_experiment.py worker")
+
+
+def print_tracker_help() -> None:
+    print("usage: CQPCFG_MODEL_PATH=model.json CQPCFG_JOB_SPEC_PATH=job-spec.json python experiments/cqpcfg_experiment.py tracker")
+    print()
+    print("tracker configuration is read from environment variables:")
+    print("  CQPCFG_MODEL_PATH")
+    print("  CQPCFG_JOB_SPEC_PATH")
+    print("  CQPCFG_BIND")
+    print("  CQPCFG_ADVERTISE_HOST")
+    print("  CQPCFG_TOTAL_NODES")
+    print("  CQPCFG_INITIAL_GENERATORS / CQPCFG_INITIAL_CONSUMERS")
+    print("  CQPCFG_SOURCE_MODE")
+    print("  CQPCFG_METRICS_PATH")
+    print("  CQPCFG_CHECKPOINT_PATH / CQPCFG_BATCH_CHECKPOINT_PATH")
+    print("  CQPCFG_CANDIDATE_SAMPLE_SIZE")
 
 
 def print_worker_help() -> None:
@@ -86,7 +113,7 @@ def print_worker_help() -> None:
     print("  CQPCFG_CONNECT")
     print("  CQPCFG_MODEL_CACHE_DIR")
     print("  CQPCFG_METRICS_PATH or CQPCFG_METRICS_DIR")
-    print("  CQPCFG_HITS_PATH or CQPCFG_HITS_DIR")
+    print("  CQPCFG_OUTPUTS_PATH or CQPCFG_OUTPUTS_DIR")
     print("  CQPCFG_MODEL_JSON_PAGE_CACHE")
     print("  CQPCFG_RESOURCE_CPUS / CQPCFG_RESOURCE_MEMORY / CQPCFG_RESOURCE_GPUS")
 

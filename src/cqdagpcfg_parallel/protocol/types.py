@@ -145,10 +145,22 @@ class EnumerationChunk:
         return ChunkRange(self.node_id, self.start, self.end)
 
 
+STABLE_PROBABILITY_DIGITS = 13
+
+
+def stable_record_string(record: GuessRecord) -> str:
+    rank_str = ",".join(str(value) for value in record.ranks)
+    probability = f"{record.prob:.{STABLE_PROBABILITY_DIGITS}g}"
+    return (
+        f"{probability}|{record.structure_index}|{record.structure_name}|"
+        f"{rank_str}|{record.guess}"
+    )
+
+
 def stable_digest(records: Iterable[GuessRecord]) -> str:
     digest = sha256()
     for record in records:
-        digest.update(record.stable_string().encode("utf-8"))
+        digest.update(stable_record_string(record).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -160,7 +172,9 @@ __all__ = [
     "EnumerationChunk",
     "Lease",
     "NodeId",
+    "STABLE_PROBABILITY_DIGITS",
     "WorkItem",
     "WorkerId",
     "stable_digest",
+    "stable_record_string",
 ]

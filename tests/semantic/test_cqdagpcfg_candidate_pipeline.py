@@ -4,6 +4,7 @@ from CQDAGPCFG import OptimizedCQDAGEnumerator
 from CQDAGPCFG.cpp_backend import CppOptimizedCQDAGEnumerator, cpp_backend_available
 from CQDAGPCFG.training import PCFGTrainer
 
+from cqdagpcfg_parallel.protocol import stable_record_string
 from cqdagpcfg_parallel.runtime import PipelineConfig, run_candidate_pipeline
 
 
@@ -65,5 +66,5 @@ def test_candidate_pipeline_preserves_cqdagpcfg_prefix_and_bounds() -> None:
         config.consumer_count * config.max_batch_payload_bytes
     )
     assert stats.collected_stable_records == tuple(
-        record.stable_string() for record in baseline.outputs
+        stable_record_string(record) for record in baseline.outputs
     )

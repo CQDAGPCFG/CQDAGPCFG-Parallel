@@ -47,7 +47,7 @@
 - `role_control.py`: persistent node agent에게 현재 role을 전달하는 ZeroMQ role control plane
 - `experiments/cqpcfg_experiment.py worker`: 한 프로세스 안에서 generator/consumer role을 hot-swap하는 reusable node runtime
 
-`NodeAgent`, `RoleController`, CQDAG source bootstrap, `@cqdagpcfg_node_agent`, `@cqdagpcfg_tracker`는 라이브러리 레벨 API이다. CLI/env parsing과 role-signal metrics reader는 `experiments/src`에서 담당한다.
+`NodeAgent`, `RoleController`, CQDAG source bootstrap, `@cqdagpcfg_node_agent`, `@cqdagpcfg_tracker`, CQDAG-aware elastic role rebalance는 라이브러리 레벨 API이다. CLI/env parsing과 실험별 hash target 생성/검증은 `experiments/src`에서 담당한다.
 
 ## CQDAG-Aware Elastic Role Allocation
 
@@ -123,7 +123,6 @@ tracker_config.run()
     resource_cpus=2.0,
     resource_memory="4g",
     resource_gpus=1,
-    model_json_page_cache=64,
 )
 @cqpcfg_generator
 def worker_source(worker_id):
@@ -143,7 +142,6 @@ worker_source.run()
     resource_cpus=2.0,
     resource_memory="4g",
     resource_gpus=1,
-    model_json_page_cache=64,
 )
 class WorkerNode:
     @cqpcfg_generator
@@ -165,22 +163,26 @@ from hashlib import sha256
 from cqdagpcfg_parallel import cqdagpcfg
 
 
+target_digests = {"..."}
+
+
 @cqdagpcfg.remote(
-    env_prefix="CQPCFG",
     connect="cqpcfg://tracker:5555",
     num_cpus=2,
     memory="4g",
     num_gpus=1,
-    model_json_page_cache=128,
 )
 class ExperimentNode:
     def consume(self, guess: str):
-        return sha256(guess.encode()).hexdigest()
+        digest = sha256(guess.encode()).hexdigest()
+        if digest in target_digests:
+            return {"hash": digest}
+        return None
 
 ExperimentNode.remote()
 ```
 
-`@cqdagpcfg.remote`는 Ray처럼 괄호 없이도 쓸 수 있고, resource option이 필요하면 `@cqdagpcfg.remote(...)`로 쓴다. `connect`, CPU/GPU, memory, model page cache처럼 배포자가 직접 판단해야 하는 값은 decorator에 드러내고, `env_prefix="CQPCFG"`를 주면 같은 값들을 환경 변수로 덮어쓸 수 있다. 일반 사용자는 transport subchannel, drain timeout, ack, bootstrap 같은 protocol detail을 직접 선언하지 않는다. `consume()`은 기본적으로 후보 문자열 하나를 받고, `None`, `False`, `True`, digest 문자열, `dict`, `list[dict]`를 반환할 수 있다. Tracker는 target hash table을 제공하지만, guess를 어떤 hash 알고리즘으로 digest할지는 consumer가 결정한다. 프레임워크는 반환된 digest나 `hash` 필드를 target table에 매칭하고, `rank`, `batch_id`, `guess`, `node_id`, `elapsed_seconds` 같은 실행 메타데이터를 자동으로 붙여 hit log와 metrics에 반영한다. 내부 batch를 직접 보고 싶은 고급 사용자는 parameter 이름을 `batch`로 두면 `CandidateBatch`를 그대로 받을 수 있다.
+`@cqdagpcfg.remote`는 Ray처럼 괄호 없이도 쓸 수 있고, resource option이 필요하면 `@cqdagpcfg.remote(...)`로 쓴다. `connect`, CPU/GPU, memory처럼 배포자가 직접 판단해야 하는 값은 decorator에 드러낸다. model page cache, drain timeout, ack, bootstrap, metrics flush 같은 protocol knob은 프레임워크 기본값 또는 환경 설정으로 흡수한다. 일반 사용자는 transport subchannel, batch id, ack, bootstrap 같은 protocol detail을 직접 선언하지 않는다. `consume()`은 기본적으로 후보 문자열 하나를 받고, `None`, `False`, `True`, `dict`, `list[dict]`를 반환할 수 있다. Guess를 어떤 hash 알고리즘으로 digest할지, 어떤 digest를 hit로 볼지는 consumer 구현이 결정한다. 프레임워크는 consumer가 반환한 hit dict에 `rank`, `batch_id`, `guess`, `node_id`, `elapsed_seconds` 같은 실행 메타데이터만 보강한다. 내부 batch를 직접 보고 싶은 고급 사용자는 parameter 이름을 `batch`로 두면 `CandidateBatch`를 그대로 받을 수 있다.
 
 `generate()`는 선택적 hook이다. 생략하면 프레임워크가 기본 CQDAGPCFG source를 사용한다. 사용자가 후보를 필터링하거나 변형하고 싶을 때는 `guess` 또는 `record`를 받아 `None`, 문자열, `GuessRecord`, 또는 이들의 iterable을 반환한다. `None`은 해당 후보를 제거한다. 프레임워크는 반환값을 range-preserving local stream으로 감싸기 때문에 사용자가 직접 `[start,end)` source를 구현하지 않는다.
 
@@ -354,7 +356,7 @@ Restart한 tracker는 shard cursor를 checkpoint 위치로 옮기고, `ChunkStor
 
 ## Consumer Retry
 
-`CandidateBatch`는 `batch_id`, `start_rank`, `end_rank`로 식별된다. Consumer는 batch 처리 후 `BatchAck(DONE|FAILED)`를 ack plane으로 보낸다. Tracker는 `BatchRetryLedger`에 rank range와 attempt 상태를 남기고, 실패한 batch는 bounded inflight buffer에 있는 payload를 다시 발행한다.
+`CandidateBatch`는 `batch_id`, `start_rank`, `end_rank`로 식별된다. Consumer는 batch 처리 후 `BatchAck(DONE|FAILED)`를 ack plane으로 보낸다. 사용자가 consumer에서 반환한 결과는 `BatchAck.outputs`로 tracker까지 올라가며, tracker는 이를 중앙 `consumer_outputs`로 집계할 수 있다. Tracker는 `BatchRetryLedger`에 rank range와 attempt 상태를 남기고, 실패한 batch는 bounded inflight buffer에 있는 payload를 다시 발행한다.
 
 ```text
 PUBLISHED -> INFLIGHT -> DONE
@@ -369,7 +371,7 @@ Worker는 tracker와 같은 CQDAGPCFG 모델 fingerprint를 사용해야 한다.
 
 모델 page는 후보 생성이 필요한 node에만 올라간다. `NodeAgent`는 `LazyLocalResultSource`를 사용하므로 consumer나 idle role에서는 CQDAGPCFG 모델을 로드하지 않는다. generator role로 전환되어 실제 `read_range`가 호출될 때만 bounded JSON page cache를 준비하고 CQDAGPCFG source를 만든다.
 
-Resource-only worker는 model path, targets path, control/batch/ack endpoint를 사전에 알 필요가 없다. Worker가 role plane에 붙으면 tracker-side `RoleController`가 `JobContext`를 내려준다.
+Resource-only worker는 model path, job payload, control/batch/ack endpoint를 사전에 알 필요가 없다. Worker가 role plane에 붙으면 tracker-side `RoleController`가 `JobContext`를 내려준다.
 
 ```text
 NodeAgent start
@@ -378,9 +380,9 @@ NodeAgent start
    - model_id / model_fingerprint
    - model_connect
    - control_connect / batch_connect / ack_connect
-   - hash targets
+   - opaque job_payload
    - source_mode / demand_window
--> consumer role: hash targets + CandidateBatch만 사용
+-> consumer role: job_payload + CandidateBatch만 사용
 -> generator role: needed model page만 lazy fetch
 ```
 
@@ -391,7 +393,7 @@ reference 구현은 다음 계층으로 나뉜다.
 - `PagedCQDAGRecordSource/PagedCQDAGStructureRecordSource`: worker 쪽 CQDAGPCFG source. 구조 page를 읽어 root/structure stream을 만들고, slot table entry는 실제 접근된 rank가 속한 page만 가져온다.
 - `FileModelArtifactCache`: compatibility fallback. `--disable-paged-source` 또는 local full-model 실행이 필요할 때만 전체 artifact를 materialize한다.
 - `BoundedModelPageCache`: raw artifact chunk/page를 bounded LRU로 유지하기 위한 낮은 수준의 cache primitive.
-- `JobContext`: worker가 사전 설정 없이 참여할 수 있도록 role plane에서 내려주는 실행 context.
+- `JobContext`: worker가 사전 설정 없이 참여할 수 있도록 role plane에서 내려주는 실행 context. Hash target 같은 실험별 데이터는 프레임워크 필드가 아니라 opaque `job_payload`에 담긴다.
 
 따라서 consumer-only node는 모델 메모리 없이 실행할 수 있고, generator로 바뀐 node도 전체 모델 대신 제한된 수의 JSON page만 유지한다. tracker는 모델 전체를 소유하고, worker는 CPU/GPU 자원과 page cache만 제공하는 구조다. 이 설계는 CQDAGPCFG 모델 로딩 메모리를 모든 worker에 중복 부과하지 않는 protocol-level model distribution layer다. 실제 배포에서는 같은 manifest/page 계약을 HTTP, object storage, shared volume 위에 올릴 수 있다.
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from time import monotonic, sleep
-from typing import Callable
+from typing import Any, Callable
 
 from cqdagpcfg_parallel.framework_logging import log_event
 from cqdagpcfg_parallel.protocol import WorkerId
@@ -22,7 +23,7 @@ from .resources import WorkerResourceSpec
 from .worker import DistributedProtocolWorker
 
 
-CandidateBatchHandler = Callable[[CandidateBatch], None]
+CandidateBatchHandler = Callable[[CandidateBatch], object]
 NodeAgentStatsCallback = Callable[["NodeAgentStats"], None]
 LOGGER = logging.getLogger("cqdagpcfg.node_agent")
 
@@ -63,6 +64,9 @@ class NodeAgentStats:
     role_control_messages: int = 0
     role_control_bytes: int = 0
     role_control_seconds: float = 0.0
+    role_control_request_seconds: float = 0.0
+    role_control_roundtrip_ewma_seconds: float = 0.0
+    role_refresh_interval_seconds: float = 0.0
     source_cached_records: int = 0
     source_peak_cached_records: int = 0
     source_reclaimed_records: int = 0
@@ -94,6 +98,8 @@ class NodeAgent:
         consumer_drain_timeout_ms: int = 2000,
         idle_sleep_seconds: float = 0.01,
         role_refresh_interval_seconds: float = 0.05,
+        role_refresh_max_interval_seconds: float = 1.0,
+        role_control_overhead_budget: float = 0.01,
         stats_flush_interval_seconds: float = 0.25,
         stats_callback: NodeAgentStatsCallback | None = None,
         resources: WorkerResourceSpec = WorkerResourceSpec(),
@@ -116,6 +122,13 @@ class NodeAgent:
             raise ValueError("idle_sleep_seconds cannot be negative")
         if role_refresh_interval_seconds <= 0.0:
             raise ValueError("role_refresh_interval_seconds must be positive")
+        if role_refresh_max_interval_seconds < role_refresh_interval_seconds:
+            raise ValueError(
+                "role_refresh_max_interval_seconds must be greater than or equal to "
+                "role_refresh_interval_seconds",
+            )
+        if not 0.0 < role_control_overhead_budget <= 1.0:
+            raise ValueError("role_control_overhead_budget must be in (0, 1]")
         if stats_flush_interval_seconds < 0.0:
             raise ValueError("stats_flush_interval_seconds cannot be negative")
         self.node_id = node_id
@@ -132,6 +145,8 @@ class NodeAgent:
         self.consumer_drain_timeout_ms = consumer_drain_timeout_ms
         self.idle_sleep_seconds = idle_sleep_seconds
         self.role_refresh_interval_seconds = role_refresh_interval_seconds
+        self.role_refresh_max_interval_seconds = role_refresh_max_interval_seconds
+        self.role_control_overhead_budget = role_control_overhead_budget
         self.stats_flush_interval_seconds = stats_flush_interval_seconds
         self.stats_callback = stats_callback
         self.resources = resources
@@ -151,6 +166,7 @@ class NodeAgent:
         self.current_role = "idle"
         self._last_reply = RoleControlReply()
         self._next_role_refresh_at = 0.0
+        self._current_role_refresh_interval_seconds = role_refresh_interval_seconds
         self._next_stats_flush_at = 0.0
         self._current_batch_source: ZmqPullBatchSource | None = None
         self._network_messages = 0
@@ -191,6 +207,8 @@ class NodeAgent:
     def run_generator_session(self) -> bool:
         self.generator_sessions += 1
         self.current_role = "generator"
+        self._role_reply(force=True)
+        self.flush_stats(final=False, force=True)
         session_id = f"{self.node_id}-generator-{self.generator_sessions}"
         retire_requested = False
         log_event(
@@ -249,6 +267,8 @@ class NodeAgent:
     def run_consumer_session(self) -> bool:
         self.consumer_sessions += 1
         self.current_role = "consumer"
+        self._role_reply(force=True)
+        self.flush_stats(final=False, force=True)
         log_event(
             LOGGER,
             logging.INFO,
@@ -346,13 +366,14 @@ class NodeAgent:
         ack_sink: ZmqPushBatchAckSink | None,
     ) -> None:
         try:
-            self.consume_batch(message)
+            outputs = _normalize_consumer_outputs(self.consume_batch(message))
             if ack_sink is not None:
                 ack_sink.publish(
                     BatchAck(
                         batch_id=message.batch_id,
                         consumer_id=self.node_id,
                         status=BatchAckStatus.DONE,
+                        outputs=outputs,
                     )
                 )
         except BaseException as exc:
@@ -385,9 +406,9 @@ class NodeAgent:
     def should_stop(self) -> bool:
         return self._role_reply().stop
 
-    def flush_stats(self, *, final: bool) -> NodeAgentStats:
+    def flush_stats(self, *, final: bool, force: bool = False) -> NodeAgentStats:
         now = monotonic()
-        if not final and now < self._next_stats_flush_at:
+        if not final and not force and now < self._next_stats_flush_at:
             return self.stats_snapshot(final=False)
         self._next_stats_flush_at = now + self.stats_flush_interval_seconds
         stats = self.stats_snapshot(final=final)
@@ -439,6 +460,9 @@ class NodeAgent:
             role_control_messages=role_stats.messages,
             role_control_bytes=role_stats.bytes,
             role_control_seconds=role_control_seconds,
+            role_control_request_seconds=role_stats.request_seconds,
+            role_control_roundtrip_ewma_seconds=role_stats.roundtrip_ewma_seconds,
+            role_refresh_interval_seconds=self._current_role_refresh_interval_seconds,
             source_cached_records=source_stats.cached_records,
             source_peak_cached_records=source_stats.peak_cached_records,
             source_reclaimed_records=source_stats.reclaimed_records,
@@ -450,21 +474,62 @@ class NodeAgent:
             elapsed_seconds=elapsed,
         )
 
-    def _role_reply(self) -> RoleControlReply:
+    def _role_reply(self, *, force: bool = False) -> RoleControlReply:
         now = monotonic()
-        if now < self._next_role_refresh_at:
+        if not force and now < self._next_role_refresh_at:
             return self._last_reply
-        self._next_role_refresh_at = now + self.role_refresh_interval_seconds
+        previous_reply = self._last_reply
+        elapsed = max(now - self.started_at, 1e-12)
+        source_stats = source_reclaim_counters(self.source)
+        network = self._network_snapshot()
         self._last_reply = self.role_client.request(
             {
                 "current_role": self.current_role,
                 "completed_records": self.completed_records,
                 "consumed_candidates": self.consumed_candidates,
                 "role_switches": self.role_switches,
+                "generation_rate": self.completed_records / elapsed,
+                "consumer_rate": self.consumed_candidates / elapsed,
+                "network_poll_seconds": network.poll_seconds,
+                "elapsed_seconds": elapsed,
+                "waits": self.waits,
+                "completed_items": self.completed_items,
+                "source_cached_records": source_stats.cached_records,
+                "source_peak_cached_records": source_stats.peak_cached_records,
+                "source_reclaimed_records": source_stats.reclaimed_records,
+                "source_dag_repository_active_units": source_stats.dag_repository_active_units,
+                "source_dag_stream_active_units": source_stats.dag_stream_active_units,
                 "resources": self.resources.to_dict(),
             }
         )
+        self._current_role_refresh_interval_seconds = (
+            self._optimized_role_refresh_interval(previous_reply, self._last_reply)
+        )
+        self._next_role_refresh_at = monotonic() + self._current_role_refresh_interval_seconds
         return self._last_reply
+
+    def _optimized_role_refresh_interval(
+        self,
+        previous_reply: RoleControlReply,
+        next_reply: RoleControlReply,
+    ) -> float:
+        if (
+            previous_reply.role != next_reply.role
+            or previous_reply.stop != next_reply.stop
+            or previous_reply.job_context_version != next_reply.job_context_version
+        ):
+            return self.role_refresh_interval_seconds
+        if next_reply.stop:
+            return self.role_refresh_interval_seconds
+
+        roundtrip = self.role_client.roundtrip_ewma_seconds
+        if roundtrip <= 0.0:
+            return self.role_refresh_interval_seconds
+        budget_interval = roundtrip / self.role_control_overhead_budget
+        return min(
+            self.role_refresh_max_interval_seconds,
+            max(self.role_refresh_interval_seconds, budget_interval),
+        )
 
     def _network_snapshot(self):
         stats = _MutableNetworkStats(
@@ -518,6 +583,24 @@ class _MutableNetworkStats:
     poll_timeouts: int = 0
     recv_seconds: float = 0.0
     deserialize_seconds: float = 0.0
+
+
+def _normalize_consumer_outputs(result: object) -> tuple[Mapping[str, Any], ...]:
+    if result is None:
+        return ()
+    if isinstance(result, Mapping):
+        return (dict(result),)
+    if not isinstance(result, Iterable) or isinstance(result, (str, bytes, bytearray)):
+        raise TypeError(
+            "consumer batch handler must return None, a mapping, "
+            "or an iterable of mappings",
+        )
+    outputs: list[Mapping[str, Any]] = []
+    for item in result:
+        if not isinstance(item, Mapping):
+            raise TypeError("consumer batch handler returned a non-mapping output")
+        outputs.append(dict(item))
+    return tuple(outputs)
 
 
 __all__ = [

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from time import perf_counter
 from types import TracebackType
-from typing import Any
+from typing import Any, Mapping
 
 from .zmq_transport import ZmqBatchTransportStats, ZmqEndpoint, _require_zmq
 
@@ -21,6 +21,7 @@ class BatchAck:
     consumer_id: str
     status: BatchAckStatus
     error: str | None = None
+    outputs: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.batch_id < 0:
@@ -29,6 +30,9 @@ class BatchAck:
             raise ValueError("consumer_id cannot be empty")
         if self.status == BatchAckStatus.FAILED and not self.error:
             raise ValueError("failed ack must include an error")
+        for output in self.outputs:
+            if not isinstance(output, Mapping):
+                raise TypeError("BatchAck outputs must be mappings")
 
 
 class JsonBatchAckCodec:
@@ -45,6 +49,8 @@ class JsonBatchAckCodec:
         }
         if ack.error is not None:
             payload["error"] = ack.error
+        if ack.outputs:
+            payload["outputs"] = [dict(output) for output in ack.outputs]
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     @classmethod
@@ -59,6 +65,7 @@ class JsonBatchAckCodec:
             consumer_id=str(raw["consumer_id"]),
             status=BatchAckStatus(str(raw["status"])),
             error=str(raw["error"]) if raw.get("error") is not None else None,
+            outputs=tuple(dict(output) for output in raw.get("outputs", ())),
         )
 
 

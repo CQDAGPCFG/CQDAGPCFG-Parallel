@@ -1,11 +1,15 @@
 # Docker 실행
 
 이 구성은 CQDAGPCFG E2E 실험을 컨테이너 단위로 분리해서 실행한다.
+Compose의 tracker와 worker service 설정은 환경 변수로 주입한다. CLI 인자는 호스트에서 수동 실행하거나 일회성 tool을 직접 호출할 때만 사용한다.
 
 ```bash
 docker compose -f experiments/docker/compose.yml up --build
 docker compose -f experiments/docker/compose.yml down -v
 ```
+
+기본 compose는 tracker, metrics-exporter, Prometheus, Grafana만 띄운다. worker node는 자동으로 시작하지 않는다. 필요할 때 `run_worker.sh` 또는 `workers.compose.yml --scale`로 붙인다.
+compose 실험의 기본 후보 prefix limit은 `CQPCFG_LIMIT=10000000`이다. 짧은 smoke test만 돌릴 때는 `CQPCFG_LIMIT=10000`처럼 낮춰서 실행한다.
 
 실행 후 대시보드는 다음 주소에서 볼 수 있다.
 
@@ -14,41 +18,42 @@ docker compose -f experiments/docker/compose.yml down -v
 - Grafana 계정: `admin` / `admin`
 - Dashboard: `CQDAGPCFG / CQDAGPCFG Protocol Overview`
 
+Docker demo에서는 tracker가 최근 후보 20개만 샘플링해서 Grafana의 `Recent Candidate Samples` 테이블에 표시한다. 긴 실험이나 실제 민감 데이터에서는 Prometheus label 증가를 피하기 위해 `CQPCFG_CANDIDATE_SAMPLE_SIZE=0`으로 끈다.
+10M급 실험에서는 checkpoint와 batch도 큰 prefix에 맞게 조정한다. 기본값은 `CQPCFG_CHECKPOINT_INTERVAL_RECORDS=10000`, `CQPCFG_BATCH_SIZE=4096`, `CQPCFG_MAX_BATCH_PAYLOAD_BYTES=1048576`, `CQPCFG_MAX_CHUNK_SIZE=8192`이다.
+
 구성은 다음 역할로 나뉜다.
 
-- `prepare`: 학습 모델과 target hash 파일 생성
+- `train-model`: 로컬 smoke test용 작은 모델 생성
+- `prepare`: 기존 모델에서 실험용 job spec과 serial digest 파일 생성
 - `tracker`: CQDAGPCFG protocol tracker, role controller, model page server, CandidateBatch 발행
-- `node-0..4`: `node_agent.py` 기반 elastic worker. 현재 role에 따라 generator 또는 consumer로 동작
 - `metrics-exporter`: `/artifacts/metrics/*.json`을 Prometheus `/metrics` 형식으로 변환
 - `prometheus`: protocol metrics scrape
 - `grafana`: Prometheus datasource와 CQDAGPCFG overview dashboard 자동 provisioning
-- `verify-hits`: 여러 node hit report를 합쳐 target hash 발견 여부 확인
 
 ## Tracker와 worker 분리 실행
 
 tracker를 호스트나 외부 서버에서 따로 띄우고, Docker는 worker node만 여러 개 붙일 수도 있다. 이 모드는 worker가 모델 파일을 직접 들고 시작하지 않는다. worker는 role controller에서 job context를 받고, 필요한 모델 block/page만 tracker의 model artifact server에서 가져온다.
 
-먼저 tracker가 사용할 model/target artifact를 만든다.
+먼저 tracker가 사용할 job spec artifact를 만든다. 모델 파일은 prepare가 만들거나 복사하지 않는다. prepare는 기존 모델을 읽어서 실험용 payload와 serial digest만 만든다.
 
 ```bash
 mkdir -p /tmp/cqdagpcfg-split
 python experiments/cqpcfg_experiment.py prepare \
   --source-model-path ../CQDAGPCFG/examples/artifacts/rockyou_train/model.json \
-  --model-path /tmp/cqdagpcfg-split/model.json \
-  --targets-path /tmp/cqdagpcfg-split/targets.json \
+  --job-spec-path /tmp/cqdagpcfg-split/job-spec.json \
   --limit 1000
 ```
 
-그 다음 tracker를 호스트에서 실행한다. 같은 컴퓨터의 Docker worker가 붙는 경우 `--advertise-host host.docker.internal`을 사용한다. 외부 서버에서 tracker를 띄운다면 이 값을 서버 IP나 DNS 이름으로 바꾼다.
+그 다음 tracker를 호스트에서 실행한다. 같은 컴퓨터의 Docker worker가 붙는 경우 `CQPCFG_ADVERTISE_HOST=host.docker.internal`을 사용한다. 외부 서버에서 tracker를 띄운다면 이 값을 서버 IP나 DNS 이름으로 바꾼다.
 
 ```bash
-python experiments/cqpcfg_experiment.py tracker \
-  --model-path /tmp/cqdagpcfg-split/model.json \
-  --targets-path /tmp/cqdagpcfg-split/targets.json \
-  --bind cqpcfg://0.0.0.0:5555 \
-  --advertise-host host.docker.internal \
-  --source-mode structure \
-  --metrics-path /tmp/cqdagpcfg-split/metrics/tracker.json
+CQPCFG_MODEL_PATH=../CQDAGPCFG/examples/artifacts/rockyou_train/model.json \
+CQPCFG_JOB_SPEC_PATH=/tmp/cqdagpcfg-split/job-spec.json \
+CQPCFG_BIND=cqpcfg://0.0.0.0:5555 \
+CQPCFG_ADVERTISE_HOST=host.docker.internal \
+CQPCFG_SOURCE_MODE=structure \
+CQPCFG_METRICS_PATH=/tmp/cqdagpcfg-split/metrics/tracker.json \
+python experiments/cqpcfg_experiment.py tracker
 ```
 
 worker는 필요한 시점에 하나씩 붙인다. tracker는 노드 수를 미리 알 필요가 없다. 같은 명령을 여러 번 실행하면 매번 새 worker 컨테이너가 하나씩 추가된다.
@@ -65,6 +70,7 @@ TRACKER_HOST=host.docker.internal \
 ```
 
 `run_worker.sh`는 worker image가 없을 때만 build한다. 코드를 바꾼 뒤 강제로 다시 build하려면 `CQPCFG_FORCE_BUILD=1`을 붙인다.
+기본적으로 compose의 `docker_default` network와 `docker_artifacts` volume을 공유하므로, `run_worker.sh`로 붙인 worker가 tracker의 내부 주소를 해석하고 같은 Grafana 대시보드에 metrics와 hit를 남긴다. 별도 network나 volume을 쓰려면 `CQPCFG_WORKER_NETWORK`, `CQPCFG_WORKER_VOLUME`을 지정한다.
 
 worker별 CPU, 메모리, GPU도 컨테이너 단위로 제한할 수 있다.
 
@@ -81,13 +87,13 @@ CQPCFG_MODEL_JSON_PAGE_CACHE=64 \
 role별 최소 자원도 프로토콜에서 지정할 수 있다. 예를 들어 GPU가 있는 node만 consumer 역할을 받게 하려면 다음처럼 둔다.
 
 ```bash
-python experiments/cqpcfg_experiment.py tracker \
-  --model-path /tmp/cqdagpcfg-split/model.json \
-  --targets-path /tmp/cqdagpcfg-split/targets.json \
-  --bind cqpcfg://0.0.0.0:5555 \
-  --advertise-host host.docker.internal \
-  --source-mode structure \
-  --consumer-min-gpus 1
+CQPCFG_MODEL_PATH=../CQDAGPCFG/examples/artifacts/rockyou_train/model.json \
+CQPCFG_JOB_SPEC_PATH=/tmp/cqdagpcfg-split/job-spec.json \
+CQPCFG_BIND=cqpcfg://0.0.0.0:5555 \
+CQPCFG_ADVERTISE_HOST=host.docker.internal \
+CQPCFG_SOURCE_MODE=structure \
+CQPCFG_CONSUMER_MIN_GPUS=1 \
+python experiments/cqpcfg_experiment.py tracker
 ```
 
 GPU를 노출해야 하는 consumer worker는 Docker의 `--gpus` 값을 그대로 넘긴다.
@@ -197,7 +203,9 @@ python experiments/cqpcfg_experiment.py fault \
 Docker에서 수동으로 같은 흐름을 볼 때는 checkpoint 파일을 남긴 상태로 tracker를 kill한 뒤 tracker를 다시 올리고 `fault` profile의 late worker를 추가한다.
 
 ```bash
-docker compose -f experiments/docker/compose.yml up -d --build prepare tracker node-0 node-1 node-2
+docker compose -f experiments/docker/compose.yml up -d --build prepare tracker metrics-exporter prometheus grafana
+TRACKER_HOST=host.docker.internal ./experiments/docker/run_worker.sh
+TRACKER_HOST=host.docker.internal ./experiments/docker/run_worker.sh
 docker compose -f experiments/docker/compose.yml kill -s SIGKILL tracker
 docker compose -f experiments/docker/compose.yml up -d tracker
 docker compose -f experiments/docker/compose.yml --profile fault up -d node-late

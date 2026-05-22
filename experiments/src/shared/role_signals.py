@@ -18,6 +18,7 @@ class RoleSignalConfig:
     model_json_page_cache: int
     pending_window_batches: int = 4
     min_observed_rate: float = 1e-9
+    role_swap_cost_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ def build_role_signal_snapshot(
     tracker_metrics = _read_json(tracker_metrics_path)
     published = int(tracker_metrics.get("published_candidates", 0))
     generation_rate = float(tracker_metrics.get("candidate_rate", 0.0))
+    remaining = max(0, config.limit - published)
 
     consumed = 0
     consumer_rate = 0.0
@@ -143,11 +145,13 @@ def build_role_signal_snapshot(
                 config.min_observed_rate,
             ),
             current_generator_count=current_generators,
+            remaining_candidates=remaining,
             pending_candidates=pending,
             max_pending_candidates=max_pending,
             generator_idle_ratio=generator_idle_ratio,
             consumer_idle_ratio=consumer_idle_ratio,
             migration_cost_per_role_swap=config.batch_size,
+            role_swap_cost_seconds=config.role_swap_cost_seconds,
             cqdag_frontier_pressure=frontier_pressure,
             cqdag_priority_pressure=priority_pressure,
             cqdag_reclaim_pressure=reclaim_pressure,

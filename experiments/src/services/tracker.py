@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import sys
 import logging
+import os
+import sys
+from collections import deque
 from pathlib import Path
 
 _EXPERIMENT_SRC = Path(__file__).resolve().parents[1]
@@ -10,7 +12,6 @@ if str(_EXPERIMENT_SRC) not in sys.path:
     sys.path.insert(0, str(_EXPERIMENT_SRC))
 
 from shared.common import ensure_project_paths
-from shared.tracker_args import cqdag_tracker_config_from_args
 
 ensure_project_paths()
 
@@ -26,14 +27,69 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     cqdagpcfg_tracker,
 )
 from cqdagpcfg_parallel.framework_logging import log_event
+from cqdagpcfg_parallel.runtime import CandidateBatch
 
 
 LOGGER = logging.getLogger("cqdagpcfg.experiment.tracker")
 
 
-@cqdagpcfg_tracker(cqdag_tracker_config_from_args())
+def _print_tracker_help() -> None:
+    print("usage: CQPCFG_MODEL_PATH=model.json CQPCFG_JOB_SPEC_PATH=job-spec.json python experiments/cqpcfg_experiment.py tracker")
+    print()
+    print("tracker configuration is read from CQPCFG_* environment variables.")
+
+
+if len(sys.argv) > 1:
+    if sys.argv[1] in {"-h", "--help"}:
+        _print_tracker_help()
+        raise SystemExit(0)
+    raise SystemExit(
+        "tracker service is configured with CQPCFG_* environment variables; "
+        "pass no CLI arguments",
+    )
+
+
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return None if value is None or value == "" else Path(value)
+
+
+def _env_required_path(name: str) -> Path:
+    value = _env_path(name)
+    if value is None:
+        raise SystemExit(f"tracker requires {name}")
+    return value
+
+
+def _env_int(name: str, default: int | None = None) -> int | None:
+    value = os.environ.get(name)
+    return default if value is None or value == "" else int(value)
+
+
+@cqdagpcfg_tracker(
+    env_prefix="CQPCFG",
+    model_path=_env_required_path("CQPCFG_MODEL_PATH"),
+    job_spec_path=_env_required_path("CQPCFG_JOB_SPEC_PATH"),
+    bind=os.environ.get("CQPCFG_BIND") or None,
+    advertise_host=os.environ.get("CQPCFG_ADVERTISE_HOST", "127.0.0.1"),
+    total_nodes=_env_int("CQPCFG_TOTAL_NODES"),
+    initial_generators=_env_int("CQPCFG_INITIAL_GENERATORS"),
+    initial_consumers=_env_int("CQPCFG_INITIAL_CONSUMERS"),
+    source_mode=os.environ.get("CQPCFG_SOURCE_MODE", "root"),
+)
 class ExperimentTracker:
     """Default CQDAGPCFG tracker used by the experiment."""
+
+    def __init__(self) -> None:
+        self.candidate_sample_size = _env_int("CQPCFG_CANDIDATE_SAMPLE_SIZE", 0) or 0
+        self.candidate_sample_max_length = _env_int("CQPCFG_CANDIDATE_SAMPLE_MAX_LENGTH", 64) or 64
+        if self.candidate_sample_size < 0:
+            raise ValueError("CQPCFG_CANDIDATE_SAMPLE_SIZE cannot be negative")
+        if self.candidate_sample_max_length <= 0:
+            raise ValueError("CQPCFG_CANDIDATE_SAMPLE_MAX_LENGTH must be positive")
+        self.candidate_samples: deque[dict[str, object]] = deque(
+            maxlen=max(1, self.candidate_sample_size),
+        )
 
     def on_start(self, job: CQDAGPCFGTrackerJob) -> None:
         log_event(
@@ -42,7 +98,7 @@ class ExperimentTracker:
             "experiment.tracker_start",
             model=job.model_path,
             limit=job.limit,
-            target_hashes=job.target_count,
+            job_payload_items=job.job_payload_items,
             source_mode=job.source_mode,
         )
 
@@ -78,6 +134,33 @@ class ExperimentTracker:
             reclaimed_records=snapshot.reclaimed_records,
             pending_batches=snapshot.pending_batches,
         )
+
+    def on_candidate_batch(self, batch: CandidateBatch) -> None:
+        if self.candidate_sample_size == 0:
+            return
+        for offset, record in enumerate(batch.records):
+            self.candidate_samples.append(
+                {
+                    "rank": batch.start_rank + offset,
+                    "batch_id": batch.batch_id,
+                    "guess": self._display_guess(record.guess),
+                    "prob": record.prob,
+                    "structure_index": record.structure_index,
+                    "structure_name": record.structure_name,
+                },
+            )
+
+    def metrics_snapshot(self) -> dict[str, object]:
+        if self.candidate_sample_size == 0:
+            return {}
+        return {"candidate_samples": tuple(self.candidate_samples)}
+
+    def _display_guess(self, guess: str) -> str:
+        if len(guess) <= self.candidate_sample_max_length:
+            return guess
+        if self.candidate_sample_max_length <= 3:
+            return "." * self.candidate_sample_max_length
+        return f"{guess[: self.candidate_sample_max_length - 3]}..."
 
     def on_checkpoint(self, checkpoint: CQDAGPCFGCheckpointEvent) -> None:
         log_event(

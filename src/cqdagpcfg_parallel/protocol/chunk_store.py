@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from CQDAGPCFG import GuessRecord
 
-from .types import EnumerationChunk, NodeId
+from .types import EnumerationChunk, NodeId, stable_record_string
 
 
 class ChunkStoreError(RuntimeError):
@@ -251,7 +251,7 @@ class InMemoryChunkStore:
 
 
 def _stable(record: GuessRecord) -> str:
-    return record.stable_string()
+    return stable_record_string(record)
 
 
 __all__ = [

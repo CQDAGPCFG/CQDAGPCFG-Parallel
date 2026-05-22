@@ -20,10 +20,13 @@ from .paged_source import (
     build_paged_model,
 )
 from .node_source import (
+    CQDAGGenerationBackend,
     CQDAGNodeSourceConfig,
     build_cqdag_node_source,
+    resolve_generation_backend,
     resolve_cqdag_model_path,
 )
+from .job_spec import CQDAGJobSpec, compute_serial_digest
 from .node_service import (
     AnnotatedCQDAGPCFGNode,
     CQDAGCandidate,
@@ -50,9 +53,9 @@ from .tracker_service import (
     CQDAGPCFGTrackerSummary,
     CQDAGPCFGTracker,
     CqdagTrackerServiceConfig,
-    StreamingRecordBatchPublisher,
     cqdagpcfg_tracker,
 )
+from .tracker_publisher import StreamingRecordBatchPublisher
 from .serial_oracle import SerialCQDAGOracle, SerialOracleResult
 
 __all__ = [
@@ -60,7 +63,9 @@ __all__ = [
     "AnnotatedCQDAGPCFGNode",
     "AnnotatedCQDAGPCFGTracker",
     "CQDAGCandidate",
+    "CQDAGGenerationBackend",
     "CQDAGPCFGFramework",
+    "CQDAGJobSpec",
     "CQDAGNodeSourceConfig",
     "CQDAGPCFGNodeContext",
     "CQDAGPCFGNode",
@@ -91,6 +96,7 @@ __all__ = [
     "StreamingRecordBatchPublisher",
     "build_paged_model",
     "build_cqdag_node_source",
+    "compute_serial_digest",
     "cqdagpcfg",
     "cqdagpcfg_consumer",
     "cqdagpcfg_generator",
@@ -99,6 +105,7 @@ __all__ = [
     "cqdagpcfg_tracker",
     "pcfg",
     "resolve_cqdag_model_path",
+    "resolve_generation_backend",
     "slot_entropy",
     "slot_entropy_bound",
 ]

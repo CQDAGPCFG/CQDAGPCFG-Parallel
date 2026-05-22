@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-slot-page-size", type=int, default=1024)
     parser.add_argument("--model-structure-page-size", type=int, default=4096)
     parser.add_argument("--model-json-page-cache", type=int, default=128)
+    parser.add_argument("--source-mode", choices=("root", "structure"), default="root")
     parser.add_argument("--demand-window", type=int, default=8)
     parser.add_argument("--max-chunk-size", type=int, default=32)
     parser.add_argument("--max-parallel-leases-per-node", type=int, default=2)
@@ -96,8 +97,8 @@ def main() -> None:
     work_dir = Path(work_dir_context.name) if work_dir_context is not None else args.work_dir
     assert work_dir is not None
     work_dir.mkdir(parents=True, exist_ok=True)
-    model_path = work_dir / "model.json"
-    targets_path = work_dir / "targets.json"
+    model_path = args.source_model_path or work_dir / "model.json"
+    job_spec_path = work_dir / "job-spec.json"
 
     env = os.environ.copy()
     env["PYTHONPATH"] = (
@@ -105,22 +106,31 @@ def main() -> None:
     )
     python = sys.executable
 
+    if args.source_model_path is None:
+        train_cmd = [
+            python,
+            str(scripts_dir / "tools" / "train_model.py"),
+            "--model-path",
+            str(model_path),
+        ]
+        if args.train_file is not None:
+            train_cmd.extend(["--train-file", str(args.train_file)])
+        run_checked(train_cmd, env=env)
+    elif args.train_file is not None:
+        raise SystemExit("--train-file cannot be used with --source-model-path")
+
     prepare_cmd = [
         python,
         str(scripts_dir / "tools" / "prepare.py"),
-        "--model-path",
+        "--source-model-path",
         str(model_path),
-        "--targets-path",
-        str(targets_path),
+        "--job-spec-path",
+        str(job_spec_path),
         "--limit",
         str(args.limit),
         "--hash-algorithm",
         args.hash_algorithm,
     ]
-    if args.train_file is not None:
-        prepare_cmd.extend(["--train-file", str(args.train_file)])
-    if args.source_model_path is not None:
-        prepare_cmd.extend(["--source-model-path", str(args.source_model_path)])
     for rank in args.target_rank or []:
         prepare_cmd.extend(["--target-rank", str(rank)])
     run_checked(prepare_cmd, env=env)
@@ -143,7 +153,7 @@ def main() -> None:
         python=python,
         scripts_dir=scripts_dir,
         model_path=model_path,
-        targets_path=targets_path,
+        job_spec_path=job_spec_path,
         work_dir=work_dir,
         initial_plan=role_plan,
         enable_rebalance=args.dynamic_rebalance,
@@ -156,21 +166,21 @@ def run_checked(command: list[str], *, env: dict[str, str]) -> None:
     subprocess.run(command, env=env, check=True, text=True)
 
 
-def verify_hash_hits(targets_path: Path, hit_paths: tuple[Path, ...]) -> None:
-    targets = read_json(targets_path)
+def verify_hash_hits(job_spec_path: Path, output_paths: tuple[Path, ...]) -> None:
+    targets = read_json(job_spec_path)
     expected_guesses = {str(target["guess"]) for target in targets["targets"]}
-    all_hits = []
-    for path in hit_paths:
+    all_outputs = []
+    for path in output_paths:
         if not path.exists():
-            raise SystemExit(f"missing consumer hit report: {path}")
-        all_hits.extend(read_json(path)["hits"])
-    found_guesses = {str(hit["guess"]) for hit in all_hits}
+            raise SystemExit(f"missing consumer output report: {path}")
+        all_outputs.extend(read_json(path)["consumer_outputs"])
+    found_guesses = {str(output["guess"]) for output in all_outputs}
     missing = sorted(expected_guesses - found_guesses)
     if missing:
         raise SystemExit(f"hash consumers missed target guesses: {missing}")
     print("local node hit reports verified")
-    print(f"  nodes: {len(hit_paths)}")
-    print(f"  hits : {len(all_hits)}")
+    print(f"  nodes: {len(output_paths)}")
+    print(f"  outputs: {len(all_outputs)}")
 
 
 @dataclass(slots=True)
@@ -178,7 +188,7 @@ class AgentProcess:
     node_id: str
     process: subprocess.Popen[str]
     metrics_path: Path
-    hits_path: Path
+    outputs_path: Path
 
 
 @dataclass(slots=True)
@@ -194,7 +204,7 @@ def run_node_agent_pipeline(
     python: str,
     scripts_dir: Path,
     model_path: Path,
-    targets_path: Path,
+    job_spec_path: Path,
     work_dir: Path,
     initial_plan,
     enable_rebalance: bool,
@@ -218,11 +228,11 @@ def run_node_agent_pipeline(
     role_controller = RoleController(
         endpoint=ZmqEndpoint.from_uri(args.role_bind, bind=True),
         roles=roles,
-        job_context=build_job_context(args, targets_path) if use_job_context(args) else None,
+        job_context=build_job_context(args, job_spec_path) if use_job_context(args) else None,
     )
 
     agents: dict[str, AgentProcess] = {}
-    all_hit_paths: list[Path] = []
+    all_output_paths: list[Path] = []
     all_metrics_paths: list[Path] = []
     allocator = CqdagAwareElasticRoleAllocator()
     role_stability = RoleStabilityState(
@@ -234,9 +244,9 @@ def run_node_agent_pipeline(
 
     def start_agent(node_id: str) -> None:
         metrics_path = metrics_dir / f"{node_id}.json"
-        hits_path = work_dir / f"hits-{node_id}.json"
+        outputs_path = work_dir / f"outputs-{node_id}.json"
         all_metrics_paths.append(metrics_path)
-        all_hit_paths.append(hits_path)
+        all_output_paths.append(outputs_path)
         agent_env = {
             **env,
             "CQPCFG_NODE_ID": node_id,
@@ -247,7 +257,7 @@ def run_node_agent_pipeline(
             "CQPCFG_CONSUMER_DRAIN_TIMEOUT_MS": str(args.consumer_drain_timeout_ms),
             "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
             "CQPCFG_METRICS_PATH": str(metrics_path),
-            "CQPCFG_HITS_PATH": str(hits_path),
+            "CQPCFG_OUTPUTS_PATH": str(outputs_path),
             "CQPCFG_MODEL_JSON_PAGE_CACHE": str(args.model_json_page_cache),
         }
         if args.model_cache_dir is not None:
@@ -255,7 +265,7 @@ def run_node_agent_pipeline(
         if not use_job_context(args):
             agent_env.update(
                 {
-                    "CQPCFG_TARGETS_PATH": str(targets_path),
+                    "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
                     "CQPCFG_CONTROL_CONNECT": args.control_connect,
                     "CQPCFG_BATCH_CONNECT": args.batch_connect,
                     "CQPCFG_ACK_CONNECT": args.ack_connect,
@@ -276,7 +286,7 @@ def run_node_agent_pipeline(
             node_id=node_id,
             process=subprocess.Popen(command, env=agent_env, text=True),
             metrics_path=metrics_path,
-            hits_path=hits_path,
+            outputs_path=outputs_path,
         )
 
     def request_switch(node_id: str, new_role: str) -> bool:
@@ -315,65 +325,47 @@ def run_node_agent_pipeline(
     for node_id in node_ids:
         start_agent(node_id)
 
-    tracker_cmd = [
-        python,
-        str(scripts_dir / "services" / "tracker.py"),
-        "--model-path",
-        str(model_path),
-        "--targets-path",
-        str(targets_path),
-        "--model-id",
-        args.model_id,
-        "--control-bind",
-        args.control_bind,
-        "--batch-bind",
-        args.batch_bind,
-        "--ack-bind",
-        args.ack_bind,
-        "--consumer-count",
-        str(args.total_nodes if enable_rebalance else initial_plan.consumer_count),
-        "--demand-window",
-        str(args.demand_window),
-        "--max-chunk-size",
-        str(args.max_chunk_size),
-        "--max-parallel-leases-per-node",
-        str(args.max_parallel_leases_per_node),
-        "--node-affinity-bonus",
-        str(args.node_affinity_bonus),
-        "--batch-size",
-        str(args.batch_size),
-        "--max-batch-payload-bytes",
-        str(args.max_batch_payload_bytes),
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-        "--ack-timeout-seconds",
-        str(args.ack_timeout_seconds),
-        "--ack-retry-interval-seconds",
-        str(args.ack_retry_interval_seconds),
-        "--metrics-path",
-        str(tracker_metrics_path),
-        "--metrics-flush-interval-seconds",
-        str(args.metrics_flush_interval_seconds),
-    ]
+    tracker_env = {
+        **env,
+        "CQPCFG_MODEL_PATH": str(model_path),
+        "CQPCFG_JOB_SPEC_PATH": str(job_spec_path),
+        "CQPCFG_MODEL_ID": args.model_id,
+        "CQPCFG_CONTROL_BIND": args.control_bind,
+        "CQPCFG_BATCH_BIND": args.batch_bind,
+        "CQPCFG_ACK_BIND": args.ack_bind,
+        "CQPCFG_CONSUMER_COUNT": str(args.total_nodes if enable_rebalance else initial_plan.consumer_count),
+        "CQPCFG_SOURCE_MODE": args.source_mode,
+        "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
+        "CQPCFG_MAX_CHUNK_SIZE": str(args.max_chunk_size),
+        "CQPCFG_MAX_PARALLEL_LEASES_PER_NODE": str(args.max_parallel_leases_per_node),
+        "CQPCFG_NODE_AFFINITY_BONUS": str(args.node_affinity_bonus),
+        "CQPCFG_BATCH_SIZE": str(args.batch_size),
+        "CQPCFG_MAX_BATCH_PAYLOAD_BYTES": str(args.max_batch_payload_bytes),
+        "CQPCFG_TIMEOUT_SECONDS": str(args.timeout_seconds),
+        "CQPCFG_ACK_TIMEOUT_SECONDS": str(args.ack_timeout_seconds),
+        "CQPCFG_ACK_RETRY_INTERVAL_SECONDS": str(args.ack_retry_interval_seconds),
+        "CQPCFG_METRICS_PATH": str(tracker_metrics_path),
+        "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
+    }
     if args.model_serve_bind is not None:
-        tracker_cmd.extend(
-            [
-                "--model-serve-bind",
-                args.model_serve_bind,
-                "--model-chunk-size",
-                str(args.model_chunk_size),
-                "--model-slot-page-size",
-                str(args.model_slot_page_size),
-                "--model-structure-page-size",
-                str(args.model_structure_page_size),
-            ]
+        tracker_env.update(
+            {
+                "CQPCFG_MODEL_SERVE_BIND": args.model_serve_bind,
+                "CQPCFG_MODEL_CHUNK_SIZE": str(args.model_chunk_size),
+                "CQPCFG_MODEL_SLOT_PAGE_SIZE": str(args.model_slot_page_size),
+                "CQPCFG_MODEL_STRUCTURE_PAGE_SIZE": str(args.model_structure_page_size),
+            },
         )
     if args.disable_reclaim:
-        tracker_cmd.append("--disable-reclaim")
+        tracker_env["CQPCFG_DISABLE_RECLAIM"] = "1"
     if args.disable_node_affinity:
-        tracker_cmd.append("--disable-node-affinity")
+        tracker_env["CQPCFG_DISABLE_NODE_AFFINITY"] = "1"
     sleep(0.2)
-    tracker_process = subprocess.Popen(tracker_cmd, env=env, text=True)
+    tracker_process = subprocess.Popen(
+        [python, str(scripts_dir / "services" / "tracker.py")],
+        env=tracker_env,
+        text=True,
+    )
 
     failures: list[tuple[list[str] | str, int]] = []
     next_rebalance_at = monotonic() + args.rebalance_interval_seconds
@@ -418,7 +410,7 @@ def run_node_agent_pipeline(
             for command, code in failures:
                 print(f"process failed with code {code}: {command}", file=sys.stderr)
             raise SystemExit(1)
-        verify_hash_hits(targets_path, tuple(all_hit_paths))
+        verify_hash_hits(job_spec_path, tuple(all_output_paths))
         print_overhead_summary(
             tracker_metrics_path=tracker_metrics_path,
             node_metrics_paths=tuple(all_metrics_paths),
@@ -452,6 +444,11 @@ def maybe_rebalance_roles(
             batch_size=args.batch_size,
             limit=args.limit,
             model_json_page_cache=args.model_json_page_cache,
+            role_swap_cost_seconds=max(
+                args.role_switch_cooldown_seconds,
+                args.rebalance_interval_seconds
+                + args.consumer_drain_quiet_ms / 1000.0,
+            ),
         ),
         agent_metrics_paths={
             node_id: agent.metrics_path for node_id, agent in agents.items()
@@ -494,6 +491,9 @@ def maybe_rebalance_roles(
     )
     if improvement < args.role_switch_min_improvement and not pressure_extreme:
         return
+    payback = allocator.payback_for(snapshot, plan, current_generators)
+    if not payback.should_switch:
+        return
 
     if desired_generators < current_generators:
         for node_id in switch_candidates(
@@ -521,21 +521,21 @@ def use_job_context(args: argparse.Namespace) -> bool:
     return args.model_connect is not None or args.model_serve_bind is not None
 
 
-def build_job_context(args: argparse.Namespace, targets_path: Path) -> JobContext:
+def build_job_context(args: argparse.Namespace, job_spec_path: Path) -> JobContext:
     model_connect = args.model_connect
     if model_connect is None:
         if args.model_serve_bind is None:
             raise RuntimeError("model serve endpoint is required for JobContext")
         model_connect = connect_uri_from_bind(args.model_serve_bind)
-    return JobContext.from_targets_payload(
-        read_json(targets_path),
+    return JobContext.from_job_payload(
+        read_json(job_spec_path),
         job_id="local-dynamic",
         model_id=args.model_id,
         model_connect=model_connect,
         control_connect=args.control_connect,
         batch_connect=args.batch_connect,
         ack_connect=args.ack_connect,
-        source_mode="root",
+        source_mode=args.source_mode,
         demand_window=args.demand_window,
     )
 
@@ -600,6 +600,9 @@ def print_overhead_summary(
         + role_control.recv_seconds
         + role_control.send_seconds
         + sum(float(item.get("role_control_seconds", 0.0)) for item in node_metrics)
+    )
+    role_control_request_seconds = sum(
+        float(item.get("role_control_request_seconds", 0.0)) for item in node_metrics
     )
     report_write_count = int(tracker.get("metrics_write_count", 0)) + sum(
         int(item.get("report_write_count", 0)) for item in node_metrics
@@ -670,6 +673,7 @@ def print_overhead_summary(
     print(f"  role control messages    : {role_control_messages}")
     print(f"  role control bytes       : {role_control_bytes}")
     print(f"  role control seconds     : {role_control_seconds:.6f}")
+    print(f"  role request seconds     : {role_control_request_seconds:.6f}")
     print(f"  report writes            : {report_write_count}")
     print(f"  report write seconds     : {report_write_seconds:.6f}")
 

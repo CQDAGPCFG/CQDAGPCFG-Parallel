@@ -19,7 +19,7 @@
 4. Tracker-owned model serving: tracker가 canonical model을 갖고 worker는 필요한 page/block만 fetch한다.
 5. Page-backed model source: slot/structure JSON page를 디스크에 두고 worker cache 크기를 제한한다.
 6. CQDAG-aware elastic role allocation: frontier, reclaim, page locality 신호로 generator/consumer 비율을 조정한다.
-7. Durable batch/ack/retry boundary: candidate batch 발행 순서와 hash consumer 완료 순서를 분리한다.
+7. Durable batch/ack/retry/result boundary: candidate batch 발행 순서, consumer 완료 순서, consumer가 반환한 결과 집계를 분리한다.
 
 ## Layout
 
@@ -57,7 +57,7 @@ python -m pytest
 python experiments/cqpcfg_experiment.py --help
 python experiments/cqpcfg_experiment.py local --limit 1000
 python experiments/cqpcfg_experiment.py validate
-python experiments/cqpcfg_experiment.py tracker --model-path experiments/data/model.json --targets-path experiments/data/targets.json
+CQPCFG_MODEL_PATH=experiments/data/model.json CQPCFG_JOB_SPEC_PATH=experiments/data/job-spec.json python experiments/cqpcfg_experiment.py tracker
 CQPCFG_CONNECT=cqpcfg://tracker:5555 python experiments/cqpcfg_experiment.py worker
 ```
 
@@ -91,7 +91,6 @@ from cqdagpcfg_parallel.distributed import cqpcfg_generator, cqpcfg_worker
     resource_cpus=2.0,
     resource_memory="4g",
     resource_gpus=1,
-    model_json_page_cache=64,
 )
 @cqpcfg_generator
 def worker_source(worker_id):
@@ -114,7 +113,6 @@ from cqdagpcfg_parallel.distributed import (
     resource_cpus=2.0,
     resource_memory="4g",
     resource_gpus=1,
-    model_json_page_cache=64,
 )
 class WorkerNode:
     @cqpcfg_generator

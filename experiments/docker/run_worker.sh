@@ -9,7 +9,9 @@ CQDAGPCFG_ROOT="${CQDAGPCFG_ROOT:-${WORKSPACE_ROOT}/CQDAGPCFG}"
 IMAGE="${CQPCFG_WORKER_IMAGE:-cqdagpcfg-worker:local}"
 TRACKER_HOST="${TRACKER_HOST:-host.docker.internal}"
 CQPCFG_PORT="${CQPCFG_PORT:-5555}"
-ARTIFACT_VOLUME="${CQPCFG_WORKER_VOLUME:-cqdagpcfg-worker-artifacts}"
+ARTIFACT_VOLUME="${CQPCFG_WORKER_VOLUME:-docker_artifacts}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-docker}"
+WORKER_NETWORK="${CQPCFG_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME}_default}"
 CONTAINER_NAME="${CQPCFG_WORKER_NAME:-cqpcfg-worker-$(date +%Y%m%d%H%M%S)-${RANDOM}}"
 
 JOB_BOOTSTRAP_TIMEOUT_SECONDS="${JOB_BOOTSTRAP_TIMEOUT_SECONDS:-60}"
@@ -61,6 +63,14 @@ docker_args=(
   --add-host host.docker.internal:host-gateway
 )
 
+if [[ -n "${WORKER_NETWORK}" ]]; then
+  if docker network inspect "${WORKER_NETWORK}" >/dev/null 2>&1; then
+    docker_args+=(--network "${WORKER_NETWORK}")
+  else
+    echo "worker network not found, falling back to Docker default bridge: ${WORKER_NETWORK}" >&2
+  fi
+fi
+
 if [[ -n "${CQPCFG_WORKER_CPUS}" ]]; then
   docker_args+=(--cpus "${CQPCFG_WORKER_CPUS}")
 fi
@@ -94,7 +104,7 @@ docker_args+=(
   -e "CQPCFG_CONNECT=cqpcfg://${TRACKER_HOST}:${CQPCFG_PORT}"
   -e "CQPCFG_MODEL_CACHE_DIR=/artifacts/model-cache"
   -e "CQPCFG_METRICS_DIR=/artifacts/metrics"
-  -e "CQPCFG_HITS_DIR=/artifacts/hits"
+  -e "CQPCFG_OUTPUTS_DIR=/artifacts/hits"
   -e "CQPCFG_JOB_BOOTSTRAP_TIMEOUT_SECONDS=${JOB_BOOTSTRAP_TIMEOUT_SECONDS}"
   -e "CQPCFG_ROLE_REPLY_TIMEOUT_MS=${ROLE_REPLY_TIMEOUT_MS}"
   -e "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS=${METRICS_FLUSH_INTERVAL_SECONDS}"
@@ -131,4 +141,5 @@ echo "  id  : ${container_id}"
 echo "  cpu : ${CQPCFG_WORKER_CPUS:-unlimited}"
 echo "  mem : ${CQPCFG_WORKER_MEMORY:-unlimited}"
 echo "  gpu : ${CQPCFG_WORKER_GPUS:-none}"
+echo "  net : ${WORKER_NETWORK:-bridge}"
 echo "  logs: docker logs -f ${CONTAINER_NAME}"

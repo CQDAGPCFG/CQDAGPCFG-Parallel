@@ -26,7 +26,14 @@ from cqdagpcfg_parallel.distributed import (
     run_distributed_protocol,
     run_distributed_sequence_protocol,
 )
-from cqdagpcfg_parallel.protocol import ChunkSizePolicy, NodeId, SchedulerConfig, WorkerId, stable_digest
+from cqdagpcfg_parallel.protocol import (
+    ChunkSizePolicy,
+    NodeId,
+    SchedulerConfig,
+    WorkerId,
+    stable_digest,
+    stable_record_string,
+)
 from cqdagpcfg_parallel.runtime import ZmqEndpoint
 from cqdagpcfg_parallel.simulation import MappingRecordSource
 from cqdagpcfg_parallel.storage import DistributedTrackerCheckpoint
@@ -117,7 +124,7 @@ def test_zmq_distributed_protocol_preserves_cqdagpcfg_prefix() -> None:
     )
 
     assert result.digest == baseline.digest
-    assert result.stable_records == tuple(record.stable_string() for record in records)
+    assert result.stable_records == tuple(stable_record_string(record) for record in records)
     assert len(result.seen_workers) == 3
     assert sum(worker.completed_records for worker in workers) >= limit
 
@@ -154,7 +161,9 @@ def test_zmq_distributed_structure_protocol_preserves_cqdagpcfg_prefix() -> None
     )
 
     assert result.digest == baseline.digest
-    assert result.stable_records == tuple(record.stable_string() for record in baseline.outputs)
+    assert result.stable_records == tuple(
+        stable_record_string(record) for record in baseline.outputs
+    )
     assert len(result.assigned_records_by_node) > 1
     assert sum(worker.completed_records for worker in workers) >= limit
 

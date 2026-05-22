@@ -16,29 +16,29 @@ ensure_project_paths()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify combined hash consumer hit reports.")
-    parser.add_argument("--targets-path", type=Path, required=True)
-    parser.add_argument("--hits-path", type=Path, action="append", required=True)
+    parser.add_argument("--job-spec-path", type=Path, required=True)
+    parser.add_argument("--outputs-path", type=Path, action="append", required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    targets = read_json(args.targets_path)
+    targets = read_json(args.job_spec_path)
     expected_guesses = {str(target["guess"]) for target in targets["targets"]}
-    hits = []
-    for path in args.hits_path:
+    outputs = []
+    for path in args.outputs_path:
         if not path.exists():
-            raise SystemExit(f"missing hit report: {path}")
-        hits.extend(read_json(path)["hits"])
+            raise SystemExit(f"missing consumer output report: {path}")
+        outputs.extend(read_json(path)["consumer_outputs"])
 
-    found_guesses = {str(hit["guess"]) for hit in hits}
+    found_guesses = {str(output["guess"]) for output in outputs}
     missing = sorted(expected_guesses - found_guesses)
     if missing:
         raise SystemExit(f"hash consumers missed target guesses: {missing}")
 
     print("combined hash consumer reports verified")
-    print(f"  consumers: {len(args.hits_path)}")
-    print(f"  hits     : {len(hits)}")
+    print(f"  consumers: {len(args.outputs_path)}")
+    print(f"  outputs  : {len(outputs)}")
 
 
 if __name__ == "__main__":

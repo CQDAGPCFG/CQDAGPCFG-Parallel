@@ -196,6 +196,7 @@ def test_json_batch_ack_codec_round_trips() -> None:
         consumer_id="consumer-a",
         status=BatchAckStatus.FAILED,
         error="temporary failure",
+        outputs=({"rank": 7, "guess": "secret"},),
     )
 
     decoded = JsonBatchAckCodec.loads(JsonBatchAckCodec.dumps(ack))
