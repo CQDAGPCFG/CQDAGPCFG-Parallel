@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from CQDAGPCFG import save_model
-from CQDAGPCFG.cpp_backend import cpp_backend_available
+from CQDAGPCFG.cpp_backend import CppOptimizedCQDAGEnumerator, cpp_backend_available
 from CQDAGPCFG.training import PCFGTrainer
 
 from cqdagpcfg_parallel.adapters.cqdagpcfg import (
@@ -10,6 +10,7 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     CQDAGNodeSourceConfig,
     CQDAGRecordSource,
     CQDAGStructureRecordSource,
+    CppFileCQDAGRecordSource,
     ROOT_NODE_ID,
     SerialCQDAGOracle,
     build_cqdag_node_source,
@@ -20,6 +21,7 @@ from cqdagpcfg_parallel.protocol import (
     NodeStateTable,
     SchedulerConfig,
     WorkerId,
+    stable_digest,
     stable_record_string,
 )
 from cqdagpcfg_parallel.storage import StateMigrationSnapshot
@@ -235,6 +237,66 @@ def test_cpp_cqdag_structure_source_matches_python_stream_and_skip() -> None:
     assert stats.reclaimed_records >= start
 
 
+def test_cpp_file_cqdag_root_source_matches_serial_prefix(tmp_path) -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    model_path = tmp_path / "model.json"
+    save_model(model, model_path)
+    limit = 80
+
+    baseline = SerialCQDAGOracle(model).run(limit)
+    source = CppFileCQDAGRecordSource(model_path, max_records=limit)
+    records = source.read_range(ROOT_NODE_ID, 0, limit)
+
+    assert stable_digest(records) == baseline.digest
+    assert tuple(stable_record_string(record) for record in records) == tuple(
+        stable_record_string(record) for record in baseline.outputs
+    )
+
+
+def test_cpp_structure_state_export_and_restore(tmp_path) -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    model_path = tmp_path / "model.json"
+    save_model(model, model_path)
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    if node.cardinality < 8:
+        pytest.skip("toy model did not produce a large enough structure stream")
+
+    enumerator = CppOptimizedCQDAGEnumerator.from_json_file(model_path)
+    prefix = tuple(enumerator.iter_structure_records(node.structure_index, 0, 4))
+    state = enumerator.structure_state(node.structure_index)
+    assert state["produced"] >= 4
+    assert state["has_cursor"] is True
+
+    restored = CppOptimizedCQDAGEnumerator.from_json_file(model_path)
+    restored.restore_structure_state(node.structure_index, int(state["produced"]))
+    suffix = tuple(
+        restored.iter_structure_records(
+            node.structure_index,
+            int(state["produced"]),
+            int(state["produced"]) + 4,
+        )
+    )
+    baseline = tuple(
+        CppOptimizedCQDAGEnumerator(model).iter_structure_records(
+            node.structure_index,
+            0,
+            int(state["produced"]) + 4,
+        )
+    )
+
+    assert tuple(stable_record_string(record) for record in prefix) == tuple(
+        stable_record_string(record) for record in baseline[:4]
+    )
+    assert tuple(stable_record_string(record) for record in suffix) == tuple(
+        stable_record_string(record) for record in baseline[int(state["produced"]) :]
+    )
+
+
 def test_node_source_auto_uses_cpp_for_structure_source(tmp_path) -> None:
     if not cpp_backend_available():
         pytest.skip("CQDAGPCFG C++ backend is not built")
@@ -253,6 +315,26 @@ def test_node_source_auto_uses_cpp_for_structure_source(tmp_path) -> None:
 
     assert resolve_generation_backend(config) == "cpp"
     assert source.prefer_cpp is True
+
+
+def test_node_source_auto_uses_cpp_file_source_for_root(tmp_path) -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    model_path = tmp_path / "model.json"
+    save_model(model, model_path)
+
+    config = CQDAGNodeSourceConfig.from_explicit_model(
+        model_path=model_path,
+        model_connect=None,
+        model_id="toy",
+        source_mode="root",
+        generation_backend="auto",
+    )
+    source = build_cqdag_node_source(config, limit=16)
+
+    assert resolve_generation_backend(config) == "cpp"
+    assert isinstance(source, CppFileCQDAGRecordSource)
 
 
 def test_cqdag_structure_source_state_migration_resumes_stream_after_json_roundtrip() -> None:

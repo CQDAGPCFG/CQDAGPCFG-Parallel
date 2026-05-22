@@ -7,6 +7,7 @@ from .block_graph import (
     CQDAGRecordSource,
     CQDAGSourceReclaimStats,
     CQDAGStructureRecordSource,
+    CppFileCQDAGRecordSource,
     slot_entropy,
     slot_entropy_bound,
 )
@@ -26,7 +27,15 @@ from .node_source import (
     resolve_generation_backend,
     resolve_cqdag_model_path,
 )
-from .job_spec import CQDAGJobSpec, compute_serial_digest
+from .job_spec import (
+    CQDAGJobSpec,
+    compute_serial_digest,
+    digest_guess,
+    iter_serial_records,
+    normalize_target_ranks,
+    prepare_cqdag_job_spec,
+    serial_digest_and_targets,
+)
 from .node_service import (
     AnnotatedCQDAGPCFGNode,
     CQDAGCandidate,
@@ -84,6 +93,7 @@ __all__ = [
     "CQDAGRecordSource",
     "CQDAGSourceReclaimStats",
     "CQDAGStructureRecordSource",
+    "CppFileCQDAGRecordSource",
     "PagedCQDAGModelClient",
     "PagedCQDAGRecordSource",
     "PagedCQDAGStructureRecordSource",
@@ -97,6 +107,11 @@ __all__ = [
     "build_paged_model",
     "build_cqdag_node_source",
     "compute_serial_digest",
+    "digest_guess",
+    "iter_serial_records",
+    "normalize_target_ranks",
+    "prepare_cqdag_job_spec",
+    "serial_digest_and_targets",
     "cqdagpcfg",
     "cqdagpcfg_consumer",
     "cqdagpcfg_generator",

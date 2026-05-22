@@ -16,6 +16,7 @@ from .block_graph import (
     CQDAGBlockGraphAdapter,
     CQDAGRecordSource,
     CQDAGStructureRecordSource,
+    CppFileCQDAGRecordSource,
 )
 from .paged_source import (
     PagedCQDAGRecordSource,
@@ -131,6 +132,11 @@ def build_cqdag_node_source(
         model_cache_dir=model_cache_dir,
         expected_fingerprint=expected_fingerprint,
     )
+    if backend == "cpp" and config.source_mode == "root":
+        return CppFileCQDAGRecordSource(
+            model_path,
+            max_records=limit + config.demand_window,
+        )
     model = load_model(model_path)
     adapter = CQDAGBlockGraphAdapter(model)
     if config.source_mode == "structure":

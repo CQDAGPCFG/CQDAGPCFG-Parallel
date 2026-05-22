@@ -145,7 +145,7 @@ class EnumerationChunk:
         return ChunkRange(self.node_id, self.start, self.end)
 
 
-STABLE_PROBABILITY_DIGITS = 13
+STABLE_PROBABILITY_DIGITS = 9
 
 
 def stable_record_string(record: GuessRecord) -> str:

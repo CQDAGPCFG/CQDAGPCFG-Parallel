@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from CQDAGPCFG import GuessRecord
 
+import cqdagpcfg_parallel.runtime.batch_transport as batch_transport
 from cqdagpcfg_parallel.runtime import (
     BatchEndOfStream,
     BatchAck,
@@ -73,6 +74,22 @@ def test_binary_candidate_batch_codec_round_trips() -> None:
     assert [record.stable_string() for record in decoded.records] == [
         record.stable_string() for record in batch.records
     ]
+
+
+def test_cpp_binary_candidate_batch_serializer_matches_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    cpp_serializer = batch_transport.cpp_serialize_candidate_batch
+    if cpp_serializer is None:
+        pytest.skip("CQDAGPCFG C++ batch serializer is not available")
+    batch = _batch(5, 10, count=4)
+
+    monkeypatch.setattr(batch_transport, "cpp_serialize_candidate_batch", None)
+    python_payload = BinaryCandidateBatchCodec.dumps(batch)
+    monkeypatch.setattr(batch_transport, "cpp_serialize_candidate_batch", cpp_serializer)
+    cpp_payload = BinaryCandidateBatchCodec.dumps(batch)
+
+    assert cpp_payload == python_payload
+    decoded = BinaryCandidateBatchCodec.loads(cpp_payload)
+    assert decoded.guesses == batch.guesses
 
 
 def test_binary_candidate_batch_codec_round_trips_end_of_stream() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from math import log, prod
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from CQDAGPCFG import GuessRecord
@@ -223,6 +224,170 @@ class CQDAGRecordSource:
         except StopIteration:
             self.exhausted = True
             return None
+
+
+class CppFileCQDAGRecordSource:
+    """Root stream backed directly by the CQDAGPCFG C++ file loader."""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        node_id: NodeId = ROOT_NODE_ID,
+        max_records: int,
+    ) -> None:
+        if max_records < 0:
+            raise ValueError("max_records cannot be negative")
+        self.model_path = Path(model_path)
+        self.node_id = node_id
+        self.max_records = max_records
+        self.prefer_cpp = True
+        if self.model_path.suffix == ".bin":
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_binary_file(self.model_path)
+        else:
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_json_file(self.model_path)
+        self._cache: list[GuessRecord] = []
+        self._cache_base = 0
+        self._raw_index = 0
+        self._raw_buffer: deque[GuessRecord] = deque()
+        self._lookahead_record: GuessRecord | None = None
+        self._raw_fetch_size = 4096
+        self._raw_exhausted = False
+        self._peak_cached_records = 0
+        self._reclaimed_records = 0
+        self.exhausted = False
+
+    def read_range(
+        self,
+        node_id: NodeId,
+        start: int,
+        end: int,
+    ) -> Sequence[GuessRecord]:
+        if node_id != self.node_id:
+            raise KeyError(f"unknown CQDAG record source node: {node_id}")
+        if start < 0 or end < start:
+            raise ValueError("invalid source range")
+        if start < self._cache_base:
+            self._restart_from_zero()
+        if start > self._ready_end:
+            self._skip_to(start)
+        self._ensure(end)
+        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+
+    def reclaim_before(self, node_id: NodeId, index: int) -> int:
+        if node_id != self.node_id:
+            raise KeyError(f"unknown CQDAG record source node: {node_id}")
+        if index < 0:
+            raise ValueError("reclaim index cannot be negative")
+        ready_end = self._cache_base + len(self._cache)
+        reclaim_end = min(max(index, self._cache_base), ready_end)
+        reclaimed = reclaim_end - self._cache_base
+        if reclaimed <= 0:
+            return self._cache_base
+        del self._cache[:reclaimed]
+        self._cache_base = reclaim_end
+        self._reclaimed_records += reclaimed
+        return self._cache_base
+
+    def stats(self) -> CQDAGSourceReclaimStats:
+        return CQDAGSourceReclaimStats(
+            node_count=1,
+            cached_records=len(self._cache),
+            peak_cached_records=self._peak_cached_records,
+            reclaimed_records=self._reclaimed_records,
+            dag_repository_active_units=self.enumerator.active_units(),
+        )
+
+    @property
+    def _ready_end(self) -> int:
+        return self._cache_base + len(self._cache)
+
+    def _skip_to(self, index: int) -> None:
+        if index <= self._ready_end:
+            return
+        reclaim_end = min(index, self._ready_end)
+        if reclaim_end > self._cache_base:
+            reclaimed = reclaim_end - self._cache_base
+            del self._cache[:reclaimed]
+            self._cache_base = reclaim_end
+            self._reclaimed_records += reclaimed
+        while self._cache_base < index and not self.exhausted:
+            group = self._next_canonical_group()
+            if not group:
+                return
+            skip_count = min(index - self._cache_base, len(group))
+            self._cache_base += skip_count
+            self._reclaimed_records += skip_count
+            if skip_count < len(group):
+                self._cache.extend(group[skip_count:])
+                self._update_peak_cached_records()
+                return
+
+    def _ensure(self, end: int) -> None:
+        if end > self.max_records:
+            raise RuntimeError("requested range exceeds configured source limit")
+        while self._cache_base + len(self._cache) < end and not self.exhausted:
+            group = self._next_canonical_group()
+            if not group:
+                return
+            self._cache.extend(group)
+            self._update_peak_cached_records()
+
+    def _next_canonical_group(self) -> tuple[GuessRecord, ...]:
+        first = self._pop_next_raw_record()
+        if first is None:
+            return ()
+        group_key = _probability_group_key(first)
+        group = [first]
+        while True:
+            record = self._pop_next_raw_record()
+            if record is None:
+                break
+            if _probability_group_key(record) != group_key:
+                self._lookahead_record = record
+                break
+            group.append(record)
+        return tuple(sorted(group, key=_canonical_tie_key))
+
+    def _pop_next_raw_record(self) -> GuessRecord | None:
+        if self._lookahead_record is not None:
+            record = self._lookahead_record
+            self._lookahead_record = None
+            return record
+        while not self._raw_buffer and not self._raw_exhausted:
+            if self._raw_index >= self.max_records:
+                self._raw_exhausted = True
+                return None
+            start = self._raw_index
+            end = min(self.max_records, self._raw_index + self._raw_fetch_size)
+            records = tuple(self.enumerator.iter_root_raw_records(start, end))
+            self._raw_index += len(records)
+            if not records:
+                self._raw_exhausted = True
+                return None
+            self._raw_buffer.extend(records)
+            if len(records) < end - start:
+                self._raw_exhausted = True
+        if not self._raw_buffer:
+            self.exhausted = True
+            return None
+        return self._raw_buffer.popleft()
+
+    def _restart_from_zero(self) -> None:
+        if self.model_path.suffix == ".bin":
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_binary_file(self.model_path)
+        else:
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_json_file(self.model_path)
+        self._cache = []
+        self._cache_base = 0
+        self._raw_index = 0
+        self._raw_buffer.clear()
+        self._lookahead_record = None
+        self._raw_exhausted = False
+        self.exhausted = False
+
+    def _update_peak_cached_records(self) -> None:
+        self._peak_cached_records = max(self._peak_cached_records, len(self._cache))
 
 
 def _probability_group_key(record: GuessRecord) -> str:
@@ -778,7 +943,11 @@ class _CppStructureLocalStream:
         else:
             self._cache_base = snapshot.ready_end
             self._cache = []
-        self.enumerator.advance_structure(self.structure_index, self.ready_end)
+        self.enumerator.restore_structure_state(
+            self.structure_index,
+            self.ready_end,
+            exhausted=False,
+        )
         self._raw_index = self.ready_end
         self._raw_buffer.clear()
         self._lookahead_record = None

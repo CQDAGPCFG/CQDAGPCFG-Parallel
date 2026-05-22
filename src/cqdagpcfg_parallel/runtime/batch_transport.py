@@ -9,6 +9,11 @@ from typing import Iterable, Protocol
 
 from CQDAGPCFG import GuessRecord
 
+try:
+    from CQDAGPCFG.cpp_backend import cpp_serialize_candidate_batch
+except (ImportError, RuntimeError):  # pragma: no cover - optional backend
+    cpp_serialize_candidate_batch = None
+
 from .batching import make_candidate_batches
 from .candidate_batch import CandidateBatch
 from .candidate_queue import BoundedCandidateQueue
@@ -113,6 +118,12 @@ class BinaryCandidateBatchCodec:
 
     @classmethod
     def dumps(cls, batch: CandidateBatch) -> bytes:
+        if cpp_serialize_candidate_batch is not None:
+            return cpp_serialize_candidate_batch(
+                batch.batch_id,
+                batch.start_rank,
+                batch.records,
+            )
         parts = [
             cls._header.pack(cls._magic, cls.schema_version, cls._type_batch),
             cls._batch_header.pack(batch.batch_id, batch.start_rank, len(batch.records)),
