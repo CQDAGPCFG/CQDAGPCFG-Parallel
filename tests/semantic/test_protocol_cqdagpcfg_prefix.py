@@ -15,8 +15,11 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     SerialCQDAGOracle,
     build_cqdag_node_source,
     parse_structure_rank_lane_node_id,
+    parse_structure_rank_range_node_id,
     resolve_generation_backend,
+    structure_probability_mass_lane_bounds,
     structure_rank_lane_bounds,
+    structure_rank_range_node_id,
 )
 from cqdagpcfg_parallel.protocol import (
     ChunkSizePolicy,
@@ -244,6 +247,109 @@ def test_cqdag_structure_rank_lane_source_maps_local_rank_to_structure_rank() ->
     assert lane_source.stats().reclaimed_records >= read_count
 
 
+def test_probability_mass_lane_bounds_front_load_cracking_horizon() -> None:
+    bounds = tuple(
+        structure_probability_mass_lane_bounds(
+            cardinality=1_000,
+            lane_index=index,
+            lane_count=4,
+            rank_horizon=64,
+            mass_bias=2.0,
+        )
+        for index in range(4)
+    )
+
+    assert bounds == ((0, 4), (4, 16), (16, 36), (36, 64))
+
+
+def test_cqdag_rank_range_source_maps_local_rank_to_structure_rank() -> None:
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    if node.cardinality < 8:
+        pytest.skip("toy model did not produce a large enough structure stream")
+
+    start = max(1, node.cardinality // 4)
+    end = min(node.cardinality, start + 4)
+    range_node_id = structure_rank_range_node_id(
+        node.structure_index,
+        node.name,
+        start,
+        end,
+    )
+
+    assert parse_structure_rank_range_node_id(range_node_id) == (
+        node.structure_index,
+        start,
+        end,
+        node.name,
+    )
+
+    baseline_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=node.cardinality,
+        adapter=adapter,
+    )
+    baseline = baseline_source.read_range(node.node_id, start, end)
+
+    range_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=node.cardinality,
+        adapter=adapter,
+    )
+    records = range_source.read_range(range_node_id, 0, end - start)
+
+    assert tuple(record.stable_string() for record in records) == tuple(
+        record.stable_string() for record in baseline
+    )
+    assert range_source.reclaim_before(range_node_id, end - start) == end - start
+
+
+def test_probability_mass_rank_lanes_use_range_addressed_nodes() -> None:
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    if node.cardinality < 16:
+        pytest.skip("toy model did not produce a large enough structure stream")
+
+    lane_nodes = tuple(
+        lane
+        for lane in adapter.structure_rank_lane_nodes(
+            lane_count=4,
+            rank_horizon=16,
+            split_strategy="probability_mass",
+            mass_bias=2.0,
+        )
+        if lane.structure_index == node.structure_index
+    )
+
+    assert [lane.rank_start for lane in lane_nodes] == [0, 1, 4, 9]
+    assert [lane.rank_end for lane in lane_nodes] == [1, 4, 9, 16]
+    assert all(parse_structure_rank_range_node_id(lane.node_id) for lane in lane_nodes)
+    assert lane_nodes[0].priority > lane_nodes[-1].priority
+
+
+def test_probability_mass_rank_lanes_do_not_duplicate_tiny_ranges() -> None:
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+
+    for node in adapter.structure_nodes():
+        lane_nodes = tuple(
+            lane
+            for lane in adapter.structure_rank_lane_nodes(
+                lane_count=12,
+                rank_horizon=16,
+                split_strategy="probability_mass",
+                mass_bias=2.0,
+            )
+            if lane.structure_index == node.structure_index
+        )
+        ranges = tuple((lane.rank_start, lane.rank_end) for lane in lane_nodes)
+        assert len(ranges) == len(set(ranges))
+        for left, right in zip(ranges, ranges[1:]):
+            assert left[1] <= right[0]
+
+
 def test_cpp_cqdag_structure_source_matches_python_stream_and_skip() -> None:
     if not cpp_backend_available():
         pytest.skip("CQDAGPCFG C++ backend is not built")
@@ -291,6 +397,41 @@ def test_cpp_cqdag_structure_source_matches_python_stream_and_skip() -> None:
     assert stats.cached_records <= limit - start
     assert stats.peak_cached_records >= end - start
     assert stats.reclaimed_records >= start
+
+
+def test_cpp_structure_artifact_writer_handles_out_of_order_tail_ranges(tmp_path) -> None:
+    if not cpp_backend_available():
+        pytest.skip("CQDAGPCFG C++ backend is not built")
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    limit = min(node.cardinality, 24)
+    if limit < 8:
+        pytest.skip("toy model did not produce a large enough structure stream")
+
+    source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=limit,
+        adapter=adapter,
+        prefer_cpp=True,
+    )
+    later = source.write_range_artifact(
+        node.node_id,
+        4,
+        8,
+        guess_path=tmp_path / "later.txt",
+        verify_artifact=False,
+    )
+    earlier = source.write_range_artifact(
+        node.node_id,
+        0,
+        4,
+        guess_path=tmp_path / "earlier.txt",
+        verify_artifact=False,
+    )
+
+    assert later.record_count == 4
+    assert earlier.record_count == 4
 
 
 def test_cpp_file_cqdag_root_source_matches_serial_prefix(tmp_path) -> None:

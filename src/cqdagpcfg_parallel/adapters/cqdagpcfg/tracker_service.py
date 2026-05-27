@@ -66,6 +66,8 @@ DEFAULT_SAFE_RECORD_CHUNK_SIZE = 8192
 DEFAULT_ROOT_ARTIFACT_TARGET_BYTES = 128 * 1024 * 1024
 DEFAULT_CRACKING_ROOT_ARTIFACT_TARGET_BYTES = 128 * 1024 * 1024
 DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH = 4
+DEFAULT_SHARD_LANE_SPLIT_STRATEGY = "equal_rank"
+DEFAULT_SHARD_MASS_LANE_BIAS = 2.0
 
 
 @dataclass(slots=True)
@@ -678,7 +680,14 @@ def _run_cqdag_tracker_service(
             max_parallel_leases_per_node,
         )
         protocol_nodes = adapter.structure_rank_lane_nodes(
-            lane_count=shard_rank_lane_count
+            lane_count=shard_rank_lane_count,
+            rank_horizon=(
+                limit
+                if DEFAULT_SHARD_LANE_SPLIT_STRATEGY == "probability_mass"
+                else None
+            ),
+            split_strategy=DEFAULT_SHARD_LANE_SPLIT_STRATEGY,
+            mass_bias=DEFAULT_SHARD_MASS_LANE_BIAS,
         )
         node_ids = tuple(node.node_id for node in protocol_nodes)
         node_features = adapter.scheduling_features_for(protocol_nodes)
@@ -728,6 +737,8 @@ def _run_cqdag_tracker_service(
         generator_slots=generator_slots,
         shard_rank_lane_count=shard_rank_lane_count,
         shard_parallel_pipeline_depth=DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH,
+        shard_lane_split_strategy=DEFAULT_SHARD_LANE_SPLIT_STRATEGY,
+        shard_mass_lane_bias=DEFAULT_SHARD_MASS_LANE_BIAS,
         max_parallel_leases_per_node=max_parallel_leases_per_node,
         requested_max_parallel_leases_per_node=args.max_parallel_leases_per_node,
         lease_ttl_seconds=args.lease_ttl_seconds,

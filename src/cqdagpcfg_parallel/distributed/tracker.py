@@ -924,7 +924,7 @@ class DistributedProtocolTracker:
 
         shard = self._shard_for_item(item)
         shard.cursor = max(shard.cursor, item.start + len(emitted))
-        self.states.update_frontier_start(item.node_id, shard.cursor)
+        self._update_direct_frontier_start(item.node_id, shard.cursor)
         if self.config.reclaim_emitted_chunks:
             self.chunk_store.advance_base_offset(item.node_id, shard.cursor)
 
@@ -986,9 +986,14 @@ class DistributedProtocolTracker:
 
         shard = self._shard_for_item(item)
         shard.cursor = max(shard.cursor, item.start + emit_count)
-        self.states.update_frontier_start(item.node_id, shard.cursor)
+        self._update_direct_frontier_start(item.node_id, shard.cursor)
         if self.config.reclaim_emitted_chunks:
             self.chunk_store.advance_base_offset(item.node_id, shard.cursor)
+
+    def _update_direct_frontier_start(self, node_id: NodeId, cursor: int) -> None:
+        state = self.states.get(node_id)
+        if cursor > state.frontier_start:
+            self.states.update_frontier_start(node_id, cursor)
 
     def _delete_unpublished_artifacts(self, message: ControlMessage) -> None:
         if message.artifact_uri is not None:

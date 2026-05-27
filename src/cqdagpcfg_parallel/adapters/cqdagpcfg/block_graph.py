@@ -54,6 +54,7 @@ ROOT_NODE_ID = NodeId("root")
 _SOURCE_SKIP_ACK_WINDOW = 64
 _SERIAL_PROBABILITY_SIGNIFICANT_DIGITS = STABLE_PROBABILITY_DIGITS
 _ARTIFACT_WRITE_BUFFER_BYTES = 1 << 20
+DEFAULT_PROBABILITY_MASS_LANE_BIAS = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +76,7 @@ class BlockNodeDescriptor:
 
     @property
     def is_lane(self) -> bool:
-        return self.lane_index is not None
+        return self.rank_end is not None and self.rank_end > self.rank_start
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +195,36 @@ def parse_structure_rank_lane_node_id(node_id: NodeId) -> tuple[int, int, int, s
     return structure_index, lane_index, lane_count, parts[5]
 
 
+def structure_rank_range_node_id(
+    structure_index: int,
+    structure_name: str,
+    start: int,
+    end: int,
+) -> NodeId:
+    if structure_index < 0:
+        raise ValueError("structure_index cannot be negative")
+    if start < 0:
+        raise ValueError("rank range start cannot be negative")
+    if end <= start:
+        raise ValueError("rank range end must be greater than start")
+    return NodeId(f"structure:{structure_index}:range:{start}:{end}:{structure_name}")
+
+
+def parse_structure_rank_range_node_id(node_id: NodeId) -> tuple[int, int, int, str] | None:
+    parts = str(node_id).split(":", 5)
+    if len(parts) != 6 or parts[0] != "structure" or parts[2] != "range":
+        return None
+    try:
+        structure_index = int(parts[1])
+        start = int(parts[3])
+        end = int(parts[4])
+    except ValueError:
+        return None
+    if structure_index < 0 or start < 0 or end <= start:
+        return None
+    return structure_index, start, end, parts[5]
+
+
 def structure_rank_lane_bounds(
     *,
     cardinality: int,
@@ -215,6 +246,61 @@ def structure_rank_lane_bounds(
     start = min(cardinality, lane_index * lane_size)
     end = min(cardinality, start + lane_size)
     return start, end
+
+
+def structure_probability_mass_lane_bounds(
+    *,
+    cardinality: int,
+    lane_index: int,
+    lane_count: int,
+    rank_horizon: int | None = None,
+    mass_bias: float = DEFAULT_PROBABILITY_MASS_LANE_BIAS,
+) -> tuple[int, int]:
+    if cardinality < 0:
+        raise ValueError("cardinality cannot be negative")
+    if lane_count <= 0:
+        raise ValueError("lane_count must be positive")
+    if lane_index < 0 or lane_index >= lane_count:
+        raise ValueError("lane_index is out of range")
+    if mass_bias <= 0.0:
+        raise ValueError("mass_bias must be positive")
+    if cardinality == 0:
+        return 0, 0
+    horizon = cardinality if rank_horizon is None else min(cardinality, rank_horizon)
+    if horizon <= 0:
+        return 0, 0
+    effective_lanes = min(lane_count, horizon)
+    if lane_index >= effective_lanes:
+        return horizon, horizon
+
+    def boundary(index: int) -> int:
+        if index <= 0:
+            return 0
+        if index >= effective_lanes:
+            return horizon
+        fraction = (index / effective_lanes) ** mass_bias
+        raw = round(horizon * fraction)
+        lower = index
+        upper = horizon - (effective_lanes - index)
+        return min(upper, max(lower, raw))
+
+    start = boundary(lane_index)
+    end = boundary(lane_index + 1)
+    if end <= start:
+        end = min(horizon, start + 1)
+    return start, end
+
+
+def _probability_mass_fraction(
+    rank: int,
+    *,
+    horizon: int,
+    mass_bias: float,
+) -> float:
+    if horizon <= 0:
+        return 0.0
+    ratio = min(1.0, max(0.0, rank / horizon))
+    return ratio ** (1.0 / mass_bias)
 
 
 class CQDAGRecordSource:
@@ -1000,25 +1086,41 @@ class CQDAGStructureRecordSource:
         if descriptor is not None:
             return descriptor
         lane_parts = parse_structure_rank_lane_node_id(node_id)
-        if lane_parts is None:
+        range_parts = parse_structure_rank_range_node_id(node_id)
+        if lane_parts is None and range_parts is None:
             raise KeyError(f"unknown CQDAG structure source node: {node_id}")
-        structure_index, lane_index, lane_count, structure_name = lane_parts
+        if range_parts is not None:
+            structure_index, start, end, structure_name = range_parts
+            lane_index = None
+            lane_count = 1
+        else:
+            assert lane_parts is not None
+            structure_index, lane_index, lane_count, structure_name = lane_parts
         base_node_id = NodeId(f"structure:{structure_index}:{structure_name}")
         base = self._descriptors.get(base_node_id)
         if base is None:
             raise KeyError(f"unknown CQDAG structure source node: {node_id}")
         lanes = min(lane_count, max(1, base.cardinality))
-        start, end = structure_rank_lane_bounds(
-            cardinality=base.cardinality,
-            lane_index=lane_index,
-            lane_count=lanes,
-        )
+        if range_parts is None:
+            assert lane_index is not None
+            start, end = structure_rank_lane_bounds(
+                cardinality=base.cardinality,
+                lane_index=lane_index,
+                lane_count=lanes,
+            )
+        else:
+            start = min(start, base.cardinality)
+            end = min(end, base.cardinality)
         if end <= start:
             raise KeyError(f"empty CQDAG structure lane node: {node_id}")
         descriptor = replace(
             base,
             node_id=node_id,
-            name=f"{base.name}/lane{lane_index + 1}of{lanes}",
+            name=(
+                f"{base.name}/rank{start}-{end}"
+                if range_parts is not None
+                else f"{base.name}/lane{lane_index + 1}of{lanes}"
+            ),
             cardinality=end - start,
             lane_index=lane_index,
             lane_count=lanes,
@@ -1032,14 +1134,14 @@ class CQDAGStructureRecordSource:
         self,
         descriptor: BlockNodeDescriptor,
     ) -> StructureRankLane | None:
-        if descriptor.lane_index is None or descriptor.rank_end is None:
+        if descriptor.rank_end is None:
             return None
         structure_index = _require_structure_index(descriptor)
         structure_name = self.model.structures[structure_index].name
         return StructureRankLane(
             structure_index=structure_index,
             structure_name=structure_name,
-            lane_index=descriptor.lane_index,
+            lane_index=0 if descriptor.lane_index is None else descriptor.lane_index,
             lane_count=descriptor.lane_count,
             start=descriptor.rank_start,
             end=descriptor.rank_end,
@@ -1106,37 +1208,87 @@ class CQDAGBlockGraphAdapter:
         self,
         *,
         lane_count: int,
+        rank_horizon: int | None = None,
+        split_strategy: str = "equal_rank",
+        mass_bias: float = DEFAULT_PROBABILITY_MASS_LANE_BIAS,
     ) -> tuple[BlockNodeDescriptor, ...]:
         if lane_count <= 0:
             raise ValueError("lane_count must be positive")
+        if split_strategy not in {"equal_rank", "probability_mass"}:
+            raise ValueError("split_strategy must be equal_rank or probability_mass")
+        if rank_horizon is not None and rank_horizon < 0:
+            raise ValueError("rank_horizon cannot be negative")
+        if mass_bias <= 0.0:
+            raise ValueError("mass_bias must be positive")
         nodes: list[BlockNodeDescriptor] = []
         for node in self.structure_nodes():
-            lanes = min(lane_count, max(1, node.cardinality))
+            horizon = (
+                node.cardinality
+                if rank_horizon is None
+                else min(node.cardinality, rank_horizon)
+            )
+            lanes = min(lane_count, max(1, horizon))
             for lane_index in range(lanes):
-                start, end = structure_rank_lane_bounds(
-                    cardinality=node.cardinality,
-                    lane_index=lane_index,
-                    lane_count=lanes,
-                )
+                if split_strategy == "probability_mass":
+                    start, end = structure_probability_mass_lane_bounds(
+                        cardinality=node.cardinality,
+                        lane_index=lane_index,
+                        lane_count=lanes,
+                        rank_horizon=horizon,
+                        mass_bias=mass_bias,
+                    )
+                else:
+                    start, end = structure_rank_lane_bounds(
+                        cardinality=node.cardinality,
+                        lane_index=lane_index,
+                        lane_count=lanes,
+                    )
                 if end <= start:
                     continue
-                # Earlier rank lanes are more valuable in cracking mode.  We
-                # keep the structure probability as the dominant signal and use
-                # a mild lane decay so the scheduler prefers front lanes without
-                # starving high-mass neighboring structures.
-                lane_decay = 1.0 / (1.0 + lane_index)
+                if split_strategy == "probability_mass":
+                    mass_start = _probability_mass_fraction(
+                        start,
+                        horizon=max(1, horizon),
+                        mass_bias=mass_bias,
+                    )
+                    mass_end = _probability_mass_fraction(
+                        end,
+                        horizon=max(1, horizon),
+                        mass_bias=mass_bias,
+                    )
+                    lane_mass_fraction = max(0.0, mass_end - mass_start)
+                    lane_decay = 1.0 / (1.0 + lane_index)
+                    priority = node.priority * lane_mass_fraction * lane_decay
+                    base_prob = node.base_prob * lane_mass_fraction
+                    node_id = structure_rank_range_node_id(
+                        _require_structure_index(node),
+                        node.name,
+                        start,
+                        end,
+                    )
+                    name = f"{node.name}/masslane{lane_index + 1}of{lanes}"
+                else:
+                    # Earlier rank lanes are more valuable in cracking mode.  We
+                    # keep the structure probability as the dominant signal and use
+                    # a mild lane decay so the scheduler prefers front lanes without
+                    # starving high-mass neighboring structures.
+                    lane_decay = 1.0 / (1.0 + lane_index)
+                    priority = node.priority * lane_decay
+                    base_prob = node.base_prob * lane_decay
+                    node_id = structure_rank_lane_node_id(
+                        _require_structure_index(node),
+                        node.name,
+                        lane_index,
+                        lanes,
+                    )
+                    name = f"{node.name}/lane{lane_index + 1}of{lanes}"
                 nodes.append(
                     replace(
                         node,
-                        node_id=structure_rank_lane_node_id(
-                            _require_structure_index(node),
-                            node.name,
-                            lane_index,
-                            lanes,
-                        ),
-                        name=f"{node.name}/lane{lane_index + 1}of{lanes}",
-                        priority=node.priority * lane_decay,
-                        base_prob=node.base_prob * lane_decay,
+                        node_id=node_id,
+                        name=name,
+                        priority=priority,
+                        base_prob=base_prob,
                         cardinality=end - start,
                         lane_index=lane_index,
                         lane_count=lanes,
@@ -1359,8 +1511,7 @@ class _CppStructureLocalStream:
     ) -> CandidateRangeArtifact:
         if start < 0 or end < start:
             raise ValueError("invalid structure source range")
-        if start < self._cache_base:
-            raise RuntimeError("requested range was already reclaimed by the C++ source")
+        use_isolated_writer = start < self._cache_base
         guess_path = Path(guess_path)
         stable_path = None if stable_path is None else Path(stable_path)
         effective_end = min(end, self.max_records)
@@ -1383,23 +1534,42 @@ class _CppStructureLocalStream:
                 verify_artifact=verify_artifact,
                 include_stable_metadata=include_stable_metadata,
             )
-        info = writer(
-            self.structure_index,
-            start,
-            effective_end,
-            guess_path,
-            stable_path,
-            include_stable_metadata=(
-                include_stable_metadata or _stable_metadata_enabled(stable_path)
-            ),
-        )
+        try:
+            if use_isolated_writer:
+                raise RuntimeError("reclaimed range requires isolated C++ writer")
+            info = writer(
+                self.structure_index,
+                start,
+                effective_end,
+                guess_path,
+                stable_path,
+                include_stable_metadata=(
+                    include_stable_metadata or _stable_metadata_enabled(stable_path)
+                ),
+            )
+        except RuntimeError as exc:
+            if "reclaimed" not in str(exc):
+                raise
+            isolated = CppOptimizedCQDAGEnumerator(self.model)
+            info = isolated.write_structure_artifacts(
+                self.structure_index,
+                start,
+                effective_end,
+                guess_path,
+                stable_path,
+                include_stable_metadata=(
+                    include_stable_metadata or _stable_metadata_enabled(stable_path)
+                ),
+            )
         record_count = int(info["record_count"])
-        self._cache = []
-        self._cache_base = start + record_count
-        self._raw_index = self._cache_base
-        self._raw_buffer.clear()
-        self._lookahead_record = None
-        self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
+        new_base = start + record_count
+        if new_base >= self._cache_base:
+            self._cache = []
+            self._cache_base = new_base
+            self._raw_index = self._cache_base
+            self._raw_buffer.clear()
+            self._lookahead_record = None
+            self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
         if effective_end < end or record_count < effective_end - start:
             self.exhausted = True
         return CandidateRangeArtifact(
@@ -2067,8 +2237,11 @@ __all__ = [
     "ROOT_NODE_ID",
     "StructureRankLane",
     "parse_structure_rank_lane_node_id",
+    "parse_structure_rank_range_node_id",
     "slot_entropy",
     "slot_entropy_bound",
+    "structure_probability_mass_lane_bounds",
     "structure_rank_lane_bounds",
     "structure_rank_lane_node_id",
+    "structure_rank_range_node_id",
 ]

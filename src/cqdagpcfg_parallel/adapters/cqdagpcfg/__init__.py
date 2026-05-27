@@ -10,10 +10,13 @@ from .block_graph import (
     CppFileCQDAGRecordSource,
     StructureRankLane,
     parse_structure_rank_lane_node_id,
+    parse_structure_rank_range_node_id,
     slot_entropy,
     slot_entropy_bound,
+    structure_probability_mass_lane_bounds,
     structure_rank_lane_bounds,
     structure_rank_lane_node_id,
+    structure_rank_range_node_id,
 )
 from .paged_source import (
     PagedCQDAGModelClient,
@@ -143,10 +146,13 @@ __all__ = [
     "cqdagpcfg_tracker",
     "pcfg",
     "parse_structure_rank_lane_node_id",
+    "parse_structure_rank_range_node_id",
     "resolve_cqdag_model_path",
     "resolve_generation_backend",
     "slot_entropy",
     "slot_entropy_bound",
+    "structure_probability_mass_lane_bounds",
     "structure_rank_lane_bounds",
     "structure_rank_lane_node_id",
+    "structure_rank_range_node_id",
 ]

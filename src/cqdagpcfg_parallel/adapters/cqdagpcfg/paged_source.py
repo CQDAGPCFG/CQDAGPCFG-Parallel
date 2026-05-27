@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from math import exp, fsum, log
+from math import exp, fsum, log, prod
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -29,11 +29,15 @@ from .block_graph import (
     ROOT_NODE_ID,
     _StructureLocalStream,
     _capture_reachable_blocks,
+    _empty_candidate_artifact,
     _index_resolved_children,
     _iter_repository_blocks,
     _require_structure_index,
     _restore_block_snapshot,
     _write_record_artifact,
+    parse_structure_rank_lane_node_id,
+    parse_structure_rank_range_node_id,
+    structure_rank_lane_bounds,
 )
 from .block_graph import BlockNodeDescriptor
 
@@ -366,7 +370,18 @@ class PagedCQDAGStructureRecordSource:
     ) -> Sequence[GuessRecord]:
         if start < 0 or end < start:
             raise ValueError("invalid source range")
-        return self._stream_for(node_id).read_range(start, end)
+        descriptor = self._descriptor_for_node(node_id)
+        lane = _descriptor_rank_range(descriptor)
+        if lane is None:
+            return self._stream_for(node_id).read_range(start, end)
+        lane_start, lane_end = lane
+        effective_end = min(end, lane_end - lane_start)
+        if start >= effective_end:
+            return ()
+        return self._stream_for(node_id).read_range(
+            lane_start + start,
+            lane_start + effective_end,
+        )
 
     def write_range_artifact(
         self,
@@ -379,8 +394,21 @@ class PagedCQDAGStructureRecordSource:
         verify_artifact: bool = True,
         include_stable_metadata: bool = True,
     ) -> CandidateRangeArtifact:
+        descriptor = self._descriptor_for_node(node_id)
+        lane = _descriptor_rank_range(descriptor)
+        if lane is not None:
+            lane_start, lane_end = lane
+            effective_end = min(end, lane_end - lane_start)
+            if start >= effective_end:
+                return _empty_candidate_artifact(
+                    guess_path=Path(guess_path),
+                    stable_path=None if stable_path is None else Path(stable_path),
+                    verify_artifact=verify_artifact,
+                )
+            start = lane_start + start
+            end = lane_start + effective_end
         return _write_record_artifact(
-            self.read_range(node_id, start, end),
+            self._stream_for(node_id).read_range(start, end),
             guess_path=guess_path,
             stable_path=stable_path,
             verify_artifact=verify_artifact,
@@ -391,15 +419,35 @@ class PagedCQDAGStructureRecordSource:
         stream = self._streams.get(node_id)
         if stream is None:
             return 0
-        return stream.reclaim_before(index)
+        descriptor = self._descriptor_for_node(node_id)
+        lane = _descriptor_rank_range(descriptor)
+        if lane is None:
+            return stream.reclaim_before(index)
+        lane_start, lane_end = lane
+        before = max(0, min(stream.reclaimed_records, lane_end) - lane_start)
+        stream.reclaim_before(lane_start + min(index, lane_end - lane_start))
+        after = max(0, min(stream.reclaimed_records, lane_end) - lane_start)
+        return max(0, after - before)
 
     def stats(self) -> CQDAGSourceReclaimStats:
         paged = self.model.stats
+        reclaimed_records = 0
+        for node_id, stream in self._streams.items():
+            descriptor = self._descriptor_for_node(node_id)
+            lane = _descriptor_rank_range(descriptor)
+            if lane is None:
+                reclaimed_records += stream.reclaimed_records
+            else:
+                lane_start, lane_end = lane
+                reclaimed_records += max(
+                    0,
+                    min(stream.reclaimed_records, lane_end) - lane_start,
+                )
         return CQDAGSourceReclaimStats(
             node_count=len(self._descriptors),
             cached_records=sum(stream.cached_records for stream in self._streams.values()),
             peak_cached_records=sum(stream.peak_cached_records for stream in self._streams.values()),
-            reclaimed_records=sum(stream.reclaimed_records for stream in self._streams.values()),
+            reclaimed_records=reclaimed_records,
             dag_repository_active_units=self.factory.active_units() + paged.json_pages,
             dag_stream_active_units=sum(stream.active_units for stream in self._streams.values()),
         )
@@ -466,18 +514,28 @@ class PagedCQDAGStructureRecordSource:
         stream = self._streams.get(node_id)
         if stream is not None:
             return stream
-        descriptor = self._descriptors.get(node_id)
-        if descriptor is None:
-            descriptor = _descriptor_from_node_id(self.model, node_id)
-            self._descriptors[node_id] = descriptor
+        descriptor = self._descriptor_for_node(node_id)
+        lane = _descriptor_rank_range(descriptor)
         stream = _StructureLocalStream(
             self.model,
             factory=self.factory,
             structure_index=_require_structure_index(descriptor),
-            max_records=self.max_records_per_structure,
+            max_records=(
+                min(self.max_records_per_structure, lane[1])
+                if lane is not None
+                else self.max_records_per_structure
+            ),
         )
         self._streams[node_id] = stream
         return stream
+
+    def _descriptor_for_node(self, node_id: NodeId) -> BlockNodeDescriptor:
+        descriptor = self._descriptors.get(node_id)
+        if descriptor is not None:
+            return descriptor
+        descriptor = _descriptor_from_node_id(self.model, node_id)
+        self._descriptors[node_id] = descriptor
+        return descriptor
 
 
 def build_paged_model(*, endpoint: str, model_id: str, max_json_pages: int = 128) -> PagedPcfgModel:
@@ -490,14 +548,49 @@ def build_paged_model(*, endpoint: str, model_id: str, max_json_pages: int = 128
 
 
 def _descriptor_from_node_id(model: PagedPcfgModel, node_id: NodeId) -> BlockNodeDescriptor:
+    lane_parts = parse_structure_rank_lane_node_id(node_id)
+    range_parts = parse_structure_rank_range_node_id(node_id)
     parts = str(node_id).split(":", 2)
     if len(parts) < 2 or parts[0] != "structure":
         raise KeyError(f"unknown CQDAG structure source node: {node_id}")
-    index = int(parts[1])
+    if range_parts is not None:
+        index, rank_start, rank_end, _ = range_parts
+        lane_index = None
+        lane_count = 1
+    elif lane_parts is not None:
+        index, lane_index, lane_count, _ = lane_parts
+        structure = model.structures[index]
+        cardinality = max(
+            prod(model.slot_cardinality(symbol) for symbol in structure.symbols),
+            1,
+        )
+        lanes = min(lane_count, cardinality)
+        rank_start, rank_end = structure_rank_lane_bounds(
+            cardinality=cardinality,
+            lane_index=lane_index,
+            lane_count=lanes,
+        )
+    else:
+        index = int(parts[1])
+        rank_start = 0
+        rank_end = None
+        lane_index = None
+        lane_count = 1
     structure = model.structures[index]
+    cardinality = max(
+        prod(model.slot_cardinality(symbol) for symbol in structure.symbols),
+        1,
+    )
+    if rank_end is not None:
+        rank_start = min(rank_start, cardinality)
+        rank_end = min(rank_end, cardinality)
     return BlockNodeDescriptor(
         node_id=node_id,
-        name=structure.name,
+        name=(
+            f"{structure.name}/rank{rank_start}-{rank_end}"
+            if rank_end is not None
+            else structure.name
+        ),
         structure_index=index,
         symbols=tuple(structure.symbols),
         priority=structure.base_prob,
@@ -506,7 +599,22 @@ def _descriptor_from_node_id(model: PagedPcfgModel, node_id: NodeId) -> BlockNod
             1.0,
         ),
         base_prob=structure.base_prob,
+        cardinality=(
+            max(0, rank_end - rank_start)
+            if rank_end is not None
+            else cardinality
+        ),
+        lane_index=lane_index,
+        lane_count=lane_count,
+        rank_start=rank_start,
+        rank_end=rank_end,
     )
+
+
+def _descriptor_rank_range(descriptor: BlockNodeDescriptor) -> tuple[int, int] | None:
+    if descriptor.rank_end is None:
+        return None
+    return descriptor.rank_start, descriptor.rank_end
 
 
 __all__ = [
