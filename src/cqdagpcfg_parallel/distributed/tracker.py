@@ -90,6 +90,7 @@ class DistributedProtocolConfig:
     lazy_shard_activation: bool = True
     direct_root_chunk_emission: bool = True
     direct_unordered_chunk_emission: bool = False
+    direct_unordered_pipeline_depth: int = 1
     track_output_digest: bool = True
     safe_record_chunk_size: int = 8192
 
@@ -108,6 +109,8 @@ class DistributedProtocolConfig:
             raise ValueError("node_ids cannot be empty")
         if self.lease_ttl_seconds <= 0.0:
             raise ValueError("lease_ttl_seconds must be positive")
+        if self.direct_unordered_pipeline_depth <= 0:
+            raise ValueError("direct_unordered_pipeline_depth must be positive")
         if self.safe_record_chunk_size <= 0:
             raise ValueError("safe_record_chunk_size must be positive")
 
@@ -682,7 +685,11 @@ class DistributedProtocolTracker:
             for node_id in self._direct_unordered_active_nodes
             if not self.states.get(node_id).exhausted
         }
-        active_target = max(1, self.config.scheduler.max_parallel_leases_per_node)
+        active_target = max(
+            1,
+            self.config.scheduler.max_parallel_leases_per_node
+            * self.config.direct_unordered_pipeline_depth,
+        )
         while (
             len(self._direct_unordered_active_nodes) < active_target
             and self._direct_unordered_shard_cursor < len(self._direct_unordered_shards_by_priority)

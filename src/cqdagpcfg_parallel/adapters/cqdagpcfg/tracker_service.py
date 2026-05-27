@@ -786,6 +786,7 @@ def _run_cqdag_tracker_service(
         lease_ttl_seconds=args.lease_ttl_seconds,
         lazy_shard_activation=not args.disable_lazy_shard_activation,
         direct_unordered_chunk_emission=args.source_mode == "shard",
+        direct_unordered_pipeline_depth=DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH,
         track_output_digest=args.validate_serial_digest and args.source_mode != "shard",
         safe_record_chunk_size=args.max_chunk_size,
     )

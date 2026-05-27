@@ -15,7 +15,13 @@ from cqdagpcfg_parallel.distributed import (
     ready_message,
     work_message,
 )
-from cqdagpcfg_parallel.protocol import NodeId, WorkItem, WorkerId
+from cqdagpcfg_parallel.protocol import (
+    NodeId,
+    NodeSchedulingFeatures,
+    SchedulerConfig,
+    WorkItem,
+    WorkerId,
+)
 from cqdagpcfg_parallel.runtime import ZmqEndpoint
 
 
@@ -186,3 +192,40 @@ def test_tracker_rejects_mismatched_worker_model_fingerprint() -> None:
             ready_message(worker_id, model_fingerprint="sha256:other"),
             worker_id,
         )
+
+
+def test_direct_unordered_pipeline_depth_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="direct_unordered_pipeline_depth"):
+        DistributedProtocolConfig(direct_unordered_pipeline_depth=0)
+
+
+def test_direct_unordered_pipeline_depth_widens_active_shard_window() -> None:
+    node_ids = tuple(NodeId(f"lane:{index}") for index in range(8))
+    features = tuple(
+        NodeSchedulingFeatures(
+            node_id=node_id,
+            priority=float(100 - index),
+            cardinality=100,
+        )
+        for index, node_id in enumerate(node_ids)
+    )
+    tracker = DistributedProtocolTracker(
+        endpoint=ZmqEndpoint("inproc://unused-pipeline-depth", bind=True),
+        config=DistributedProtocolConfig(
+            node_ids=node_ids,
+            node_features=features,
+            scheduler=SchedulerConfig(max_parallel_leases_per_node=2),
+            demand_window=5,
+            direct_unordered_chunk_emission=True,
+            direct_unordered_pipeline_depth=3,
+        ),
+    )
+
+    tracker._register_direct_unordered_demands(limit=100)
+
+    expected_active = set(node_ids[:6])
+    assert tracker._direct_unordered_active_nodes == expected_active
+    assert {
+        state.node_id
+        for state in tracker.states.active_demands()
+    } == expected_active
