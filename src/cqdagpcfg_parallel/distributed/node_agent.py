@@ -45,6 +45,8 @@ class NodeAgentStats:
     completed_items: int = 0
     completed_records: int = 0
     waits: int = 0
+    control_reply_timeouts: int = 0
+    control_retries: int = 0
     consumed_batches: int = 0
     consumed_candidates: int = 0
     generation_rate: float = 0.0
@@ -90,6 +92,7 @@ class NodeAgent:
         batch_endpoint: ZmqEndpoint,
         source: LocalResultSource,
         consume_batch: CandidateBatchHandler,
+        close_consumer: Callable[[], object] | None = None,
         ack_endpoint: ZmqEndpoint | None = None,
         model_fingerprint: str | None = None,
         work_delay_seconds: float = 0.0,
@@ -103,6 +106,8 @@ class NodeAgent:
         stats_flush_interval_seconds: float = 0.25,
         stats_callback: NodeAgentStatsCallback | None = None,
         resources: WorkerResourceSpec = WorkerResourceSpec(),
+        write_stable_artifacts: bool = True,
+        verify_candidate_artifacts: bool = True,
     ) -> None:
         if control_endpoint.bind:
             raise ValueError("control_endpoint must connect")
@@ -138,6 +143,7 @@ class NodeAgent:
         self.ack_endpoint = ack_endpoint
         self.source = source
         self.consume_batch = consume_batch
+        self.close_consumer = close_consumer
         self.model_fingerprint = model_fingerprint
         self.work_delay_seconds = work_delay_seconds
         self.receive_timeout_ms = receive_timeout_ms
@@ -150,6 +156,8 @@ class NodeAgent:
         self.stats_flush_interval_seconds = stats_flush_interval_seconds
         self.stats_callback = stats_callback
         self.resources = resources
+        self.write_stable_artifacts = write_stable_artifacts
+        self.verify_candidate_artifacts = verify_candidate_artifacts
 
         self.started_at = monotonic()
         self.role_switches = 0
@@ -158,6 +166,8 @@ class NodeAgent:
         self.completed_items = 0
         self.completed_records = 0
         self.waits = 0
+        self.control_reply_timeouts = 0
+        self.control_retries = 0
         self.consumed_batches = 0
         self.consumed_candidates = 0
         self.drained_batches = 0
@@ -181,6 +191,7 @@ class NodeAgent:
         self._ack_network_bytes = 0
         self._ack_network_send_seconds = 0.0
         self._ack_network_serialize_seconds = 0.0
+        self._consumer_closed = False
 
     def run(self) -> NodeAgentStats:
         self.flush_stats(final=False)
@@ -232,11 +243,16 @@ class NodeAgent:
             work_delay_seconds=self.work_delay_seconds,
             should_retire=should_retire,
             model_fingerprint=self.model_fingerprint,
+            write_stable_artifacts=self.write_stable_artifacts,
+            verify_candidate_artifacts=self.verify_candidate_artifacts,
+            resources=self.resources,
         )
         stats = worker.run()
         self.completed_items += stats.completed_items
         self.completed_records += stats.completed_records
         self.waits += stats.waits
+        self.control_reply_timeouts += stats.control_reply_timeouts
+        self.control_retries += stats.control_retries
         self.flush_stats(final=False)
         log_event(
             LOGGER,
@@ -308,6 +324,7 @@ class NodeAgent:
                     if message is None:
                         continue
                     if isinstance(message, BatchEndOfStream):
+                        self._close_consumer()
                         self.flush_stats(final=False)
                         log_event(
                             LOGGER,
@@ -351,11 +368,12 @@ class NodeAgent:
             if message is None:
                 return False
             if isinstance(message, BatchEndOfStream):
+                self._close_consumer()
                 self.flush_stats(final=False)
                 return True
             self._consume_and_ack(message, ack_sink)
             self.drained_batches += 1
-            self.drained_candidates += len(message.records)
+            self.drained_candidates += message.record_count
             quiet_deadline = monotonic() + self.consumer_drain_quiet_ms / 1000.0
             self.flush_stats(final=False)
         return False
@@ -395,10 +413,16 @@ class NodeAgent:
                         status=BatchAckStatus.FAILED,
                         error=str(exc),
                     )
-                )
+            )
             raise
         self.consumed_batches += 1
-        self.consumed_candidates += len(message.records)
+        self.consumed_candidates += message.record_count
+
+    def _close_consumer(self) -> None:
+        if self._consumer_closed or self.close_consumer is None:
+            return
+        self._consumer_closed = True
+        self.close_consumer()
 
     def desired_role(self) -> str:
         return self._role_reply().role
@@ -441,6 +465,8 @@ class NodeAgent:
             completed_items=self.completed_items,
             completed_records=self.completed_records,
             waits=self.waits,
+            control_reply_timeouts=self.control_reply_timeouts,
+            control_retries=self.control_retries,
             consumed_batches=self.consumed_batches,
             consumed_candidates=self.consumed_candidates,
             generation_rate=self.completed_records / elapsed,

@@ -57,6 +57,12 @@ class LazyLocalResultSource:
             return 0
         return int(reclaim_before(node_id, index))
 
+    def write_range_artifact(self, *args, **kwargs):
+        write_range_artifact = getattr(self._require_source(), "write_range_artifact", None)
+        if not callable(write_range_artifact):
+            raise RuntimeError("source does not support range artifact writes")
+        return write_range_artifact(*args, **kwargs)
+
     def stats(self) -> SourceReclaimCounters:
         if self._source is None:
             return SourceReclaimCounters()

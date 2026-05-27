@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from collections import deque
 from dataclasses import dataclass
-from math import log, prod
+from math import fsum, log, prod
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -25,8 +27,12 @@ from cqdagpcfg_parallel.protocol import (
     NodeSchedulingFeatures,
     NodeStateTable,
     STABLE_PROBABILITY_DIGITS,
+    StableStreamFingerprint,
     WorkerId,
+    canonical_record_bytes,
+    stable_record_string,
 )
+from cqdagpcfg_parallel.runtime.candidate_batch import UNCHECKED_ARTIFACT_SHA256
 from cqdagpcfg_parallel.storage import (
     BlockStateSnapshot,
     FrontierEntrySnapshot,
@@ -47,6 +53,7 @@ from .serial_oracle import SerialCQDAGOracle
 ROOT_NODE_ID = NodeId("root")
 _SOURCE_SKIP_ACK_WINDOW = 64
 _SERIAL_PROBABILITY_SIGNIFICANT_DIGITS = STABLE_PROBABILITY_DIGITS
+_ARTIFACT_WRITE_BUFFER_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +78,21 @@ class CQDAGSourceReclaimStats:
     reclaimed_records: int = 0
     dag_repository_active_units: int = 0
     dag_stream_active_units: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRangeArtifact:
+    record_count: int
+    payload_bytes: int
+    artifact_uri: str
+    artifact_sha256: str
+    artifact_bytes: int
+    stable_artifact_uri: str | None
+    stable_artifact_sha256: str | None
+    stable_artifact_bytes: int
+    stable_fingerprint: str | None
+    stable_fingerprint_bytes: int
+    probability_mass: float
 
 
 class CQDAGRecordSource:
@@ -118,12 +140,20 @@ class CQDAGRecordSource:
             raise KeyError(f"unknown CQDAG record source node: {node_id}")
         if start < 0 or end < start:
             raise ValueError("invalid source range")
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            self.exhausted = True
+            return ()
         if start < self._cache_base:
             self._restart_from_zero()
         if start > self._ready_end:
             self._skip_to(start)
-        self._ensure(end)
-        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+        self._ensure(effective_end)
+        if effective_end < end:
+            self.exhausted = True
+        return tuple(
+            self._cache[start - self._cache_base : effective_end - self._cache_base]
+        )
 
     def reclaim_before(self, node_id: NodeId, index: int) -> int:
         if node_id != self.node_id:
@@ -146,6 +176,37 @@ class CQDAGRecordSource:
             cached_records=len(self._cache),
             peak_cached_records=self._peak_cached_records,
             reclaimed_records=self._reclaimed_records,
+        )
+
+    def write_range_artifact(
+        self,
+        node_id: NodeId,
+        start: int,
+        end: int,
+        *,
+        guess_path: str | Path,
+        stable_path: str | Path | None = None,
+        verify_artifact: bool = True,
+        include_stable_metadata: bool = True,
+    ) -> CandidateRangeArtifact:
+        if node_id != self.node_id:
+            raise KeyError(f"unknown CQDAG record source node: {node_id}")
+        if start < 0 or end < start:
+            raise ValueError("invalid source range")
+        effective_end = min(end, self.max_records)
+        records = (
+            ()
+            if start >= effective_end
+            else tuple(self.read_range(node_id, start, effective_end))
+        )
+        if len(records) < end - start:
+            self.exhausted = True
+        return _write_record_artifact(
+            records,
+            guess_path=guess_path,
+            stable_path=stable_path,
+            verify_artifact=verify_artifact,
+            include_stable_metadata=include_stable_metadata,
         )
 
     @property
@@ -235,6 +296,8 @@ class CppFileCQDAGRecordSource:
         *,
         node_id: NodeId = ROOT_NODE_ID,
         max_records: int,
+        use_promote: bool = False,
+        share_nodes: bool = False,
     ) -> None:
         if max_records < 0:
             raise ValueError("max_records cannot be negative")
@@ -242,10 +305,20 @@ class CppFileCQDAGRecordSource:
         self.node_id = node_id
         self.max_records = max_records
         self.prefer_cpp = True
+        self.use_promote = use_promote
+        self.share_nodes = share_nodes
         if self.model_path.suffix == ".bin":
-            self.enumerator = CppOptimizedCQDAGEnumerator.from_binary_file(self.model_path)
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_binary_file(
+                self.model_path,
+                use_promote=use_promote,
+                share_nodes=share_nodes,
+            )
         else:
-            self.enumerator = CppOptimizedCQDAGEnumerator.from_json_file(self.model_path)
+            self.enumerator = CppOptimizedCQDAGEnumerator.from_json_file(
+                self.model_path,
+                use_promote=use_promote,
+                share_nodes=share_nodes,
+            )
         self._cache: list[GuessRecord] = []
         self._cache_base = 0
         self._raw_index = 0
@@ -267,12 +340,95 @@ class CppFileCQDAGRecordSource:
             raise KeyError(f"unknown CQDAG record source node: {node_id}")
         if start < 0 or end < start:
             raise ValueError("invalid source range")
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            self.exhausted = True
+            return ()
         if start < self._cache_base:
             self._restart_from_zero()
         if start > self._ready_end:
             self._skip_to(start)
-        self._ensure(end)
-        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+        self._ensure(effective_end)
+        if effective_end < end:
+            self.exhausted = True
+        return tuple(
+            self._cache[start - self._cache_base : effective_end - self._cache_base]
+        )
+
+    def write_range_artifact(
+        self,
+        node_id: NodeId,
+        start: int,
+        end: int,
+        *,
+        guess_path: str | Path,
+        stable_path: str | Path | None = None,
+        verify_artifact: bool = True,
+        include_stable_metadata: bool = True,
+    ) -> CandidateRangeArtifact:
+        if node_id != self.node_id:
+            raise KeyError(f"unknown CQDAG record source node: {node_id}")
+        if start < 0 or end < start:
+            raise ValueError("invalid source range")
+        guess_path = Path(guess_path)
+        stable_path = None if stable_path is None else Path(stable_path)
+        guess_path.parent.mkdir(parents=True, exist_ok=True)
+        if stable_path is not None:
+            stable_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            guess_path.write_bytes(b"")
+            if stable_path is not None:
+                stable_path.write_bytes(b"")
+            self.exhausted = True
+            return CandidateRangeArtifact(
+                record_count=0,
+                payload_bytes=0,
+                artifact_uri=guess_path.resolve().as_uri(),
+                artifact_sha256=_artifact_sha256(guess_path, verify_artifact),
+                artifact_bytes=0,
+                stable_artifact_uri=(
+                    stable_path.resolve().as_uri() if stable_path is not None else None
+                ),
+                stable_artifact_sha256=(
+                    _file_sha256(stable_path) if stable_path is not None else None
+                ),
+                stable_artifact_bytes=0,
+                stable_fingerprint="sfp-v1:0:0000000000000000:0000000000000000",
+                stable_fingerprint_bytes=0,
+                probability_mass=0.0,
+            )
+        info = self.enumerator.write_root_artifacts(
+            start,
+            effective_end,
+            guess_path,
+            stable_path,
+            include_stable_metadata=(
+                include_stable_metadata or _stable_metadata_enabled(stable_path)
+            ),
+        )
+        record_count = int(info["record_count"])
+        if record_count == 0:
+            self.exhausted = True
+        if record_count < end - start:
+            self.exhausted = True
+        return CandidateRangeArtifact(
+            record_count=record_count,
+            payload_bytes=int(info["payload_bytes"]),
+            artifact_uri=guess_path.resolve().as_uri(),
+            artifact_sha256=_artifact_sha256(guess_path, verify_artifact),
+            artifact_bytes=int(info["artifact_bytes"]),
+            stable_artifact_uri=(
+                stable_path.resolve().as_uri() if stable_path is not None else None
+            ),
+            stable_artifact_sha256=(
+                _file_sha256(stable_path) if stable_path is not None else None
+            ),
+            stable_artifact_bytes=int(info["stable_bytes"]),
+            stable_fingerprint=str(info.get("stable_fingerprint", "")) or None,
+            stable_fingerprint_bytes=int(info.get("stable_fingerprint_bytes", 0)),
+            probability_mass=float(info["probability_mass"]),
+        )
 
     def reclaim_before(self, node_id: NodeId, index: int) -> int:
         if node_id != self.node_id:
@@ -394,6 +550,93 @@ def _probability_group_key(record: GuessRecord) -> str:
     return f"{record.prob:.{_SERIAL_PROBABILITY_SIGNIFICANT_DIGITS}g}"
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_sha256(path: Path, verify_artifact: bool) -> str:
+    if verify_artifact:
+        return _file_sha256(path)
+    return UNCHECKED_ARTIFACT_SHA256
+
+
+def _write_record_artifact(
+    records: Sequence[GuessRecord],
+    *,
+    guess_path: str | Path,
+    stable_path: str | Path | None = None,
+    verify_artifact: bool = True,
+    include_stable_metadata: bool = True,
+) -> CandidateRangeArtifact:
+    guess_path = Path(guess_path)
+    stable_path = None if stable_path is None else Path(stable_path)
+    guess_path.parent.mkdir(parents=True, exist_ok=True)
+    if stable_path is not None:
+        stable_path.parent.mkdir(parents=True, exist_ok=True)
+
+    guess_buffer = bytearray()
+    stable_buffer = bytearray()
+    payload_bytes = 0
+    compute_stable_metadata = include_stable_metadata or stable_path is not None
+    fingerprint = StableStreamFingerprint() if compute_stable_metadata else None
+    with guess_path.open("wb") as guess_out:
+        stable_out = stable_path.open("wb") if stable_path is not None else None
+        try:
+            for record in records:
+                guess_line = record.guess.encode("utf-8")
+                guess_buffer.extend(guess_line)
+                guess_buffer.append(0x0A)
+                payload_bytes += len(guess_line) + 1
+                if fingerprint is not None:
+                    fingerprint = fingerprint.update_bytes(canonical_record_bytes(record))
+                if stable_path is not None:
+                    stable_line = stable_record_string(record).encode("utf-8")
+                    stable_buffer.extend(stable_line)
+                    stable_buffer.append(0x0A)
+                if len(guess_buffer) >= _ARTIFACT_WRITE_BUFFER_BYTES:
+                    guess_out.write(guess_buffer)
+                    guess_buffer.clear()
+                if len(stable_buffer) >= _ARTIFACT_WRITE_BUFFER_BYTES and stable_out is not None:
+                    stable_out.write(stable_buffer)
+                    stable_buffer.clear()
+            if guess_buffer:
+                guess_out.write(guess_buffer)
+            if stable_buffer and stable_out is not None:
+                stable_out.write(stable_buffer)
+        finally:
+            if stable_out is not None:
+                stable_out.close()
+
+    return CandidateRangeArtifact(
+        record_count=len(records),
+        payload_bytes=payload_bytes,
+        artifact_uri=guess_path.resolve().as_uri(),
+        artifact_sha256=_artifact_sha256(guess_path, verify_artifact),
+        artifact_bytes=guess_path.stat().st_size,
+        stable_artifact_uri=(
+            stable_path.resolve().as_uri() if stable_path is not None else None
+        ),
+        stable_artifact_sha256=(
+            _file_sha256(stable_path) if stable_path is not None else None
+        ),
+        stable_artifact_bytes=stable_path.stat().st_size if stable_path is not None else 0,
+        stable_fingerprint=(
+            fingerprint.to_string("rfp-v1") if fingerprint is not None else None
+        ),
+        stable_fingerprint_bytes=(
+            fingerprint.byte_length if fingerprint is not None else 0
+        ),
+        probability_mass=fsum(record.prob for record in records),
+    )
+
+
 def _probability_sort_value(record: GuessRecord) -> float:
     return float(_probability_group_key(record))
 
@@ -436,6 +679,36 @@ class CQDAGStructureRecordSource:
             raise ValueError("invalid source range")
         stream = self._stream_for(node_id)
         return stream.read_range(start, end)
+
+    def write_range_artifact(
+        self,
+        node_id: NodeId,
+        start: int,
+        end: int,
+        *,
+        guess_path: str | Path,
+        stable_path: str | Path | None = None,
+        verify_artifact: bool = True,
+        include_stable_metadata: bool = True,
+    ) -> CandidateRangeArtifact:
+        stream = self._stream_for(node_id)
+        writer = getattr(stream, "write_range_artifact", None)
+        if callable(writer):
+            return writer(
+                start,
+                end,
+                guess_path=guess_path,
+                stable_path=stable_path,
+                verify_artifact=verify_artifact,
+                include_stable_metadata=include_stable_metadata,
+            )
+        return _write_record_artifact(
+            stream.read_range(start, end),
+            guess_path=guess_path,
+            stable_path=stable_path,
+            verify_artifact=verify_artifact,
+            include_stable_metadata=include_stable_metadata,
+        )
 
     def reclaim_before(self, node_id: NodeId, index: int) -> int:
         if node_id not in self._descriptors:
@@ -625,6 +898,7 @@ class CQDAGBlockGraphAdapter:
                 entropy=node.slot_dispersion,
                 priority=node.priority,
                 estimated_cost=node.estimated_cost,
+                cardinality=node.cardinality,
             )
             for node in self.structure_nodes()
         )
@@ -794,6 +1068,73 @@ class _CppStructureLocalStream:
             self._skip_to(start)
         self._ensure(end)
         return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+
+    def write_range_artifact(
+        self,
+        start: int,
+        end: int,
+        *,
+        guess_path: str | Path,
+        stable_path: str | Path | None = None,
+        verify_artifact: bool = True,
+        include_stable_metadata: bool = True,
+    ) -> CandidateRangeArtifact:
+        if start < 0 or end < start:
+            raise ValueError("invalid structure source range")
+        if start < self._cache_base:
+            raise RuntimeError("requested range was already reclaimed by the C++ source")
+        if end > self.max_records:
+            raise RuntimeError("requested range exceeds configured structure source limit")
+        guess_path = Path(guess_path)
+        stable_path = None if stable_path is None else Path(stable_path)
+        guess_path.parent.mkdir(parents=True, exist_ok=True)
+        if stable_path is not None:
+            stable_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = getattr(self.enumerator, "write_structure_artifacts", None)
+        if not callable(writer):
+            return _write_record_artifact(
+                self.read_range(start, end),
+                guess_path=guess_path,
+                stable_path=stable_path,
+                verify_artifact=verify_artifact,
+                include_stable_metadata=include_stable_metadata,
+            )
+        info = writer(
+            self.structure_index,
+            start,
+            end,
+            guess_path,
+            stable_path,
+            include_stable_metadata=(
+                include_stable_metadata or _stable_metadata_enabled(stable_path)
+            ),
+        )
+        record_count = int(info["record_count"])
+        self._cache = []
+        self._cache_base = start + record_count
+        self._raw_index = self._cache_base
+        self._raw_buffer.clear()
+        self._lookahead_record = None
+        self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
+        if record_count < end - start:
+            self.exhausted = True
+        return CandidateRangeArtifact(
+            record_count=record_count,
+            payload_bytes=int(info["payload_bytes"]),
+            artifact_uri=guess_path.resolve().as_uri(),
+            artifact_sha256=_artifact_sha256(guess_path, verify_artifact),
+            artifact_bytes=int(info["artifact_bytes"]),
+            stable_artifact_uri=(
+                stable_path.resolve().as_uri() if stable_path is not None else None
+            ),
+            stable_artifact_sha256=(
+                _file_sha256(stable_path) if stable_path is not None else None
+            ),
+            stable_artifact_bytes=int(info["stable_bytes"]),
+            stable_fingerprint=str(info.get("stable_fingerprint", "")) or None,
+            stable_fingerprint_bytes=int(info.get("stable_fingerprint_bytes", 0)),
+            probability_mass=float(info["probability_mass"]),
+        )
 
     @property
     def cached_records(self) -> int:
@@ -1415,8 +1756,20 @@ def _is_merged_block(block: Any) -> bool:
     return isinstance(block, (MergedBlock, LocalMergedBlock))
 
 
+def _stable_metadata_enabled(stable_path: str | Path | None) -> bool:
+    if stable_path is not None:
+        return True
+    return os.environ.get("CQPCFG_DISABLE_STABLE_METADATA", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 __all__ = [
     "BlockNodeDescriptor",
+    "CandidateRangeArtifact",
     "CQDAGBlockGraphAdapter",
     "CQDAGRecordSource",
     "CQDAGSourceReclaimStats",

@@ -19,6 +19,12 @@ class ChunkSizePolicy(str, Enum):
     ENTROPY_ADAPTIVE = "entropy_adaptive"
 
 
+class LeaseStrategyName(str, Enum):
+    RANGE = "range"
+    PROBABILITY_MASS = "probability_mass"
+    RANK_WINDOW_PROBABILITY_MASS = "rank_window_probability_mass"
+
+
 @dataclass(frozen=True, slots=True)
 class ChunkRange:
     node_id: NodeId
@@ -84,6 +90,8 @@ class WorkItem:
     worker_id: WorkerId
     epoch: int
     reclaim_before: int = 0
+    estimated_mass: float = 0.0
+    mass_budget: float = 0.0
 
     def __post_init__(self) -> None:
         if self.start < 0:
@@ -94,6 +102,10 @@ class WorkItem:
             raise ValueError("work item reclaim_before cannot be negative")
         if self.reclaim_before > self.start:
             raise ValueError("work item reclaim_before cannot exceed start")
+        if self.estimated_mass < 0.0:
+            raise ValueError("work item estimated_mass cannot be negative")
+        if self.mass_budget < 0.0:
+            raise ValueError("work item mass_budget cannot be negative")
 
     @property
     def range(self) -> ChunkRange:
@@ -146,6 +158,9 @@ class EnumerationChunk:
 
 
 STABLE_PROBABILITY_DIGITS = 9
+STABLE_FINGERPRINT_BASE1 = 0x100000001B3
+STABLE_FINGERPRINT_BASE2 = 0x9E3779B185EBCA87
+STABLE_FINGERPRINT_MASK = (1 << 64) - 1
 
 
 def stable_record_string(record: GuessRecord) -> str:
@@ -165,16 +180,112 @@ def stable_digest(records: Iterable[GuessRecord]) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class StableStreamFingerprint:
+    """Associative fingerprint over stable record bytes."""
+
+    byte_length: int = 0
+    h1: int = 0
+    h2: int = 0
+
+    def __post_init__(self) -> None:
+        if self.byte_length < 0:
+            raise ValueError("byte_length cannot be negative")
+
+    def update_bytes(self, payload: bytes) -> "StableStreamFingerprint":
+        h1 = self.h1
+        h2 = self.h2
+        for value in payload:
+            item = value + 1
+            h1 = ((h1 * STABLE_FINGERPRINT_BASE1) + item) & STABLE_FINGERPRINT_MASK
+            h2 = ((h2 * STABLE_FINGERPRINT_BASE2) + item) & STABLE_FINGERPRINT_MASK
+        return StableStreamFingerprint(
+            byte_length=self.byte_length + len(payload),
+            h1=h1,
+            h2=h2,
+        )
+
+    def update_stable_record(self, record: GuessRecord) -> "StableStreamFingerprint":
+        return self.update_bytes(
+            stable_record_string(record).encode("utf-8") + b"\n",
+        )
+
+    def combine(self, chunk: "StableStreamFingerprint") -> "StableStreamFingerprint":
+        factor1 = pow(STABLE_FINGERPRINT_BASE1, chunk.byte_length, 1 << 64)
+        factor2 = pow(STABLE_FINGERPRINT_BASE2, chunk.byte_length, 1 << 64)
+        return StableStreamFingerprint(
+            byte_length=self.byte_length + chunk.byte_length,
+            h1=((self.h1 * factor1) + chunk.h1) & STABLE_FINGERPRINT_MASK,
+            h2=((self.h2 * factor2) + chunk.h2) & STABLE_FINGERPRINT_MASK,
+        )
+
+    def to_string(self, scheme: str = "sfp-v1") -> str:
+        if scheme not in {"sfp-v1", "rfp-v1"}:
+            raise ValueError("unsupported stable stream fingerprint scheme")
+        return f"{scheme}:{self.byte_length}:{self.h1:016x}:{self.h2:016x}"
+
+    @classmethod
+    def from_string(cls, value: str) -> "StableStreamFingerprint":
+        parts = value.split(":")
+        if len(parts) != 4 or parts[0] not in {"sfp-v1", "rfp-v1"}:
+            raise ValueError("unsupported stable stream fingerprint")
+        return cls(
+            byte_length=int(parts[1]),
+            h1=int(parts[2], 16),
+            h2=int(parts[3], 16),
+        )
+
+
+def stable_stream_fingerprint(records: Iterable[GuessRecord]) -> str:
+    fingerprint = StableStreamFingerprint()
+    for record in records:
+        fingerprint = fingerprint.update_stable_record(record)
+    return fingerprint.to_string()
+
+
+def record_stream_fingerprint(records: Iterable[GuessRecord]) -> str:
+    fingerprint = StableStreamFingerprint()
+    for record in records:
+        fingerprint = fingerprint.update_bytes(canonical_record_bytes(record))
+    return fingerprint.to_string("rfp-v1")
+
+
+def canonical_record_bytes(record: GuessRecord) -> bytes:
+    probability = f"{record.prob:.{STABLE_PROBABILITY_DIGITS}g}".encode("utf-8")
+    name = record.structure_name.encode("utf-8")
+    guess = record.guess.encode("utf-8")
+    out = bytearray()
+    out.extend(b"R")
+    _append_length_prefixed(out, probability)
+    out.extend(int(record.structure_index).to_bytes(4, "big", signed=True))
+    _append_length_prefixed(out, name)
+    out.extend(len(record.ranks).to_bytes(4, "big", signed=False))
+    for rank in record.ranks:
+        out.extend(int(rank).to_bytes(4, "big", signed=True))
+    _append_length_prefixed(out, guess)
+    return bytes(out)
+
+
+def _append_length_prefixed(out: bytearray, payload: bytes) -> None:
+    out.extend(len(payload).to_bytes(4, "big", signed=False))
+    out.extend(payload)
+
+
 __all__ = [
     "ChunkRange",
     "ChunkSizePolicy",
     "Demand",
     "EnumerationChunk",
     "Lease",
+    "LeaseStrategyName",
     "NodeId",
     "STABLE_PROBABILITY_DIGITS",
+    "StableStreamFingerprint",
     "WorkItem",
     "WorkerId",
+    "canonical_record_bytes",
+    "record_stream_fingerprint",
     "stable_digest",
     "stable_record_string",
+    "stable_stream_fingerprint",
 ]

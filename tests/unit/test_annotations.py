@@ -29,7 +29,13 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     cqdagpcfg_tracker as cqdagpcfg_tracker_adapter,
 )
 from cqdagpcfg_parallel.adapters.cqdagpcfg.tracker_service import (
+    DEFAULT_CRACKING_ROOT_ARTIFACT_TARGET_BYTES,
+    apply_endpoint_bundle,
     effective_max_parallel_leases_per_node,
+    _apply_tracker_optimization_profile,
+)
+from cqdagpcfg_parallel.adapters.cqdagpcfg.node_service import (
+    _apply_node_optimization_profile,
 )
 from cqdagpcfg_parallel.runtime import CandidateBatch, publish_record_batches
 from cqdagpcfg_parallel.simulation import SequenceRecordSource
@@ -606,7 +612,31 @@ def test_cqdagpcfg_tracker_annotation_accepts_overrides() -> None:
     assert ExperimentTracker.config.timeout_seconds == 10.0
 
 
-def test_root_mode_caps_parallel_leases_for_serial_stream() -> None:
+def test_tracker_bind_does_not_overwrite_explicit_public_endpoints() -> None:
+    config = CqdagTrackerServiceConfig(
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+        bind="cqpcfg://127.0.0.1:5555",
+        public_control_connect="cqpcfg://tracker.example.com:15556",
+        public_batch_connect="cqpcfg://tracker.example.com:15557",
+        public_ack_connect="cqpcfg://tracker.example.com:15559",
+        public_model_connect="cqpcfg://tracker.example.com:15560",
+    )
+
+    apply_endpoint_bundle(config)
+
+    assert config.control_bind == "cqpcfg://127.0.0.1:5555"
+    assert config.batch_bind == "cqpcfg://127.0.0.1:5556"
+    assert config.role_bind == "cqpcfg://127.0.0.1:5557"
+    assert config.ack_bind == "cqpcfg://127.0.0.1:5558"
+    assert config.model_serve_bind == "cqpcfg://127.0.0.1:5559"
+    assert config.public_control_connect == "cqpcfg://tracker.example.com:15556"
+    assert config.public_batch_connect == "cqpcfg://tracker.example.com:15557"
+    assert config.public_ack_connect == "cqpcfg://tracker.example.com:15559"
+    assert config.public_model_connect == "cqpcfg://tracker.example.com:15560"
+
+
+def test_root_mode_allows_rank_space_parallel_leases() -> None:
     root = CqdagTrackerServiceConfig(
         model_path=Path("/tmp/model.json"),
         job_spec_path=Path("/tmp/job-spec.json"),
@@ -620,8 +650,43 @@ def test_root_mode_caps_parallel_leases_for_serial_stream() -> None:
         max_parallel_leases_per_node=8,
     )
 
-    assert effective_max_parallel_leases_per_node(root) == 1
+    assert effective_max_parallel_leases_per_node(root) == 8
     assert effective_max_parallel_leases_per_node(structure) == 8
+
+
+def test_cracking_node_profile_disables_artifact_validation_overhead() -> None:
+    config = CqdagNodeAgentServiceConfig(
+        connect="cqpcfg://127.0.0.1:5555",
+        node_id="node-0",
+        metrics_dir=Path("/tmp/metrics"),
+        outputs_dir=Path("/tmp/outputs"),
+        optimization_profile="cracking",
+        write_stable_artifacts=True,
+        verify_candidate_artifacts=True,
+    )
+
+    resolved = _apply_node_optimization_profile(config)
+
+    assert not resolved.write_stable_artifacts
+    assert not resolved.verify_candidate_artifacts
+
+
+def test_cracking_tracker_profile_uses_throughput_defaults() -> None:
+    config = CqdagTrackerServiceConfig(
+        model_path=Path("/tmp/model.json"),
+        job_spec_path=Path("/tmp/job-spec.json"),
+        optimization_profile="cracking",
+        validate_serial_digest=True,
+        disable_reclaim=True,
+        delete_candidate_blocks_on_ack=False,
+    )
+
+    _apply_tracker_optimization_profile(config)
+
+    assert not config.validate_serial_digest
+    assert not config.disable_reclaim
+    assert not config.delete_candidate_blocks_on_ack
+    assert config.root_artifact_target_bytes == DEFAULT_CRACKING_ROOT_ARTIFACT_TARGET_BYTES
 
 
 def test_node_agent_annotation_accepts_explicit_subchannel_connects() -> None:

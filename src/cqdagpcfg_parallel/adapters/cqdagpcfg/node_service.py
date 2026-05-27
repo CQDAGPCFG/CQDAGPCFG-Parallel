@@ -91,6 +91,10 @@ class CqdagNodeAgentServiceConfig:
     metrics_dir: Path | None = None
     outputs_path: Path | None = None
     outputs_dir: Path | None = None
+    optimization_profile: str = "balanced"
+    write_stable_artifacts: bool = False
+    verify_candidate_artifacts: bool = True
+    discard_candidate_payloads: bool = False
 
     def __post_init__(self) -> None:
         if self.model_json_page_cache <= 0:
@@ -122,14 +126,28 @@ class CqdagNodeAgentServiceConfig:
             raise ValueError("metrics_flush_interval_seconds cannot be negative")
         if self.demand_window < 0:
             raise ValueError("demand_window cannot be negative")
-        if self.source_mode not in {"root", "structure"}:
-            raise ValueError("source_mode must be root or structure")
+        if self.source_mode not in {"root", "structure", "shard"}:
+            raise ValueError("source_mode must be root, structure, or shard")
         if self.generation_backend not in {"auto", "cpp", "paged", "python"}:
             raise ValueError("generation_backend must be auto, cpp, paged, or python")
+        if self.optimization_profile not in {"balanced", "cracking"}:
+            raise ValueError("optimization_profile must be balanced or cracking")
         if self.metrics_path is not None and self.metrics_dir is not None:
             raise ValueError("metrics_path and metrics_dir cannot both be set")
         if self.outputs_path is not None and self.outputs_dir is not None:
             raise ValueError("outputs_path and outputs_dir cannot both be set")
+
+
+def _apply_node_optimization_profile(
+    config: CqdagNodeAgentServiceConfig,
+) -> CqdagNodeAgentServiceConfig:
+    if config.optimization_profile != "cracking":
+        return config
+    return replace(
+        config,
+        write_stable_artifacts=False,
+        verify_candidate_artifacts=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +685,7 @@ def _run_cqdag_node_agent_service(
     node_class: type[Any],
 ) -> NodeAgentStats:
     configure_framework_logging()
+    config = _apply_node_optimization_profile(config)
     context = _build_node_context(config)
     generator, consumer = _resolve_cqdag_node_components(node_class, context)
     consumer = _capture_consumer_results(consumer, context)
@@ -677,6 +696,7 @@ def _run_cqdag_node_agent_service(
         resource_gpu_memory=config.resource_gpu_memory,
         model_json_page_cache=config.model_json_page_cache,
     )
+    resources = _annotate_node_resources(resources, context)
     source = LazyLocalResultSource(
         lambda: generator.source_for(WorkerId(context.node_id)),
     )
@@ -689,12 +709,15 @@ def _run_cqdag_node_agent_service(
         batch_connect=context.batch_connect,
         role_connect=context.role_connect,
         ack_connect=context.ack_connect,
+        optimization_profile=config.optimization_profile,
         model_fingerprint=context.model_fingerprint,
         generation_backend=resolve_generation_backend(context.source_config),
         cpu_cores=resources.cpu_cores,
         memory_bytes=resources.memory_bytes,
         gpu_count=resources.gpu_count,
         model_json_page_cache=resources.model_json_page_cache,
+        streaming_artifacts=resources.labels.get("cqpcfg.streaming_artifacts", "0"),
+        verify_candidate_artifacts=config.verify_candidate_artifacts,
     )
     role_client = RoleClient(
         node_id=context.node_id,
@@ -713,6 +736,7 @@ def _run_cqdag_node_agent_service(
         ),
         source=source,
         consume_batch=consumer.publish,
+        close_consumer=consumer.close,
         model_fingerprint=context.model_fingerprint,
         work_delay_seconds=config.work_delay_seconds,
         receive_timeout_ms=config.receive_timeout_ms,
@@ -725,6 +749,8 @@ def _run_cqdag_node_agent_service(
         stats_flush_interval_seconds=config.metrics_flush_interval_seconds,
         stats_callback=context.reporter.write,
         resources=resources,
+        write_stable_artifacts=config.write_stable_artifacts,
+        verify_candidate_artifacts=config.verify_candidate_artifacts,
     )
     stats = agent.run()
 
@@ -748,6 +774,49 @@ def _run_cqdag_node_agent_service(
         elapsed_seconds=f"{stats.elapsed_seconds:.6f}",
     )
     return stats
+
+
+def _annotate_node_resources(
+    resources,
+    context: CQDAGPCFGNodeContext,
+):
+    labels = dict(resources.labels)
+    if _node_can_stream_candidate_artifacts(context):
+        labels["cqpcfg.streaming_artifacts"] = "1"
+    if context.config.discard_candidate_payloads:
+        labels["cqpcfg.discard_candidate_payloads"] = "1"
+    if labels == dict(resources.labels):
+        return resources
+    return replace(resources, labels=labels)
+
+
+def _node_can_stream_candidate_artifacts(context: CQDAGPCFGNodeContext) -> bool:
+    if context.source_config.source_mode not in {"root", "shard"}:
+        return False
+    if resolve_generation_backend(context.source_config) != "cpp":
+        return False
+    if _worker_artifact_dir_configured_explicitly_false():
+        return False
+    if context.config.discard_candidate_payloads:
+        return True
+    return bool(
+        os.environ.get("CQPCFG_WORKER_CANDIDATE_BLOCK_DIR")
+        or os.environ.get("CQPCFG_CANDIDATE_BLOCK_DIR")
+    )
+
+
+def _worker_artifact_dir_configured_explicitly_false() -> bool:
+    return os.environ.get("CQPCFG_ENABLE_WORKER_ARTIFACTS", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    } or os.environ.get("CQPCFG_DISABLE_WORKER_ARTIFACTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _build_node_context(config: CqdagNodeAgentServiceConfig) -> CQDAGPCFGNodeContext:
@@ -967,6 +1036,10 @@ def _node_agent_config_from_env(prefix: str) -> CqdagNodeAgentServiceConfig:
         "metrics_dir": _env_path,
         "outputs_path": _env_path,
         "outputs_dir": _env_path,
+        "optimization_profile": _env_str,
+        "write_stable_artifacts": _env_bool,
+        "verify_candidate_artifacts": _env_bool,
+        "discard_candidate_payloads": _env_bool,
     }
     for field_name, reader in readers.items():
         env_name = f"{normalized_prefix}_{field_name.upper()}"
@@ -1086,9 +1159,15 @@ def _capture_consumer_results(
         result = consumer.handler(batch)
         return _record_consumer_result(context, batch, result)
 
+    def close_handler():
+        if consumer.close_handler is None:
+            return None
+        result = consumer.close_handler()
+        return _record_consumer_close_result(context, result)
+
     return AnnotatedConsumer(
         handler=handler,
-        close_handler=consumer.close_handler,
+        close_handler=close_handler if consumer.close_handler is not None else None,
     )
 
 
@@ -1123,6 +1202,47 @@ def _record_consumer_result(
     return tuple(outputs)
 
 
+def _record_consumer_close_result(
+    context: CQDAGPCFGNodeContext,
+    result: object,
+) -> tuple[dict[str, Any], ...]:
+    if result is None:
+        return ()
+    if isinstance(result, str):
+        output = _normalize_consumer_close_output(context, {"value": result})
+        context._consumer_outputs.append(output)
+        return (output,)
+    if isinstance(result, Mapping):
+        output = _normalize_consumer_close_output(context, result)
+        context._consumer_outputs.append(output)
+        return (output,)
+    if not isinstance(result, Iterable) or isinstance(result, (str, bytes)):
+        raise TypeError(
+            "@cqdagpcfg_consumer close handler must return None, a mapping, "
+            "or an iterable of mappings"
+        )
+    outputs: list[dict[str, Any]] = []
+    for item in result:
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                "@cqdagpcfg_consumer close handler returned a non-mapping output"
+            )
+        output = _normalize_consumer_close_output(context, item)
+        context._consumer_outputs.append(output)
+        outputs.append(output)
+    return tuple(outputs)
+
+
+def _normalize_consumer_close_output(
+    context: CQDAGPCFGNodeContext,
+    output: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(output)
+    normalized.setdefault("node_id", context.node_id)
+    normalized.setdefault("elapsed_seconds", monotonic() - context.started_at)
+    return normalized
+
+
 def _normalize_consumer_output(
     context: CQDAGPCFGNodeContext,
     batch: CandidateBatch,
@@ -1131,10 +1251,14 @@ def _normalize_consumer_output(
     normalized = dict(output)
     offset = normalized.get("offset")
     if offset is not None:
-        candidate = CQDAGCandidate.from_batch(batch, int(offset))
-        metadata = candidate.output_metadata()
-        metadata.update(normalized)
-        normalized = metadata
+        if batch.is_artifact:
+            normalized.setdefault("batch_id", batch.batch_id)
+            normalized.setdefault("rank", batch.start_rank + int(offset))
+        else:
+            candidate = CQDAGCandidate.from_batch(batch, int(offset))
+            metadata = candidate.output_metadata()
+            metadata.update(normalized)
+            normalized = metadata
     else:
         normalized.setdefault("batch_id", batch.batch_id)
     normalized.setdefault("node_id", context.node_id)

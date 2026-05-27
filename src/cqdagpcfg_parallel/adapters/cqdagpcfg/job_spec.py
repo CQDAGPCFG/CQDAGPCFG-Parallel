@@ -9,7 +9,12 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from CQDAGPCFG import GuessRecord, load_model
 from CQDAGPCFG.cpp_backend import cpp_backend_available
 
-from cqdagpcfg_parallel.protocol import stable_digest, stable_record_string
+from cqdagpcfg_parallel.protocol import (
+    StableStreamFingerprint,
+    canonical_record_bytes,
+    stable_digest,
+    stable_record_string,
+)
 from cqdagpcfg_parallel.storage import ModelManifest
 
 from .block_graph import CppFileCQDAGRecordSource, ROOT_NODE_ID
@@ -85,6 +90,7 @@ def prepare_cqdag_job_spec(
     model_id: str = DEFAULT_MODEL_ID,
     hash_algorithm: str = "sha256",
     target_ranks: Iterable[int] | None = None,
+    decoy_hashes: Iterable[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> CQDAGJobSpec:
     """Build a tracker job spec without materializing the serial prefix."""
@@ -98,7 +104,7 @@ def prepare_cqdag_job_spec(
         model_id=model_id,
         artifact_uri=str(model_path),
     )
-    serial_digest, targets = serial_digest_and_targets(
+    serial_digest, serial_stream_fingerprint, targets = serial_digest_and_targets(
         model_path,
         limit=limit,
         target_ranks=normalized_target_ranks,
@@ -112,7 +118,54 @@ def prepare_cqdag_job_spec(
             "model_source": str(model_path),
             "model_fingerprint": manifest.model_fingerprint,
             "serial_digest": serial_digest,
+            "serial_stream_fingerprint": serial_stream_fingerprint,
             "targets": targets,
+            "decoy_hashes": normalize_decoy_hashes(decoy_hashes),
+        },
+    )
+
+
+def prepare_cqdag_cracking_job_spec(
+    model_path: Path,
+    *,
+    limit: int,
+    model_id: str = DEFAULT_MODEL_ID,
+    hash_algorithm: str = "sha256",
+    target_ranks: Iterable[int] | None = None,
+    decoy_hashes: Iterable[str] | None = None,
+) -> CQDAGJobSpec:
+    """Build a cracking-only job spec without a serial oracle pass.
+
+    This profile is for throughput and memory experiments where exact serial
+    prefix validation is intentionally disabled by the tracker profile.  Target
+    hashes are still populated so cracking backends do real verification work.
+    """
+
+    model_path = Path(model_path)
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    normalized_target_ranks = normalize_target_ranks(target_ranks, limit)
+    manifest = ModelManifest.from_json_payload(
+        model_path.read_bytes(),
+        model_id=model_id,
+        artifact_uri=str(model_path),
+    )
+    targets = target_hashes_only(
+        model_path,
+        limit=limit,
+        target_ranks=normalized_target_ranks,
+        hash_algorithm=hash_algorithm,
+    )
+    return CQDAGJobSpec.from_mapping(
+        {
+            "algorithm": hash_algorithm,
+            "limit": limit,
+            "model_source": str(model_path),
+            "model_fingerprint": manifest.model_fingerprint,
+            "serial_digest": "unchecked-cracking-profile",
+            "serial_stream_fingerprint": None,
+            "targets": targets,
+            "decoy_hashes": normalize_decoy_hashes(decoy_hashes),
         },
     )
 
@@ -124,13 +177,15 @@ def serial_digest_and_targets(
     target_ranks: tuple[int, ...],
     hash_algorithm: str,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> tuple[str, list[dict[str, object]]]:
+) -> tuple[str, str, list[dict[str, object]]]:
     digest = hashlib.sha256()
+    fingerprint = StableStreamFingerprint()
     target_rank_set = set(target_ranks)
     target_by_rank: dict[int, dict[str, object]] = {}
     for rank, record in enumerate(iter_serial_records(model_path, limit)):
-        digest.update(stable_record_string(record).encode("utf-8"))
-        digest.update(b"\n")
+        stable_record = stable_record_string(record).encode("utf-8") + b"\n"
+        digest.update(stable_record)
+        fingerprint = fingerprint.update_bytes(canonical_record_bytes(record))
         if rank in target_rank_set:
             target_by_rank[rank] = {
                 "rank": rank,
@@ -144,7 +199,40 @@ def serial_digest_and_targets(
     missing = sorted(target_rank_set - set(target_by_rank))
     if missing:
         raise RuntimeError(f"target ranks were not produced by serial oracle: {missing}")
-    return digest.hexdigest(), [target_by_rank[rank] for rank in target_ranks]
+    return (
+        digest.hexdigest(),
+        fingerprint.to_string("rfp-v1"),
+        [target_by_rank[rank] for rank in target_ranks],
+    )
+
+
+def target_hashes_only(
+    model_path: Path,
+    *,
+    limit: int,
+    target_ranks: tuple[int, ...],
+    hash_algorithm: str,
+) -> list[dict[str, object]]:
+    if not target_ranks:
+        return []
+    max_rank = max(target_ranks)
+    if max_rank >= limit:
+        raise ValueError("target rank out of generated prefix")
+    target_rank_set = set(target_ranks)
+    target_by_rank: dict[int, dict[str, object]] = {}
+    for rank, record in enumerate(iter_serial_records(model_path, max_rank + 1)):
+        if rank in target_rank_set:
+            target_by_rank[rank] = {
+                "rank": rank,
+                "guess": record.guess,
+                "hash": digest_guess(record.guess, algorithm=hash_algorithm),
+            }
+        if len(target_by_rank) == len(target_rank_set):
+            break
+    missing = sorted(target_rank_set - set(target_by_rank))
+    if missing:
+        raise RuntimeError(f"target ranks were not produced by serial oracle: {missing}")
+    return [target_by_rank[rank] for rank in target_ranks]
 
 
 def iter_serial_records(model_path: Path, limit: int) -> Iterator[GuessRecord]:
@@ -177,6 +265,20 @@ def normalize_target_ranks(
     return normalized
 
 
+def normalize_decoy_hashes(raw_hashes: Iterable[str] | None) -> list[str]:
+    if raw_hashes is None:
+        return []
+    normalized = []
+    seen = set()
+    for value in raw_hashes:
+        digest = str(value).strip().lower()
+        if not digest or digest in seen:
+            continue
+        normalized.append(digest)
+        seen.add(digest)
+    return normalized
+
+
 def digest_guess(guess: str, *, algorithm: str) -> str:
     digest = hashlib.new(algorithm)
     digest.update(guess.encode("utf-8"))
@@ -194,7 +296,10 @@ __all__ = [
     "compute_serial_digest",
     "digest_guess",
     "iter_serial_records",
+    "normalize_decoy_hashes",
     "normalize_target_ranks",
+    "prepare_cqdag_cracking_job_spec",
     "prepare_cqdag_job_spec",
     "serial_digest_and_targets",
+    "target_hashes_only",
 ]

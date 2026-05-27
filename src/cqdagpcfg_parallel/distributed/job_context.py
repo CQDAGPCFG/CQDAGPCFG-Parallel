@@ -38,8 +38,8 @@ class JobContext:
         ):
             if not value:
                 raise ValueError(f"{name} cannot be empty")
-        if self.source_mode not in {"root", "structure"}:
-            raise ValueError("source_mode must be root or structure")
+        if self.source_mode not in {"root", "structure", "shard"}:
+            raise ValueError("source_mode must be root, structure, or shard")
         if self.demand_window < 0:
             raise ValueError("demand_window cannot be negative")
 

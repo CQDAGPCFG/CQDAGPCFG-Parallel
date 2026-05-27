@@ -6,7 +6,7 @@ from math import ceil, sqrt
 from .chunk_store import InMemoryChunkStore
 from .lease_table import LeaseDeniedError, LeaseTable
 from .node_state import NodeRuntimeState, NodeStateTable
-from .types import ChunkSizePolicy, NodeId, WorkItem, WorkerId
+from .types import ChunkSizePolicy, LeaseStrategyName, NodeId, WorkItem, WorkerId
 
 
 DEFAULT_FIXED_CHUNK_SIZE = 8
@@ -23,6 +23,12 @@ DEFAULT_NODE_AFFINITY_BONUS = 0.5
 DEFAULT_NODE_MIGRATION_PENALTY = 0.0
 DEFAULT_MAX_PARALLEL_LEASES_PER_NODE = 2
 DEFAULT_PARALLEL_LATENCY_FACTOR = 0.5
+DEFAULT_TARGET_CHUNK_PROBABILITY_MASS = 0.0
+DEFAULT_RANK_WINDOW_SIZE = 0
+DEFAULT_RANK_WINDOW_FRONTIER_MULTIPLIER = 4.0
+DEFAULT_TAIL_STEAL_MIN_GAP = 1
+DEFAULT_TAIL_STEAL_PENDING_LIMIT_MULTIPLIER = 2.0
+DEFAULT_TAIL_STEAL_SCORE_THRESHOLD = 0.0
 MIN_EFFECTIVE_COST = 1e-12
 
 
@@ -45,8 +51,18 @@ class SchedulerConfig:
     node_migration_penalty: float = DEFAULT_NODE_MIGRATION_PENALTY
     max_parallel_leases_per_node: int = DEFAULT_MAX_PARALLEL_LEASES_PER_NODE
     parallel_latency_factor: float = DEFAULT_PARALLEL_LATENCY_FACTOR
+    lease_strategy: LeaseStrategyName = LeaseStrategyName.RANGE
+    target_chunk_probability_mass: float = DEFAULT_TARGET_CHUNK_PROBABILITY_MASS
+    rank_window_size: int = DEFAULT_RANK_WINDOW_SIZE
+    rank_window_frontier_multiplier: float = DEFAULT_RANK_WINDOW_FRONTIER_MULTIPLIER
+    tail_stealing_enabled: bool = True
+    tail_steal_min_gap: int = DEFAULT_TAIL_STEAL_MIN_GAP
+    tail_steal_pending_limit_multiplier: float = DEFAULT_TAIL_STEAL_PENDING_LIMIT_MULTIPLIER
+    tail_steal_score_threshold: float = DEFAULT_TAIL_STEAL_SCORE_THRESHOLD
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "policy", ChunkSizePolicy(self.policy))
+        object.__setattr__(self, "lease_strategy", LeaseStrategyName(self.lease_strategy))
         if self.fixed_chunk_size <= 0:
             raise ValueError("fixed_chunk_size must be positive")
         if self.min_chunk_size <= 0:
@@ -75,6 +91,18 @@ class SchedulerConfig:
             raise ValueError("max_parallel_leases_per_node must be positive")
         if self.parallel_latency_factor <= 0.0:
             raise ValueError("parallel_latency_factor must be positive")
+        if self.target_chunk_probability_mass < 0.0:
+            raise ValueError("target_chunk_probability_mass cannot be negative")
+        if self.rank_window_size < 0:
+            raise ValueError("rank_window_size cannot be negative")
+        if self.rank_window_frontier_multiplier < 0.0:
+            raise ValueError("rank_window_frontier_multiplier cannot be negative")
+        if self.tail_steal_min_gap <= 0:
+            raise ValueError("tail_steal_min_gap must be positive")
+        if self.tail_steal_pending_limit_multiplier < 0.0:
+            raise ValueError("tail_steal_pending_limit_multiplier cannot be negative")
+        if self.tail_steal_score_threshold < 0.0:
+            raise ValueError("tail_steal_score_threshold cannot be negative")
 
     def chunk_size(self, *, demand_gap: int, entropy: float) -> int:
         if demand_gap <= 0:
@@ -125,6 +153,104 @@ class ScheduleStats:
     affinity_hits: int = 0
     affinity_misses: int = 0
     parallel_items: int = 0
+    tail_steal_attempts: int = 0
+    tail_steals: int = 0
+    tail_steal_denials: int = 0
+    rank_window_waits: int = 0
+    rank_window_forced_items: int = 0
+    rank_window_peak_outstanding_records: int = 0
+
+
+class RangeLeaseStrategy:
+    name = LeaseStrategyName.RANGE
+
+    def score(self, scheduler: "PriorityCostScheduler", state: NodeRuntimeState) -> float:
+        return scheduler._range_score(state)
+
+    def chunk_size(
+        self,
+        scheduler: "PriorityCostScheduler",
+        state: NodeRuntimeState,
+        gap: int,
+    ) -> int:
+        return scheduler._range_chunk_size_for_gap(state, gap)
+
+    def estimated_mass(self, state: NodeRuntimeState, chunk_size: int) -> float:
+        return chunk_size * state.effective_mass_density
+
+    def mass_budget(self, scheduler: "PriorityCostScheduler", state: NodeRuntimeState) -> float:
+        return 0.0
+
+
+class ProbabilityMassLeaseStrategy(RangeLeaseStrategy):
+    name = LeaseStrategyName.PROBABILITY_MASS
+
+    def score(self, scheduler: "PriorityCostScheduler", state: NodeRuntimeState) -> float:
+        if state.demand_gap <= 0 or state.urgency <= 0.0:
+            return 0.0
+        density = state.effective_mass_density
+        if density <= 0.0:
+            return 0.0
+        donated_multiplier = 1.0
+        if state.donated_priority > 0.0:
+            base_priority = max(state.priority, MIN_EFFECTIVE_COST)
+            donated_multiplier += (
+                scheduler.config.priority_donation_weight
+                * state.donated_priority
+                / base_priority
+            )
+        return (
+            state.demand_gap
+            * density
+            * state.urgency
+            * donated_multiplier
+            / scheduler._effective_cost(state)
+        )
+
+    def chunk_size(
+        self,
+        scheduler: "PriorityCostScheduler",
+        state: NodeRuntimeState,
+        gap: int,
+    ) -> int:
+        target_mass = scheduler.config.target_chunk_probability_mass
+        density = state.effective_mass_density
+        if target_mass <= 0.0 or density <= 0.0:
+            return scheduler._range_chunk_size_for_gap(state, gap)
+        raw = ceil(target_mass / density)
+        return min(
+            gap,
+            _clamp(
+                raw,
+                scheduler.config.min_chunk_size,
+                scheduler.config.max_chunk_size,
+            ),
+        )
+
+    def mass_budget(self, scheduler: "PriorityCostScheduler", state: NodeRuntimeState) -> float:
+        return scheduler.config.target_chunk_probability_mass
+
+
+class RankWindowProbabilityMassLeaseStrategy(ProbabilityMassLeaseStrategy):
+    name = LeaseStrategyName.RANK_WINDOW_PROBABILITY_MASS
+
+    def score(self, scheduler: "PriorityCostScheduler", state: NodeRuntimeState) -> float:
+        base = super().score(scheduler, state)
+        if base <= 0.0:
+            return 0.0
+        if state.is_frontier_blocked:
+            return base * (1.0 + scheduler.config.rank_window_frontier_multiplier)
+        return base
+
+
+def _lease_strategy_for(name: LeaseStrategyName) -> RangeLeaseStrategy:
+    if name == LeaseStrategyName.RANGE:
+        return RangeLeaseStrategy()
+    if name == LeaseStrategyName.PROBABILITY_MASS:
+        return ProbabilityMassLeaseStrategy()
+    if name == LeaseStrategyName.RANK_WINDOW_PROBABILITY_MASS:
+        return RankWindowProbabilityMassLeaseStrategy()
+    raise ValueError(f"unsupported lease strategy: {name}")
 
 
 class PriorityCostScheduler:
@@ -146,7 +272,14 @@ class PriorityCostScheduler:
         self._affinity_hits = 0
         self._affinity_misses = 0
         self._parallel_items = 0
+        self._tail_steal_attempts = 0
+        self._tail_steals = 0
+        self._tail_steal_denials = 0
+        self._rank_window_waits = 0
+        self._rank_window_forced_items = 0
+        self._rank_window_peak_outstanding_records = 0
         self._last_worker_by_node: dict[NodeId, WorkerId] = {}
+        self.lease_strategy = _lease_strategy_for(self.config.lease_strategy)
 
     @property
     def stats(self) -> ScheduleStats:
@@ -157,10 +290,28 @@ class PriorityCostScheduler:
             affinity_hits=self._affinity_hits,
             affinity_misses=self._affinity_misses,
             parallel_items=self._parallel_items,
+            tail_steal_attempts=self._tail_steal_attempts,
+            tail_steals=self._tail_steals,
+            tail_steal_denials=self._tail_steal_denials,
+            rank_window_waits=self._rank_window_waits,
+            rank_window_forced_items=self._rank_window_forced_items,
+            rank_window_peak_outstanding_records=self._rank_window_peak_outstanding_records,
         )
 
-    def schedule(self, worker_id: WorkerId, *, now: float | None = None) -> WorkItem | None:
+    def schedule(
+        self,
+        worker_id: WorkerId,
+        *,
+        now: float | None = None,
+        max_chunk_size: int | None = None,
+    ) -> WorkItem | None:
+        effective_max_chunk_size = self._effective_max_chunk_size(max_chunk_size)
         candidates = self._demand_candidates(worker_id)
+        rank_window_outstanding = self._rank_window_outstanding_records()
+        self._rank_window_peak_outstanding_records = max(
+            self._rank_window_peak_outstanding_records,
+            rank_window_outstanding,
+        )
         for state in candidates:
             start = max(state.ready_end, state.scheduled_end)
             gap = max(0, state.effective_target_end - start)
@@ -168,13 +319,35 @@ class PriorityCostScheduler:
                 continue
             active_leases = self.leases.active_count(state.node_id, now=now)
             extends_active_tail = active_leases > 0 and start > state.ready_end
-            if extends_active_tail and not self._can_parallelize_state(state):
-                self._lease_denials += 1
-                continue
             if active_leases >= self.config.max_parallel_leases_per_node:
                 self._lease_denials += 1
                 continue
-            chunk_size = self._chunk_size_for_gap(state, gap)
+            if extends_active_tail:
+                self._tail_steal_attempts += 1
+            if extends_active_tail and not self._can_tail_steal_state(
+                state,
+                gap=gap,
+                active_leases=active_leases,
+                pending_tail=start - state.ready_end,
+                max_chunk_size=effective_max_chunk_size,
+            ):
+                self._lease_denials += 1
+                self._tail_steal_denials += 1
+                continue
+            window_gap = self._rank_window_gap(
+                state,
+                gap,
+                outstanding_records=rank_window_outstanding,
+            )
+            if window_gap <= 0:
+                self._lease_denials += 1
+                self._rank_window_waits += 1
+                continue
+            gap = min(gap, window_gap)
+            chunk_size = min(
+                effective_max_chunk_size,
+                self._chunk_size_for_gap(state, gap),
+            )
             if chunk_size <= 0:
                 continue
 
@@ -198,18 +371,27 @@ class PriorityCostScheduler:
                 worker_id=worker_id,
                 epoch=lease.epoch,
                 reclaim_before=state.ready_end,
+                estimated_mass=self.lease_strategy.estimated_mass(state, chunk_size),
+                mass_budget=self.lease_strategy.mass_budget(self, state),
             )
             state.reserve_until(item.end)
             if active_leases > 0:
                 self._parallel_items += 1
+            if extends_active_tail:
+                self._tail_steals += 1
             self._record_affinity_assignment(state.node_id, worker_id)
             self._scheduled_items += 1
             self._scheduled_records += item.size
+            self._rank_window_peak_outstanding_records = max(
+                self._rank_window_peak_outstanding_records,
+                rank_window_outstanding + item.size,
+            )
             return item
         return None
 
     def _demand_candidates(self, worker_id: WorkerId) -> tuple[NodeRuntimeState, ...]:
-        for state in self.states.values():
+        active_states = tuple(self.states.active_demands())
+        for state in active_states:
             ready_end = self.chunk_store.ready_end(state.node_id)
             state.update_ready_end(ready_end)
             state.reset_scheduled_end(
@@ -218,15 +400,62 @@ class PriorityCostScheduler:
         self.states.apply_priority_donations()
         return tuple(
             sorted(
-                self.states.active_demands(),
+                active_states,
                 key=lambda state: (
-                    -self.score_for_worker(state, worker_id),
+                    -self._schedulable_score_for_worker(state, worker_id),
+                    -self._schedulable_gap(state),
                     -state.demand_gap,
                     -state.urgency,
                     str(state.node_id),
                 ),
             )
         )
+
+    def _schedulable_gap(self, state: NodeRuntimeState) -> int:
+        start = max(state.ready_end, state.scheduled_end)
+        return max(0, state.effective_target_end - start)
+
+    def _schedulable_score_for_worker(
+        self,
+        state: NodeRuntimeState,
+        worker_id: WorkerId,
+    ) -> float:
+        schedulable_gap = self._schedulable_gap(state)
+        if schedulable_gap <= 0 or state.demand_gap <= 0:
+            return 0.0
+        return self.score_for_worker(state, worker_id) * (
+            schedulable_gap / state.demand_gap
+        )
+
+    def _rank_window_gap(
+        self,
+        state: NodeRuntimeState,
+        gap: int,
+        *,
+        outstanding_records: int,
+    ) -> int:
+        if self.config.rank_window_size <= 0:
+            return gap
+        remaining = self.config.rank_window_size - outstanding_records
+        if remaining > 0:
+            return min(gap, remaining)
+        if state.is_frontier_blocked:
+            self._rank_window_forced_items += 1
+            return 1
+        return 0
+
+    def _rank_window_outstanding_records(self) -> int:
+        if self.config.rank_window_size <= 0:
+            return 0
+        outstanding = 0
+        for state in self.states.values():
+            frontier = state.frontier_start
+            ready_end = self.chunk_store.ready_end(state.node_id)
+            reserved_end = self.leases.contiguous_reserved_end(state.node_id, ready_end)
+            scheduled_end = max(state.scheduled_end, reserved_end, ready_end)
+            outstanding += max(0, scheduled_end - frontier)
+        resident = self.chunk_store.stats().record_count
+        return max(outstanding, resident)
 
     def score_for_worker(self, state: NodeRuntimeState, worker_id: WorkerId) -> float:
         return (
@@ -236,6 +465,9 @@ class PriorityCostScheduler:
         )
 
     def score(self, state: NodeRuntimeState) -> float:
+        return self.lease_strategy.score(self, state)
+
+    def _range_score(self, state: NodeRuntimeState) -> float:
         if state.demand_gap <= 0:
             return 0.0
         priority = state.priority + self.config.priority_donation_weight * state.donated_priority
@@ -280,6 +512,16 @@ class PriorityCostScheduler:
         return max(cost, MIN_EFFECTIVE_COST)
 
     def _chunk_size_for_gap(self, state: NodeRuntimeState, gap: int) -> int:
+        return self.lease_strategy.chunk_size(self, state, gap)
+
+    def _effective_max_chunk_size(self, max_chunk_size: int | None) -> int:
+        if max_chunk_size is None:
+            return self.config.max_chunk_size
+        if max_chunk_size <= 0:
+            raise ValueError("max_chunk_size must be positive")
+        return _clamp(max_chunk_size, self.config.min_chunk_size, self.config.max_chunk_size)
+
+    def _range_chunk_size_for_gap(self, state: NodeRuntimeState, gap: int) -> int:
         if gap <= 0:
             return 0
         base = self.config.chunk_size(demand_gap=gap, entropy=state.entropy)
@@ -302,12 +544,53 @@ class PriorityCostScheduler:
             return False
         if not self.config.runtime_feedback_enabled:
             return False
-        if state.feedback_count == 0:
+        return True
+
+    def _can_tail_steal_state(
+        self,
+        state: NodeRuntimeState,
+        *,
+        gap: int,
+        active_leases: int,
+        pending_tail: int,
+        max_chunk_size: int,
+    ) -> bool:
+        if not self.config.tail_stealing_enabled:
+            return False
+        if not self._can_parallelize_state(state):
+            return False
+        if gap < self.config.tail_steal_min_gap:
+            return False
+        pending_limit = (
+            max_chunk_size * self.config.tail_steal_pending_limit_multiplier
+        )
+        if pending_tail > pending_limit:
             return False
         return (
-            state.chunk_latency_ewma
-            <= self.config.target_chunk_latency_seconds * self.config.parallel_latency_factor
+            self._tail_steal_score(
+                state,
+                gap=gap,
+                active_leases=active_leases,
+                pending_tail=pending_tail,
+            )
+            >= self.config.tail_steal_score_threshold
         )
+
+    def _tail_steal_score(
+        self,
+        state: NodeRuntimeState,
+        *,
+        gap: int,
+        active_leases: int,
+        pending_tail: int,
+    ) -> float:
+        benefit = gap * state.effective_mass_density * max(state.urgency, 0.0)
+        if benefit <= 0.0:
+            return 0.0
+        pending_factor = 1.0 + pending_tail / max(1.0, float(self.config.max_chunk_size))
+        lease_factor = 1.0 + active_leases
+        risk = self._effective_cost(state) * pending_factor * lease_factor
+        return benefit / max(risk, MIN_EFFECTIVE_COST)
 
 
 class GapOnlyScheduler(PriorityCostScheduler):
@@ -348,10 +631,19 @@ __all__ = [
     "DEFAULT_NODE_MIGRATION_PENALTY",
     "DEFAULT_PARALLEL_LATENCY_FACTOR",
     "DEFAULT_PRIORITY_DONATION_WEIGHT",
+    "DEFAULT_RANK_WINDOW_FRONTIER_MULTIPLIER",
+    "DEFAULT_RANK_WINDOW_SIZE",
+    "DEFAULT_TARGET_CHUNK_PROBABILITY_MASS",
     "DEFAULT_TARGET_CHUNK_LATENCY_SECONDS",
+    "DEFAULT_TAIL_STEAL_MIN_GAP",
+    "DEFAULT_TAIL_STEAL_PENDING_LIMIT_MULTIPLIER",
+    "DEFAULT_TAIL_STEAL_SCORE_THRESHOLD",
     "GapOnlyScheduler",
     "MIN_EFFECTIVE_COST",
+    "ProbabilityMassLeaseStrategy",
     "PriorityCostScheduler",
+    "RankWindowProbabilityMassLeaseStrategy",
+    "RangeLeaseStrategy",
     "ScheduleStats",
     "SchedulerConfig",
 ]

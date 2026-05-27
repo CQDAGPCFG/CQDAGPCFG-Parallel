@@ -27,6 +27,7 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     cqdagpcfg_tracker,
 )
 from cqdagpcfg_parallel.framework_logging import log_event
+from cqdagpcfg_parallel.protocol import StableStreamFingerprint
 from cqdagpcfg_parallel.runtime import CandidateBatch
 
 
@@ -195,7 +196,19 @@ class ExperimentTracker:
             LOGGER,
             logging.INFO,
             "experiment.tracker_complete",
-            digest_match=summary.digest == summary.serial_digest,
+            digest_validation_enabled=summary.digest_validation_enabled,
+            digest_match=(
+                summary.digest == summary.serial_digest
+                or (
+                    summary.serial_stream_fingerprint is not None
+                    and _fingerprints_equal(
+                        summary.stable_fingerprint,
+                        summary.serial_stream_fingerprint,
+                    )
+                )
+                if summary.digest_validation_enabled
+                else None
+            ),
             peak_resident_records=summary.peak_resident_records,
             emitted_records=summary.emitted_records,
             reclaimed_records=summary.reclaimed_records,
@@ -204,6 +217,15 @@ class ExperimentTracker:
 
 def main() -> None:
     ExperimentTracker.run()
+
+
+def _fingerprints_equal(left: str, right: str) -> bool:
+    try:
+        return StableStreamFingerprint.from_string(left) == StableStreamFingerprint.from_string(
+            right,
+        )
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ def run_candidate_pipeline(
                     sleep(config.consumer_delay_seconds)
                 with consume_lock:
                     consumed_batches += 1
-                    consumed_candidates += len(batch.records)
+                    consumed_candidates += batch.record_count
                     if batch.batch_id in completed_ids_seen:
                         duplicate_batches += 1
                     completed_ids_seen.add(batch.batch_id)

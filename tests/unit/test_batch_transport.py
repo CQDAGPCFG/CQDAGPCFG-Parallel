@@ -14,6 +14,7 @@ from cqdagpcfg_parallel.runtime import (
     JsonBatchAckCodec,
     JsonCandidateBatchCodec,
     MemoryBatchSink,
+    UNCHECKED_ARTIFACT_SHA256,
     ZmqEndpoint,
     ZmqEndpointBundle,
     ZmqPullBatchAckSource,
@@ -42,6 +43,18 @@ def _batch(batch_id: int, start_rank: int, count: int = 2) -> CandidateBatch:
     )
 
 
+def _artifact_batch(batch_id: int, start_rank: int, count: int = 2) -> CandidateBatch:
+    return CandidateBatch.from_artifact(
+        batch_id=batch_id,
+        start_rank=start_rank,
+        record_count=count,
+        payload_bytes=count * 4,
+        artifact_uri=f"file:///tmp/candidate-block-{batch_id}.txt",
+        artifact_sha256="0" * 64,
+        artifact_bytes=count * 4,
+    )
+
+
 def test_json_candidate_batch_codec_round_trips() -> None:
     batch = _batch(3, 6, count=3)
 
@@ -54,6 +67,37 @@ def test_json_candidate_batch_codec_round_trips() -> None:
     assert [record.stable_string() for record in decoded.records] == [
         record.stable_string() for record in batch.records
     ]
+
+
+def test_json_candidate_batch_codec_round_trips_artifact() -> None:
+    batch = _artifact_batch(30, 60, count=5)
+
+    decoded = JsonCandidateBatchCodec.loads(JsonCandidateBatchCodec.dumps(batch))
+
+    assert decoded.batch_id == batch.batch_id
+    assert decoded.start_rank == batch.start_rank
+    assert decoded.end_rank == batch.end_rank
+    assert decoded.record_count == batch.record_count
+    assert decoded.payload_bytes == batch.payload_bytes
+    assert decoded.artifact_uri == batch.artifact_uri
+    assert decoded.artifact_sha256 == batch.artifact_sha256
+    assert decoded.artifact_bytes == batch.artifact_bytes
+
+
+def test_artifact_batch_can_skip_sha_verification(tmp_path) -> None:
+    artifact_path = tmp_path / "candidates.txt"
+    artifact_path.write_text("alpha\nbeta\n", encoding="utf-8")
+    batch = CandidateBatch.from_artifact(
+        batch_id=7,
+        start_rank=11,
+        record_count=2,
+        payload_bytes=11,
+        artifact_uri=artifact_path.resolve().as_uri(),
+        artifact_sha256=UNCHECKED_ARTIFACT_SHA256,
+        artifact_bytes=artifact_path.stat().st_size,
+    )
+
+    assert tuple(batch.iter_guesses()) == ("alpha", "beta")
 
 
 def test_json_candidate_batch_codec_round_trips_end_of_stream() -> None:
@@ -74,6 +118,21 @@ def test_binary_candidate_batch_codec_round_trips() -> None:
     assert [record.stable_string() for record in decoded.records] == [
         record.stable_string() for record in batch.records
     ]
+
+
+def test_binary_candidate_batch_codec_round_trips_artifact() -> None:
+    batch = _artifact_batch(40, 80, count=7)
+
+    decoded = BinaryCandidateBatchCodec.loads(BinaryCandidateBatchCodec.dumps(batch))
+
+    assert decoded.batch_id == batch.batch_id
+    assert decoded.start_rank == batch.start_rank
+    assert decoded.end_rank == batch.end_rank
+    assert decoded.record_count == batch.record_count
+    assert decoded.payload_bytes == batch.payload_bytes
+    assert decoded.artifact_uri == batch.artifact_uri
+    assert decoded.artifact_sha256 == batch.artifact_sha256
+    assert decoded.artifact_bytes == batch.artifact_bytes
 
 
 def test_cpp_binary_candidate_batch_serializer_matches_python(monkeypatch: pytest.MonkeyPatch) -> None:

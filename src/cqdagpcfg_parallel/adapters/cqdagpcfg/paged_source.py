@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import exp, fsum, log
+from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from CQDAGPCFG import GuessRecord
@@ -22,6 +23,7 @@ from cqdagpcfg_parallel.storage import (
 )
 
 from .block_graph import (
+    CandidateRangeArtifact,
     CQDAGRecordSource,
     CQDAGSourceReclaimStats,
     ROOT_NODE_ID,
@@ -31,6 +33,7 @@ from .block_graph import (
     _iter_repository_blocks,
     _require_structure_index,
     _restore_block_snapshot,
+    _write_record_artifact,
 )
 from .block_graph import BlockNodeDescriptor
 
@@ -364,6 +367,25 @@ class PagedCQDAGStructureRecordSource:
         if start < 0 or end < start:
             raise ValueError("invalid source range")
         return self._stream_for(node_id).read_range(start, end)
+
+    def write_range_artifact(
+        self,
+        node_id: NodeId,
+        start: int,
+        end: int,
+        *,
+        guess_path: str | Path,
+        stable_path: str | Path | None = None,
+        verify_artifact: bool = True,
+        include_stable_metadata: bool = True,
+    ) -> CandidateRangeArtifact:
+        return _write_record_artifact(
+            self.read_range(node_id, start, end),
+            guess_path=guess_path,
+            stable_path=stable_path,
+            verify_artifact=verify_artifact,
+            include_stable_metadata=include_stable_metadata,
+        )
 
     def reclaim_before(self, node_id: NodeId, index: int) -> int:
         stream = self._streams.get(node_id)

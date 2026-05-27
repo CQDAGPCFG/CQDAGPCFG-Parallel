@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,9 +40,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-file", type=Path, default=None)
     parser.add_argument("--source-model-path", type=Path, default=None)
     parser.add_argument("--work-dir", type=Path, default=None)
+    parser.add_argument(
+        "--reuse-job-spec",
+        action="store_true",
+        help="Use an existing job-spec.json in --work-dir instead of preparing a new oracle spec.",
+    )
     parser.add_argument("--limit", type=int, default=80)
     parser.add_argument("--target-rank", type=int, action="append", default=None)
+    parser.add_argument("--no-targets", action="store_true")
     parser.add_argument("--hash-algorithm", choices=("sha256", "sha1", "md5"), default="sha256")
+    parser.add_argument("--decoy-hash", action="append", default=None)
     parser.add_argument("--total-nodes", type=int, default=5)
     parser.add_argument("--generator-rate", type=float, default=120_000.0)
     parser.add_argument("--consumer-rate", type=float, default=180_000.0)
@@ -61,14 +69,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-slot-page-size", type=int, default=1024)
     parser.add_argument("--model-structure-page-size", type=int, default=4096)
     parser.add_argument("--model-json-page-cache", type=int, default=128)
-    parser.add_argument("--source-mode", choices=("root", "structure"), default="root")
+    parser.add_argument(
+        "--source-mode",
+        choices=("root", "structure", "shard"),
+        default="root",
+        help=(
+            "root is the default rank-space paging mode. structure uses "
+            "CQDAG structure shards and exact global merge. shard emits "
+            "structure-local cracking artifacts directly for maximum parallel drain."
+        ),
+    )
     parser.add_argument("--demand-window", type=int, default=8)
-    parser.add_argument("--max-chunk-size", type=int, default=32)
-    parser.add_argument("--max-parallel-leases-per-node", type=int, default=2)
+    parser.add_argument("--max-chunk-size", type=int, default=8192)
+    parser.add_argument("--max-parallel-leases-per-node", type=int, default=None)
+    parser.add_argument("--lease-ttl-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--lease-strategy",
+        choices=("range", "probability_mass", "rank_window_probability_mass"),
+        default="rank_window_probability_mass",
+    )
+    parser.add_argument("--target-chunk-probability-mass", type=float, default=0.01)
+    parser.add_argument("--rank-window-size", type=int, default=65536)
+    parser.add_argument("--rank-window-frontier-multiplier", type=float, default=4.0)
+    parser.add_argument("--tail-steal-min-gap", type=int, default=1)
+    parser.add_argument("--tail-steal-pending-limit-multiplier", type=float, default=2.0)
+    parser.add_argument("--tail-steal-score-threshold", type=float, default=0.0)
+    parser.add_argument("--disable-tail-stealing", action="store_true")
     parser.add_argument("--disable-node-affinity", action="store_true")
     parser.add_argument("--node-affinity-bonus", type=float, default=0.5)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-batch-payload-bytes", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=65536)
+    parser.add_argument("--max-batch-payload-bytes", type=int, default=1 << 20)
     parser.add_argument("--ack-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--ack-retry-interval-seconds", type=float, default=5.0)
     parser.add_argument("--worker-delay-seconds", type=float, default=0.0)
@@ -77,16 +107,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consumer-drain-timeout-ms", type=int, default=2000)
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--disable-reclaim", action="store_true")
+    parser.add_argument("--disable-lazy-shard-activation", action="store_true")
     parser.add_argument("--dynamic-rebalance", action="store_true")
     parser.add_argument("--rebalance-interval-seconds", type=float, default=0.25)
     parser.add_argument("--role-switch-cooldown-seconds", type=float, default=3.0)
     parser.add_argument("--role-switch-min-improvement", type=float, default=0.25)
     parser.add_argument("--metrics-flush-interval-seconds", type=float, default=0.25)
+    parser.add_argument(
+        "--optimization-profile",
+        choices=("balanced", "cracking"),
+        default="balanced",
+        help=(
+            "Use 'cracking' to disable exact-validation overhead and choose "
+            "memory-bounded streaming defaults for throughput runs."
+        ),
+    )
+    parser.add_argument(
+        "--fast-cracking-mode",
+        action="store_true",
+        help=(
+            "Skip stable serial-digest artifact I/O during the distributed run. "
+            "Use this for throughput measurements, not serial-prefix validation."
+        ),
+    )
+    parser.add_argument(
+        "--stable-artifact-validation",
+        action="store_true",
+        help=(
+            "Validate exact output by rereading stable artifacts instead of using "
+            "the default associative stable-stream fingerprint."
+        ),
+    )
+    parser.add_argument(
+        "--drain-only",
+        action="store_true",
+        help="Acknowledge candidate batches without hashing or reading artifact payloads.",
+    )
+    parser.add_argument(
+        "--discard-candidate-payloads",
+        action="store_true",
+        help=(
+            "Generate logical artifact chunks but discard candidate payload bytes at "
+            "the worker. This is intended for very large protocol throughput runs."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.fast_cracking_mode and args.optimization_profile == "balanced":
+        args.optimization_profile = "cracking"
     root = repo_root()
     scripts_dir = experiment_src_dir()
     work_dir_context = (
@@ -104,6 +175,15 @@ def main() -> None:
     env["PYTHONPATH"] = (
         f"{scripts_dir}:{root / 'src'}:{root.parent}:{env.get('PYTHONPATH', '')}"
     )
+    env.setdefault("CQPCFG_CANDIDATE_BLOCK_DIR", str(work_dir / "candidate_blocks"))
+    env.setdefault(
+        "CQPCFG_ENABLE_WORKER_ARTIFACTS",
+        "1" if args.source_mode in {"root", "shard"} else "0",
+    )
+    env["CQPCFG_OPTIMIZATION_PROFILE"] = args.optimization_profile
+    if args.optimization_profile == "cracking":
+        env.setdefault("CQPCFG_DISABLE_STABLE_METADATA", "1")
+        env.setdefault("CQPCFG_VERIFY_CANDIDATE_ARTIFACTS", "0")
     python = sys.executable
 
     if args.source_model_path is None:
@@ -119,21 +199,31 @@ def main() -> None:
     elif args.train_file is not None:
         raise SystemExit("--train-file cannot be used with --source-model-path")
 
-    prepare_cmd = [
-        python,
-        str(scripts_dir / "tools" / "prepare.py"),
-        "--source-model-path",
-        str(model_path),
-        "--job-spec-path",
-        str(job_spec_path),
-        "--limit",
-        str(args.limit),
-        "--hash-algorithm",
-        args.hash_algorithm,
-    ]
-    for rank in args.target_rank or []:
-        prepare_cmd.extend(["--target-rank", str(rank)])
-    run_checked(prepare_cmd, env=env)
+    if args.reuse_job_spec:
+        if not job_spec_path.exists():
+            raise SystemExit(f"--reuse-job-spec requires existing {job_spec_path}")
+    else:
+        prepare_cmd = [
+            python,
+            str(scripts_dir / "tools" / "prepare.py"),
+            "--source-model-path",
+            str(model_path),
+            "--job-spec-path",
+            str(job_spec_path),
+            "--limit",
+            str(args.limit),
+            "--hash-algorithm",
+            args.hash_algorithm,
+        ]
+        if args.optimization_profile == "cracking":
+            prepare_cmd.append("--cracking-profile")
+        if args.no_targets:
+            prepare_cmd.append("--no-targets")
+        for rank in args.target_rank or []:
+            prepare_cmd.extend(["--target-rank", str(rank)])
+        for digest in args.decoy_hash or []:
+            prepare_cmd.extend(["--decoy-hash", digest])
+        run_checked(prepare_cmd, env=env)
 
     role_plan = CqdagAwareElasticRoleAllocator().plan(
         RoleAllocationInput(
@@ -146,6 +236,11 @@ def main() -> None:
     print(f"  generators: {role_plan.generator_count}")
     print(f"  consumers : {role_plan.consumer_count}")
     print(f"  throughput: {role_plan.expected_throughput:.3f}", flush=True)
+    effective_max_parallel_leases = (
+        args.max_parallel_leases_per_node
+        if args.max_parallel_leases_per_node is not None
+        else max(2, role_plan.generator_count)
+    )
 
     run_node_agent_pipeline(
         args=args,
@@ -156,6 +251,7 @@ def main() -> None:
         job_spec_path=job_spec_path,
         work_dir=work_dir,
         initial_plan=role_plan,
+        effective_max_parallel_leases=effective_max_parallel_leases,
         enable_rebalance=args.dynamic_rebalance,
     )
     if work_dir_context is not None:
@@ -207,6 +303,7 @@ def run_node_agent_pipeline(
     job_spec_path: Path,
     work_dir: Path,
     initial_plan,
+    effective_max_parallel_leases: int,
     enable_rebalance: bool,
 ) -> None:
     if args.rebalance_interval_seconds <= 0.0:
@@ -259,6 +356,19 @@ def run_node_agent_pipeline(
             "CQPCFG_METRICS_PATH": str(metrics_path),
             "CQPCFG_OUTPUTS_PATH": str(outputs_path),
             "CQPCFG_MODEL_JSON_PAGE_CACHE": str(args.model_json_page_cache),
+            "CQPCFG_WRITE_STABLE_ARTIFACTS": (
+                "1" if args.stable_artifact_validation else "0"
+            ),
+            "CQPCFG_OPTIMIZATION_PROFILE": args.optimization_profile,
+            "CQPCFG_DRAIN_ONLY": (
+                "1" if args.drain_only or args.discard_candidate_payloads else "0"
+            ),
+            "CQPCFG_DISCARD_CANDIDATE_PAYLOADS": (
+                "1" if args.discard_candidate_payloads else "0"
+            ),
+            "CQPCFG_VERIFY_CANDIDATE_ARTIFACTS": (
+                "0" if args.optimization_profile == "cracking" else "1"
+            ),
         }
         if args.model_cache_dir is not None:
             agent_env["CQPCFG_MODEL_CACHE_DIR"] = str(args.model_cache_dir)
@@ -333,11 +443,26 @@ def run_node_agent_pipeline(
         "CQPCFG_CONTROL_BIND": args.control_bind,
         "CQPCFG_BATCH_BIND": args.batch_bind,
         "CQPCFG_ACK_BIND": args.ack_bind,
+        "CQPCFG_TOTAL_NODES": str(args.total_nodes),
+        "CQPCFG_INITIAL_GENERATORS": str(initial_plan.generator_count),
+        "CQPCFG_INITIAL_CONSUMERS": str(initial_plan.consumer_count),
+        "CQPCFG_EXPECTED_WORKERS": str(initial_plan.generator_count),
         "CQPCFG_CONSUMER_COUNT": str(args.total_nodes if enable_rebalance else initial_plan.consumer_count),
         "CQPCFG_SOURCE_MODE": args.source_mode,
+        "CQPCFG_OPTIMIZATION_PROFILE": args.optimization_profile,
         "CQPCFG_DEMAND_WINDOW": str(args.demand_window),
         "CQPCFG_MAX_CHUNK_SIZE": str(args.max_chunk_size),
-        "CQPCFG_MAX_PARALLEL_LEASES_PER_NODE": str(args.max_parallel_leases_per_node),
+        "CQPCFG_MAX_PARALLEL_LEASES_PER_NODE": str(effective_max_parallel_leases),
+        "CQPCFG_LEASE_TTL_SECONDS": str(args.lease_ttl_seconds),
+        "CQPCFG_LEASE_STRATEGY": args.lease_strategy,
+        "CQPCFG_TARGET_CHUNK_PROBABILITY_MASS": str(args.target_chunk_probability_mass),
+        "CQPCFG_RANK_WINDOW_SIZE": str(args.rank_window_size),
+        "CQPCFG_RANK_WINDOW_FRONTIER_MULTIPLIER": str(
+            args.rank_window_frontier_multiplier,
+        ),
+        "CQPCFG_TAIL_STEAL_MIN_GAP": str(args.tail_steal_min_gap),
+        "CQPCFG_TAIL_STEAL_PENDING_LIMIT_MULTIPLIER": str(args.tail_steal_pending_limit_multiplier),
+        "CQPCFG_TAIL_STEAL_SCORE_THRESHOLD": str(args.tail_steal_score_threshold),
         "CQPCFG_NODE_AFFINITY_BONUS": str(args.node_affinity_bonus),
         "CQPCFG_BATCH_SIZE": str(args.batch_size),
         "CQPCFG_MAX_BATCH_PAYLOAD_BYTES": str(args.max_batch_payload_bytes),
@@ -346,6 +471,9 @@ def run_node_agent_pipeline(
         "CQPCFG_ACK_RETRY_INTERVAL_SECONDS": str(args.ack_retry_interval_seconds),
         "CQPCFG_METRICS_PATH": str(tracker_metrics_path),
         "CQPCFG_METRICS_FLUSH_INTERVAL_SECONDS": str(args.metrics_flush_interval_seconds),
+        "CQPCFG_VALIDATE_SERIAL_DIGEST": (
+            "0" if args.fast_cracking_mode else "1"
+        ),
     }
     if args.model_serve_bind is not None:
         tracker_env.update(
@@ -358,8 +486,12 @@ def run_node_agent_pipeline(
         )
     if args.disable_reclaim:
         tracker_env["CQPCFG_DISABLE_RECLAIM"] = "1"
+    if args.disable_lazy_shard_activation:
+        tracker_env["CQPCFG_DISABLE_LAZY_SHARD_ACTIVATION"] = "1"
     if args.disable_node_affinity:
         tracker_env["CQPCFG_DISABLE_NODE_AFFINITY"] = "1"
+    if args.disable_tail_stealing:
+        tracker_env["CQPCFG_DISABLE_TAIL_STEALING"] = "1"
     sleep(0.2)
     tracker_process = subprocess.Popen(
         [python, str(scripts_dir / "services" / "tracker.py")],
@@ -392,25 +524,32 @@ def run_node_agent_pipeline(
 
         role_controller.set_stop(True)
         role_controller.poll(timeout_ms=50)
-        deadline = monotonic() + args.timeout_seconds
+        deadline = monotonic() + min(args.timeout_seconds, 5.0)
         while agents and monotonic() < deadline:
             role_controller.poll(timeout_ms=50)
             failures.extend(reap_finished())
             sleep(0.05)
-        if agents:
-            sleep(0.2)
         for agent in agents.values():
             if agent.process.poll() is None:
                 agent.process.terminate()
         for agent in agents.values():
-            code = agent.process.wait(timeout=2)
-            if code != 0:
-                failures.append((agent.process.args, code))
+            try:
+                agent.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                agent.process.kill()
+                agent.process.wait(timeout=2)
+        _cleanup_transient_candidate_blocks(
+            work_dir=work_dir,
+            tracker_metrics_path=tracker_metrics_path,
+        )
         if failures:
             for command, code in failures:
                 print(f"process failed with code {code}: {command}", file=sys.stderr)
             raise SystemExit(1)
-        verify_hash_hits(job_spec_path, tuple(all_output_paths))
+        if args.source_mode == "shard":
+            print("local rank-target hit verification skipped for unordered shard mode")
+        else:
+            verify_hash_hits(job_spec_path, tuple(all_output_paths))
         print_overhead_summary(
             tracker_metrics_path=tracker_metrics_path,
             node_metrics_paths=tuple(all_metrics_paths),
@@ -425,6 +564,29 @@ def run_node_agent_pipeline(
             if agent.process.poll() is None:
                 agent.process.terminate()
         role_controller.close()
+
+
+def _cleanup_transient_candidate_blocks(
+    *,
+    work_dir: Path,
+    tracker_metrics_path: Path,
+) -> None:
+    if not tracker_metrics_path.exists():
+        return
+    metrics = read_json(tracker_metrics_path)
+    if not metrics.get("final") or int(metrics.get("ack_pending_batches", 0)) != 0:
+        return
+    candidate_dir = work_dir / "candidate_blocks"
+    if not candidate_dir.exists():
+        return
+    for path in candidate_dir.iterdir():
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def maybe_rebalance_roles(
@@ -618,6 +780,8 @@ def print_overhead_summary(
     reclaimed_records = int(tracker.get("chunkstore_reclaimed_records", 0))
     affinity_hits = int(tracker.get("scheduler_affinity_hits", 0))
     affinity_misses = int(tracker.get("scheduler_affinity_misses", 0))
+    parallel_items = int(tracker.get("scheduler_parallel_items", 0))
+    tail_steals = int(tracker.get("scheduler_tail_steals", 0))
     source_cached_records = sum(int(item.get("source_cached_records", 0)) for item in node_metrics)
     source_peak_cached_records = sum(
         int(item.get("source_peak_cached_records", 0)) for item in node_metrics
@@ -645,6 +809,8 @@ def print_overhead_summary(
     print(f"  chunk reclaimed records : {reclaimed_records}")
     print(f"  affinity hits           : {affinity_hits}")
     print(f"  affinity misses         : {affinity_misses}")
+    print(f"  parallel scheduled items: {parallel_items}")
+    print(f"  tail steals             : {tail_steals}")
     print(f"  source cached records   : {source_cached_records}")
     print(f"  source peak cache       : {source_peak_cached_records}")
     print(f"  source reclaimed records: {source_reclaimed_records}")

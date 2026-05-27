@@ -10,6 +10,7 @@ from cqdagpcfg_parallel.protocol import (
     InMemoryChunkStore,
     LeaseDeniedError,
     LeaseTable,
+    LeaseStrategyName,
     NodeId,
     NodeRuntimeState,
     NodeStateTable,
@@ -18,7 +19,7 @@ from cqdagpcfg_parallel.protocol import (
     WorkerId,
     stable_digest,
 )
-from cqdagpcfg_parallel.simulation import simulate_sequence_protocol
+from cqdagpcfg_parallel.simulation import GlobalMerger, RootShard, simulate_sequence_protocol
 
 
 def _record(index: int, guess: str | None = None) -> GuessRecord:
@@ -237,6 +238,321 @@ def test_scheduler_penalizes_expensive_node() -> None:
     assert item.node_id == cheap
 
 
+def test_probability_mass_strategy_prefers_high_mass_node_over_larger_gap() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    low_mass = NodeId("wide-low-mass")
+    high_mass = NodeId("narrow-high-mass")
+    states.register_demand(low_mass, 100, priority=1.0)
+    states.register_demand(high_mass, 2, priority=1.0)
+    states.record_runtime_feedback(
+        low_mass,
+        chunk_latency_seconds=0.001,
+        records_requested=100,
+        records_produced=100,
+        ewma_alpha=1.0,
+        chunk_probability_mass=0.1,
+    )
+    states.record_runtime_feedback(
+        high_mass,
+        chunk_latency_seconds=0.001,
+        records_requested=2,
+        records_produced=2,
+        ewma_alpha=1.0,
+        chunk_probability_mass=0.8,
+    )
+
+    range_scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(fixed_chunk_size=2),
+    )
+    mass_scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            fixed_chunk_size=2,
+            lease_strategy=LeaseStrategyName.PROBABILITY_MASS,
+        ),
+    )
+
+    assert range_scheduler.schedule(WorkerId("range-worker")).node_id == low_mass
+    assert mass_scheduler.schedule(WorkerId("mass-worker")).node_id == high_mass
+
+
+def test_probability_mass_strategy_uses_mass_budget_for_chunk_size() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    node_id = NodeId("mass-budgeted")
+    states.register_demand(node_id, 100, priority=1.0)
+    states.record_runtime_feedback(
+        node_id,
+        chunk_latency_seconds=0.001,
+        records_requested=10,
+        records_produced=10,
+        ewma_alpha=1.0,
+        chunk_probability_mass=2.0,
+    )
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            fixed_chunk_size=32,
+            min_chunk_size=1,
+            max_chunk_size=64,
+            lease_strategy=LeaseStrategyName.PROBABILITY_MASS,
+            target_chunk_probability_mass=1.0,
+        ),
+    )
+
+    item = scheduler.schedule(WorkerId("worker"))
+
+    assert item is not None
+    assert item.size == 5
+    assert item.mass_budget == 1.0
+    assert item.estimated_mass == pytest.approx(1.0)
+
+
+def test_scheduler_applies_worker_specific_chunk_cap() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    node_id = NodeId("memory-capped")
+    states.register_demand(node_id, 100, priority=1.0)
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=64,
+            min_chunk_size=1,
+            max_chunk_size=64,
+        ),
+    )
+
+    item = scheduler.schedule(WorkerId("small-worker"), max_chunk_size=7)
+
+    assert item is not None
+    assert item.size == 7
+
+
+def test_merger_skips_missing_shard_when_upper_bound_cannot_beat_ready_head() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    high = RootShard(
+        node_id=NodeId("structure:0:high"),
+        chunk_store=store,
+        states=states,
+        priority=0.9,
+    )
+    low = RootShard(
+        node_id=NodeId("structure:1:low"),
+        chunk_store=store,
+        states=states,
+        priority=0.1,
+    )
+    store.publish(
+        EnumerationChunk.from_records(
+            node_id=high.node_id,
+            start=0,
+            records=[
+                GuessRecord(
+                    prob=0.5,
+                    guess="high",
+                    structure_index=0,
+                    structure_name="high",
+                    ranks=(0,),
+                ),
+            ],
+            worker_id=WorkerId("publisher"),
+            epoch=1,
+        ),
+    )
+
+    record = GlobalMerger((high, low)).next_ready()
+
+    assert record is not None
+    assert record.guess == "high"
+    assert low.cursor == 0
+    assert states.get(low.node_id).demand_gap == 0
+
+
+def test_merger_can_disable_lazy_shard_activation() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    high = RootShard(
+        node_id=NodeId("structure:0:high"),
+        chunk_store=store,
+        states=states,
+        priority=0.9,
+    )
+    low = RootShard(
+        node_id=NodeId("structure:1:low"),
+        chunk_store=store,
+        states=states,
+        priority=0.1,
+    )
+    store.publish(
+        EnumerationChunk.from_records(
+            node_id=high.node_id,
+            start=0,
+            records=[
+                GuessRecord(
+                    prob=0.5,
+                    guess="high",
+                    structure_index=0,
+                    structure_name="high",
+                    ranks=(0,),
+                ),
+            ],
+            worker_id=WorkerId("publisher"),
+            epoch=1,
+        ),
+    )
+
+    record = GlobalMerger((high, low), lazy_shard_activation=False).next_ready()
+
+    assert record is None
+    assert high.cursor == 0
+    assert states.get(low.node_id).demand_gap == 1
+
+
+def test_merger_blocks_missing_shard_when_upper_bound_can_beat_ready_head() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    ready = RootShard(
+        node_id=NodeId("structure:0:ready"),
+        chunk_store=store,
+        states=states,
+        priority=0.5,
+    )
+    missing = RootShard(
+        node_id=NodeId("structure:1:missing"),
+        chunk_store=store,
+        states=states,
+        priority=0.9,
+    )
+    store.publish(
+        EnumerationChunk.from_records(
+            node_id=ready.node_id,
+            start=0,
+            records=[
+                GuessRecord(
+                    prob=0.5,
+                    guess="ready",
+                    structure_index=0,
+                    structure_name="ready",
+                    ranks=(0,),
+                ),
+            ],
+            worker_id=WorkerId("publisher"),
+            epoch=1,
+        ),
+    )
+
+    record = GlobalMerger((ready, missing)).next_ready()
+
+    assert record is None
+    assert ready.cursor == 0
+    assert states.get(missing.node_id).demand_gap == 1
+
+
+def test_rank_window_strategy_caps_scheduled_frontier_records() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    node_id = NodeId("windowed")
+    states.register_demand(node_id, 100, priority=1.0)
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=16,
+            lease_strategy=LeaseStrategyName.RANK_WINDOW_PROBABILITY_MASS,
+            rank_window_size=4,
+        ),
+    )
+
+    item = scheduler.schedule(WorkerId("worker"))
+
+    assert item is not None
+    assert item.size == 4
+    assert scheduler.stats.rank_window_peak_outstanding_records == 4
+
+
+def test_rank_window_strategy_forces_blocking_head_when_window_is_full() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    warm = NodeId("warm")
+    blocked = NodeId("blocked")
+    store.publish(
+        EnumerationChunk.from_records(
+            node_id=warm,
+            start=0,
+            records=[_record(index) for index in range(4)],
+            worker_id=WorkerId("publisher"),
+            epoch=1,
+        ),
+    )
+    states.update_ready_end(warm, 4)
+    states.register_demand(blocked, 10, priority=10.0)
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=16,
+            lease_strategy=LeaseStrategyName.RANK_WINDOW_PROBABILITY_MASS,
+            rank_window_size=4,
+        ),
+    )
+
+    item = scheduler.schedule(WorkerId("worker"))
+
+    assert item is not None
+    assert item.node_id == blocked
+    assert item.size == 1
+    assert scheduler.stats.rank_window_forced_items == 1
+
+
+def test_rank_window_strategy_waits_for_nonblocking_prefetch_when_window_is_full() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    node_id = NodeId("prefetch")
+    store.publish(
+        EnumerationChunk.from_records(
+            node_id=node_id,
+            start=0,
+            records=[_record(index) for index in range(4)],
+            worker_id=WorkerId("publisher"),
+            epoch=1,
+        ),
+    )
+    states.update_ready_end(node_id, 4)
+    states.register_demand(node_id, 10, priority=1.0)
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=LeaseTable(),
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=16,
+            lease_strategy=LeaseStrategyName.RANK_WINDOW_PROBABILITY_MASS,
+            rank_window_size=4,
+        ),
+    )
+
+    item = scheduler.schedule(WorkerId("worker"))
+
+    assert item is None
+    assert scheduler.stats.rank_window_waits == 1
+
+
 def test_scheduler_node_affinity_prefers_warm_worker_when_scores_are_close() -> None:
     store = InMemoryChunkStore()
     states = NodeStateTable()
@@ -431,6 +747,81 @@ def test_scheduler_splits_hot_node_into_concurrent_ranges() -> None:
     assert (first.start, first.end) == (0, 4)
     assert (second.start, second.end) == (4, 12)
     assert scheduler.stats.parallel_items == 1
+    assert scheduler.stats.tail_steal_attempts == 1
+    assert scheduler.stats.tail_steals == 1
+
+
+def test_scheduler_denies_tail_steal_when_pending_tail_is_too_large() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    leases = LeaseTable()
+    node_id = NodeId("hot")
+    states.register_demand(node_id, 100)
+
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=leases,
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=10,
+            max_chunk_size=10,
+            max_parallel_leases_per_node=2,
+            tail_steal_pending_limit_multiplier=0.5,
+        ),
+    )
+
+    first = scheduler.schedule(WorkerId("worker-a"))
+    states.record_runtime_feedback(
+        node_id,
+        chunk_latency_seconds=0.001,
+        records_requested=10,
+        records_produced=10,
+        ewma_alpha=1.0,
+    )
+    second = scheduler.schedule(WorkerId("worker-b"))
+
+    assert first is not None
+    assert second is None
+    assert scheduler.stats.tail_steal_attempts == 1
+    assert scheduler.stats.tail_steal_denials == 1
+    assert scheduler.stats.tail_steals == 0
+
+
+def test_scheduler_denies_tail_steal_below_score_threshold() -> None:
+    store = InMemoryChunkStore()
+    states = NodeStateTable()
+    leases = LeaseTable()
+    node_id = NodeId("low-benefit")
+    states.register_demand(node_id, 20, estimated_cost=100.0)
+
+    scheduler = PriorityCostScheduler(
+        states=states,
+        chunk_store=store,
+        leases=leases,
+        config=SchedulerConfig(
+            policy=ChunkSizePolicy.FIXED,
+            fixed_chunk_size=4,
+            max_parallel_leases_per_node=2,
+            tail_steal_score_threshold=10.0,
+        ),
+    )
+
+    first = scheduler.schedule(WorkerId("worker-a"))
+    states.record_runtime_feedback(
+        node_id,
+        chunk_latency_seconds=0.001,
+        records_requested=4,
+        records_produced=4,
+        ewma_alpha=1.0,
+        chunk_probability_mass=0.001,
+    )
+    second = scheduler.schedule(WorkerId("worker-b"))
+
+    assert first is not None
+    assert second is None
+    assert scheduler.stats.tail_steal_attempts == 1
+    assert scheduler.stats.tail_steal_denials == 1
 
 
 def test_scheduler_applies_dependency_priority_donation() -> None:

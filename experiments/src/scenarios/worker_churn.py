@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-slot-page-size", type=int, default=1024)
     parser.add_argument("--model-structure-page-size", type=int, default=4096)
     parser.add_argument("--model-json-page-cache", type=int, default=128)
-    parser.add_argument("--source-mode", choices=("root", "structure"), default="root")
+    parser.add_argument("--source-mode", choices=("root", "structure", "shard"), default="root")
     parser.add_argument("--demand-window", type=int, default=64)
     parser.add_argument("--max-chunk-size", type=int, default=256)
     parser.add_argument("--max-parallel-leases-per-node", type=int, default=2)

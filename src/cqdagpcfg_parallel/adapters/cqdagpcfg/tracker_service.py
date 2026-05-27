@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 from CQDAGPCFG import load_model
 
 from cqdagpcfg_parallel.distributed import (
+    BatchMemoryLimits,
     DistributedProtocolConfig,
     DistributedProtocolTracker,
     JobContext,
@@ -20,13 +21,23 @@ from cqdagpcfg_parallel.distributed import (
     RoleAllocationInput,
     RoleResourcePolicy,
     WorkerResourceSpec,
+    memory_limited_batch_limits,
     parse_byte_size,
+)
+from cqdagpcfg_parallel.distributed.memory_policy import (
+    DEFAULT_STREAMING_ARTIFACT_RECORD_BYTES,
 )
 from cqdagpcfg_parallel.framework_logging import (
     configure_framework_logging,
     log_event,
 )
-from cqdagpcfg_parallel.protocol import NodeSchedulingFeatures, SchedulerConfig
+from cqdagpcfg_parallel.protocol import (
+    ChunkSizePolicy,
+    LeaseStrategyName,
+    NodeSchedulingFeatures,
+    SchedulerConfig,
+    StableStreamFingerprint,
+)
 from cqdagpcfg_parallel.storage import (
     CompactDistributedTrackerCheckpointWriter,
     DistributedTrackerCheckpoint,
@@ -44,12 +55,17 @@ from cqdagpcfg_parallel.runtime.zmq_transport import (
     ZmqPushBatchSink,
 )
 
-from .block_graph import CQDAGBlockGraphAdapter
+from .block_graph import CQDAGBlockGraphAdapter, ROOT_NODE_ID, BlockNodeDescriptor
 from .job_spec import CQDAGJobSpec
 from .tracker_publisher import BatchRetryPayload, StreamingRecordBatchPublisher
 
 
 LOGGER = logging.getLogger("cqdagpcfg.tracker")
+
+DEFAULT_SAFE_RECORD_CHUNK_SIZE = 8192
+DEFAULT_ROOT_ARTIFACT_TARGET_BYTES = 128 * 1024 * 1024
+DEFAULT_CRACKING_ROOT_ARTIFACT_TARGET_BYTES = 128 * 1024 * 1024
+DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH = 4
 
 
 @dataclass(slots=True)
@@ -105,14 +121,30 @@ class CqdagTrackerServiceConfig:
     resume_batch_checkpoint_path: Path | None = None
     source_mode: str = "root"
     demand_window: int = 8
-    max_chunk_size: int = 32
+    max_chunk_size: int = DEFAULT_SAFE_RECORD_CHUNK_SIZE
     max_parallel_leases_per_node: int = 2
+    lease_ttl_seconds: float = 30.0
+    lease_strategy: str = "rank_window_probability_mass"
+    target_chunk_probability_mass: float = 0.01
+    rank_window_size: int = 65536
+    rank_window_frontier_multiplier: float = 4.0
+    tail_steal_min_gap: int = 1
+    tail_steal_pending_limit_multiplier: float = 2.0
+    tail_steal_score_threshold: float = 0.0
+    disable_tail_stealing: bool = False
     disable_node_affinity: bool = False
     node_affinity_bonus: float = 0.5
-    batch_size: int = 16
-    max_batch_payload_bytes: int = 4096
+    batch_size: int = 65536
+    max_batch_payload_bytes: int = 1 << 20
+    optimization_profile: str = "balanced"
+    root_artifact_target_bytes: int = DEFAULT_ROOT_ARTIFACT_TARGET_BYTES
+    candidate_block_dir: Path | None = None
+    candidate_block_base_uri: str | None = None
+    delete_candidate_blocks_on_ack: bool = True
     timeout_seconds: float = 3600.0
     disable_reclaim: bool = False
+    disable_lazy_shard_activation: bool = False
+    validate_serial_digest: bool = True
 
     def __post_init__(self) -> None:
         if self.consumer_count is not None and self.consumer_count <= 0:
@@ -139,6 +171,10 @@ class CqdagTrackerServiceConfig:
             raise ValueError("model_slot_page_size must be positive")
         if self.model_structure_page_size <= 0:
             raise ValueError("model_structure_page_size must be positive")
+        if self.optimization_profile not in {"balanced", "cracking"}:
+            raise ValueError("optimization_profile must be balanced or cracking")
+        if self.root_artifact_target_bytes <= 0:
+            raise ValueError("root_artifact_target_bytes must be positive")
         if self.late_worker_role not in {"generator", "consumer", "idle"}:
             raise ValueError("late_worker_role must be generator, consumer, or idle")
         if self.role_heartbeat_timeout_seconds <= 0.0:
@@ -147,8 +183,25 @@ class CqdagTrackerServiceConfig:
             raise ValueError("role_rebalance_interval_seconds must be positive")
         if self.role_switch_min_improvement < 0.0:
             raise ValueError("role_switch_min_improvement cannot be negative")
-        if self.source_mode not in {"root", "structure"}:
-            raise ValueError("source_mode must be root or structure")
+        if self.source_mode not in {"root", "structure", "shard"}:
+            raise ValueError("source_mode must be root, structure, or shard")
+        if self.lease_ttl_seconds <= 0.0:
+            raise ValueError("lease_ttl_seconds must be positive")
+        LeaseStrategyName(self.lease_strategy)
+        if self.target_chunk_probability_mass < 0.0:
+            raise ValueError("target_chunk_probability_mass cannot be negative")
+        if self.rank_window_size < 0:
+            raise ValueError("rank_window_size cannot be negative")
+        if self.rank_window_frontier_multiplier < 0.0:
+            raise ValueError("rank_window_frontier_multiplier cannot be negative")
+        if self.tail_steal_min_gap <= 0:
+            raise ValueError("tail_steal_min_gap must be positive")
+        if self.tail_steal_pending_limit_multiplier < 0.0:
+            raise ValueError("tail_steal_pending_limit_multiplier cannot be negative")
+        if self.tail_steal_score_threshold < 0.0:
+            raise ValueError("tail_steal_score_threshold cannot be negative")
+        if self.candidate_block_base_uri is not None and self.candidate_block_dir is None:
+            raise ValueError("candidate_block_base_uri requires candidate_block_dir")
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +231,9 @@ class CQDAGPCFGTrackerSummary:
     consumer_count: int
     digest: str
     serial_digest: str
+    digest_validation_enabled: bool
+    stable_fingerprint: str
+    serial_stream_fingerprint: str | None
     emitted_records: int
     collected_outputs: int
     resident_records: int
@@ -190,9 +246,67 @@ class CQDAGPCFGTrackerSummary:
 
 
 def effective_max_parallel_leases_per_node(args: CqdagTrackerServiceConfig) -> int:
-    if args.source_mode == "root":
-        return 1
     return args.max_parallel_leases_per_node
+
+
+def _direct_artifact_chunk_size(
+    args: CqdagTrackerServiceConfig,
+    *,
+    limit: int,
+    generator_slots: int,
+) -> int:
+    if args.source_mode not in {"root", "shard"}:
+        return 0
+    if limit <= 0:
+        return 0
+    memory_limited_records = max(
+        args.max_chunk_size,
+        args.root_artifact_target_bytes
+        // DEFAULT_STREAMING_ARTIFACT_RECORD_BYTES,
+    )
+    if args.source_mode == "root":
+        return min(limit, memory_limited_records)
+
+    parallel_slots = max(1, generator_slots) * max(
+        1,
+        args.max_parallel_leases_per_node,
+    )
+    pipeline_slots = max(
+        parallel_slots,
+        parallel_slots * DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH,
+    )
+    parallel_limited_records = max(
+        args.max_chunk_size,
+        (limit + pipeline_slots - 1) // pipeline_slots,
+    )
+    return min(memory_limited_records, parallel_limited_records)
+
+
+def _apply_tracker_optimization_profile(args: CqdagTrackerServiceConfig) -> None:
+    if args.optimization_profile != "cracking":
+        return
+    args.validate_serial_digest = False
+    args.disable_reclaim = False
+    if args.root_artifact_target_bytes == DEFAULT_ROOT_ARTIFACT_TARGET_BYTES:
+        args.root_artifact_target_bytes = DEFAULT_CRACKING_ROOT_ARTIFACT_TARGET_BYTES
+
+
+def _effective_lease_strategy(args: CqdagTrackerServiceConfig) -> LeaseStrategyName:
+    if args.source_mode in {"root", "shard"}:
+        return LeaseStrategyName.RANGE
+    return LeaseStrategyName(args.lease_strategy)
+
+
+def _effective_chunk_policy(args: CqdagTrackerServiceConfig) -> ChunkSizePolicy:
+    if args.source_mode in {"root", "shard"}:
+        return ChunkSizePolicy.FIXED
+    return ChunkSizePolicy.CQDAG_ADAPTIVE
+
+
+def _effective_rank_window_size(args: CqdagTrackerServiceConfig) -> int:
+    if args.source_mode in {"root", "shard"}:
+        return 0
+    return args.rank_window_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,12 +486,28 @@ def _tracker_config_values_from_env(prefix: str) -> dict[str, Any]:
         "demand_window": _env_int,
         "max_chunk_size": _env_int,
         "max_parallel_leases_per_node": _env_int,
+        "lease_ttl_seconds": _env_float,
+        "lease_strategy": _env_str,
+        "target_chunk_probability_mass": _env_float,
+        "rank_window_size": _env_int,
+        "rank_window_frontier_multiplier": _env_float,
+        "tail_steal_min_gap": _env_int,
+        "tail_steal_pending_limit_multiplier": _env_float,
+        "tail_steal_score_threshold": _env_float,
+        "disable_tail_stealing": _env_bool,
         "disable_node_affinity": _env_bool,
         "node_affinity_bonus": _env_float,
         "batch_size": _env_int,
         "max_batch_payload_bytes": _env_int,
+        "optimization_profile": _env_str,
+        "root_artifact_target_bytes": _env_int,
+        "candidate_block_dir": _env_path,
+        "candidate_block_base_uri": _env_str,
+        "delete_candidate_blocks_on_ack": _env_bool,
         "timeout_seconds": _env_float,
         "disable_reclaim": _env_bool,
+        "disable_lazy_shard_activation": _env_bool,
+        "validate_serial_digest": _env_bool,
     }
     for field_name, reader in readers.items():
         env_name = f"{normalized_prefix}_{field_name.upper()}"
@@ -425,6 +555,7 @@ def _run_cqdag_tracker_service(
     configure_framework_logging()
     args = replace(config)
     apply_endpoint_bundle(args)
+    _apply_tracker_optimization_profile(args)
     tracker_hooks = _instantiate_tracker_hooks(tracker_class, args)
     job_spec_path = args.job_spec_path
     try:
@@ -506,16 +637,23 @@ def _run_cqdag_tracker_service(
             model_fingerprint=model_fingerprint,
         ),
     )
-    model_server = start_model_artifact_server(args)
-    role_controller = start_role_controller(args, job_payload, tracker_hooks=tracker_hooks)
-    model = load_model(args.model_path)
-    adapter = CQDAGBlockGraphAdapter(model)
-    if args.source_mode == "structure":
+    if args.source_mode in {"structure", "shard"}:
+        model = load_model(args.model_path)
+        adapter = CQDAGBlockGraphAdapter(model)
         protocol_nodes = adapter.structure_nodes()
         node_ids = tuple(node.node_id for node in protocol_nodes)
         node_features = adapter.scheduling_features()
     else:
-        root_node = adapter.root_node
+        root_node = BlockNodeDescriptor(
+            node_id=ROOT_NODE_ID,
+            name="root",
+            entropy=0.0,
+            slot_dispersion=0.0,
+            priority=1.0,
+            estimated_cost=1.0,
+            base_prob=1.0,
+            cardinality=max(limit, 1),
+        )
         protocol_nodes = (root_node,)
         node_ids = (root_node.node_id,)
         node_features = (
@@ -524,36 +662,115 @@ def _run_cqdag_tracker_service(
                 entropy=root_node.slot_dispersion,
                 priority=root_node.priority,
                 estimated_cost=root_node.estimated_cost,
+                cardinality=root_node.cardinality,
             ),
         )
+        adapter = None
+    model_server = start_model_artifact_server(args)
+    role_controller = start_role_controller(args, job_payload, tracker_hooks=tracker_hooks)
+    generator_slots = expected_generator_slots(args, role_controller)
+    root_artifact_chunk_size = _direct_artifact_chunk_size(
+        args,
+        limit=limit,
+        generator_slots=generator_slots,
+    )
     max_parallel_leases_per_node = effective_max_parallel_leases_per_node(args)
+    effective_max_chunk_size = max(args.max_chunk_size, root_artifact_chunk_size)
+    root_parallel_window = (
+        min(limit, root_artifact_chunk_size * max_parallel_leases_per_node)
+        if root_artifact_chunk_size > 0
+        else 0
+    )
+    effective_demand_window = max(
+        args.demand_window,
+        args.batch_size,
+        root_parallel_window,
+    )
+    effective_lease_strategy = _effective_lease_strategy(args)
+    effective_chunk_policy = _effective_chunk_policy(args)
+    effective_rank_window_size = _effective_rank_window_size(args)
+    effective_tail_steal_pending_limit_multiplier = (
+        max(args.tail_steal_pending_limit_multiplier, float(max_parallel_leases_per_node))
+        if args.source_mode == "root"
+        else args.tail_steal_pending_limit_multiplier
+    )
+    effective_fixed_chunk_size = (
+        effective_max_chunk_size
+        if effective_chunk_policy == ChunkSizePolicy.FIXED
+        else 8
+    )
     log_event(
         LOGGER,
         logging.INFO,
         "tracker.protocol_ready",
         protocol_nodes=len(protocol_nodes),
         source_mode=args.source_mode,
-        demand_window=args.demand_window,
-        max_chunk_size=args.max_chunk_size,
+        optimization_profile=args.optimization_profile,
+        demand_window=effective_demand_window,
+        configured_demand_window=args.demand_window,
+        max_chunk_size=effective_max_chunk_size,
+        safe_record_chunk_size=args.max_chunk_size,
+        root_artifact_chunk_size=root_artifact_chunk_size,
+        root_artifact_target_bytes=args.root_artifact_target_bytes,
+        root_parallel_window=root_parallel_window,
+        generator_slots=generator_slots,
+        shard_parallel_pipeline_depth=DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH,
         max_parallel_leases_per_node=max_parallel_leases_per_node,
         requested_max_parallel_leases_per_node=args.max_parallel_leases_per_node,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        lease_strategy=effective_lease_strategy.value,
+        configured_lease_strategy=args.lease_strategy,
+        chunk_policy=effective_chunk_policy.value,
+        target_chunk_probability_mass=args.target_chunk_probability_mass,
+        rank_window_size=effective_rank_window_size,
+        configured_rank_window_size=args.rank_window_size,
+        rank_window_frontier_multiplier=args.rank_window_frontier_multiplier,
+        tail_stealing_enabled=not args.disable_tail_stealing,
+        tail_steal_min_gap=args.tail_steal_min_gap,
+        tail_steal_pending_limit_multiplier=effective_tail_steal_pending_limit_multiplier,
+        configured_tail_steal_pending_limit_multiplier=(
+            args.tail_steal_pending_limit_multiplier
+        ),
+        tail_steal_score_threshold=args.tail_steal_score_threshold,
         node_affinity_enabled=not args.disable_node_affinity,
         reclaim_enabled=not args.disable_reclaim,
+        lazy_shard_activation_enabled=not args.disable_lazy_shard_activation,
     )
 
     config = DistributedProtocolConfig(
         scheduler=SchedulerConfig(
-            max_chunk_size=args.max_chunk_size,
+            policy=effective_chunk_policy,
+            fixed_chunk_size=effective_fixed_chunk_size,
+            max_chunk_size=effective_max_chunk_size,
             max_parallel_leases_per_node=max_parallel_leases_per_node,
+            lease_strategy=effective_lease_strategy,
+            target_chunk_probability_mass=args.target_chunk_probability_mass,
+            rank_window_size=effective_rank_window_size,
+            rank_window_frontier_multiplier=args.rank_window_frontier_multiplier,
+            tail_stealing_enabled=not args.disable_tail_stealing,
+            tail_steal_min_gap=args.tail_steal_min_gap,
+            tail_steal_pending_limit_multiplier=(
+                effective_tail_steal_pending_limit_multiplier
+            ),
+            tail_steal_score_threshold=args.tail_steal_score_threshold,
             node_affinity_enabled=not args.disable_node_affinity,
             node_affinity_bonus=args.node_affinity_bonus,
         ),
         node_ids=node_ids,
         node_features=node_features,
-        demand_window=args.demand_window,
-        record_order_key=adapter.serial_order_key,
+        demand_window=effective_demand_window,
+        record_order_key=(
+            adapter.serial_order_key
+            if adapter is not None and args.source_mode == "structure"
+            else None
+        ),
         reclaim_emitted_chunks=not args.disable_reclaim,
         model_fingerprint=model_fingerprint,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        lazy_shard_activation=not args.disable_lazy_shard_activation,
+        direct_unordered_chunk_emission=args.source_mode == "shard",
+        track_output_digest=args.validate_serial_digest and args.source_mode != "shard",
+        safe_record_chunk_size=args.max_chunk_size,
     )
     tracker = DistributedProtocolTracker(
         endpoint=ZmqEndpoint.from_uri(args.control_bind, bind=True),
@@ -606,6 +823,10 @@ def _run_cqdag_tracker_service(
                     "on_candidate_batch",
                     batch,
                 ),
+                batch_limits_provider=lambda: _active_consumer_batch_limits(
+                    args,
+                    role_controller,
+                ),
                 ack_retry_interval_seconds=args.ack_retry_interval_seconds,
                 batch_retry_callback=lambda payload: _call_tracker_hook(
                     tracker_hooks,
@@ -619,6 +840,9 @@ def _run_cqdag_tracker_service(
                 initial_batch_id=0 if resume_checkpoint is None else resume_checkpoint.emitted_count,
                 batch_checkpoint_path=args.batch_checkpoint_path,
                 resume_batch_checkpoint=resume_batch_checkpoint,
+                candidate_block_dir=args.candidate_block_dir,
+                candidate_block_base_uri=args.candidate_block_base_uri,
+                delete_candidate_blocks_on_ack=args.delete_candidate_blocks_on_ack,
             )
             if role_controller is not None:
                 role_controller["metrics_callback"][0] = lambda: publisher.write_metrics(
@@ -633,6 +857,7 @@ def _run_cqdag_tracker_service(
                 )
                 publisher.write_metrics(final=False, force=True)
             publisher.republish_pending()
+            publisher.start_background_ack_drain()
 
             def checkpoint_callback(checkpoint: DistributedTrackerCheckpoint) -> None:
                 if checkpoint_writer is None:
@@ -660,26 +885,43 @@ def _run_cqdag_tracker_service(
                 )
 
             started_at = monotonic()
-            result = tracker.run(
-                limit=limit,
-                expected_workers=expected_workers,
-                timeout_seconds=args.timeout_seconds,
-                shutdown_grace_seconds=args.shutdown_grace_seconds,
-                output_callback=publisher.publish,
-                collect_outputs=False,
-                resume_checkpoint=resume_checkpoint,
-                checkpoint_callback=checkpoint_callback if checkpoint_writer is not None else None,
-                checkpoint_interval_records=args.checkpoint_interval_records,
-            )
+            try:
+                result = tracker.run(
+                    limit=limit,
+                    expected_workers=expected_workers,
+                    timeout_seconds=args.timeout_seconds,
+                    shutdown_grace_seconds=args.shutdown_grace_seconds,
+                    output_callback=publisher.publish,
+                    output_records_callback=publisher.publish_many,
+                    output_artifact_callback=publisher.publish_artifact,
+                    schedule_backpressure_callback=publisher.artifact_backpressure_active,
+                    collect_outputs=False,
+                    resume_checkpoint=resume_checkpoint,
+                    checkpoint_callback=checkpoint_callback if checkpoint_writer is not None else None,
+                    checkpoint_interval_records=args.checkpoint_interval_records,
+                )
+            finally:
+                publisher.stop_background_ack_drain()
             elapsed = monotonic() - started_at
 
-            if result.digest != job_spec.serial_digest:
+            if (
+                args.validate_serial_digest
+                and args.source_mode != "shard"
+                and not _result_matches_oracle(
+                result,
+                job_spec,
+                )
+            ):
                 log_event(
                     LOGGER,
                     logging.ERROR,
                     "tracker.digest_mismatch",
                     digest=result.digest,
                     serial_digest=job_spec.serial_digest,
+                    stable_fingerprint=result.stable_fingerprint,
+                    serial_stream_fingerprint=job_spec.payload.get(
+                        "serial_stream_fingerprint",
+                    ),
                     emitted_records=result.emitted_count,
                 )
                 _call_tracker_hook(
@@ -711,6 +953,13 @@ def _run_cqdag_tracker_service(
             consumer_count = end_of_stream_consumer_count(args, role_controller)
             sink.publish_end_of_stream(consumer_count)
             publisher.write_metrics(final=True)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "tracker.probability_mass_progress",
+                **publisher.progress_metrics(),
+                **publisher.protocol_metrics,
+            )
             log_event(
                 LOGGER,
                 logging.INFO,
@@ -765,6 +1014,13 @@ def _run_cqdag_tracker_service(
         consumer_count=consumer_count,
         digest=result.digest,
         serial_digest=job_spec.serial_digest,
+        digest_validation_enabled=args.validate_serial_digest,
+        stable_fingerprint=result.stable_fingerprint,
+        serial_stream_fingerprint=(
+            None
+            if job_spec.payload.get("serial_stream_fingerprint") is None
+            else str(job_spec.payload["serial_stream_fingerprint"])
+        ),
         emitted_records=result.emitted_count,
         collected_outputs=len(publisher.consumer_outputs),
         resident_records=result.stats.resident_records,
@@ -818,6 +1074,24 @@ def _call_tracker_hook(instance, name: str, payload: object) -> None:
     raise TypeError(f"tracker hook {name} must accept zero or one argument")
 
 
+def _result_matches_oracle(result, job_spec: CQDAGJobSpec) -> bool:
+    if result.digest == job_spec.serial_digest:
+        return True
+    expected_fingerprint = job_spec.payload.get("serial_stream_fingerprint")
+    if expected_fingerprint is None:
+        return False
+    return _fingerprints_equal(result.stable_fingerprint, str(expected_fingerprint))
+
+
+def _fingerprints_equal(left: str, right: str) -> bool:
+    try:
+        return StableStreamFingerprint.from_string(left) == StableStreamFingerprint.from_string(
+            right,
+        )
+    except ValueError:
+        return False
+
+
 def _tracker_metrics_snapshot(instance) -> Mapping[str, object]:
     if instance is None:
         return {}
@@ -858,7 +1132,20 @@ def _print_tracker_summary(summary: CQDAGPCFGTrackerSummary) -> None:
         expected_workers=summary.expected_workers,
         consumer_count=summary.consumer_count,
         digest=summary.digest,
-        digest_match=summary.digest == summary.serial_digest,
+        digest_validation_enabled=summary.digest_validation_enabled,
+        digest_match=(
+            summary.digest == summary.serial_digest
+            or (
+                summary.serial_stream_fingerprint is not None
+                and _fingerprints_equal(
+                    summary.stable_fingerprint,
+                    summary.serial_stream_fingerprint,
+                )
+            )
+            if summary.digest_validation_enabled
+            else None
+        ),
+        stable_fingerprint=summary.stable_fingerprint,
         emitted_records=summary.emitted_records,
         collected_outputs=summary.collected_outputs,
         resident_records=summary.resident_records,
@@ -958,6 +1245,7 @@ def start_role_controller(
     )
     job_context = None
     if args.model_serve_bind is not None or args.public_model_connect is not None:
+        effective_demand_window = max(args.demand_window, args.batch_size)
         job_context = JobContext.from_job_payload(
             job_payload,
             job_id=args.model_id,
@@ -971,7 +1259,7 @@ def start_role_controller(
             ack_connect=args.public_ack_connect
             or advertised_connect_uri(args.ack_bind, args.advertise_host),
             source_mode=args.source_mode,
-            demand_window=args.demand_window,
+            demand_window=effective_demand_window,
         )
     controller = RoleController(
         endpoint=ZmqEndpoint.from_uri(args.role_bind, bind=True, linger_ms=0),
@@ -1228,6 +1516,45 @@ def _status_resources(status: object) -> WorkerResourceSpec:
     return WorkerResourceSpec.from_dict(resources)
 
 
+def _active_consumer_batch_limits(
+    args: CqdagTrackerServiceConfig,
+    role_controller,
+) -> BatchMemoryLimits:
+    resources = _active_consumer_resources(args, role_controller)
+    return memory_limited_batch_limits(
+        resources,
+        configured_batch_size=args.batch_size,
+        configured_max_payload_bytes=args.max_batch_payload_bytes,
+    )
+
+
+def _active_consumer_resources(
+    args: CqdagTrackerServiceConfig,
+    role_controller,
+) -> tuple[WorkerResourceSpec, ...]:
+    if role_controller is None:
+        fallback = parse_byte_size(args.consumer_min_memory)
+        return (
+            (WorkerResourceSpec(memory_bytes=fallback),)
+            if fallback is not None
+            else ()
+        )
+    controller = role_controller["controller"]
+    active: list[WorkerResourceSpec] = []
+    for node_id, status in controller.status_by_node.items():
+        resources = _status_resources(status)
+        if _effective_role(controller, node_id, resources) == "consumer":
+            active.append(resources)
+    if active:
+        return tuple(active)
+    fallback = parse_byte_size(args.consumer_min_memory)
+    return (
+        (WorkerResourceSpec(memory_bytes=fallback),)
+        if fallback is not None
+        else ()
+    )
+
+
 def resolve_initial_role_counts(args: CqdagTrackerServiceConfig) -> tuple[int, int]:
     consumer_count = (
         args.initial_consumers
@@ -1269,6 +1596,13 @@ def effective_expected_workers(args: CqdagTrackerServiceConfig, role_controller)
     if role_controller is None or args.total_nodes is None:
         return None
     return int(role_controller["generator_count"])
+
+
+def expected_generator_slots(args: CqdagTrackerServiceConfig, role_controller) -> int:
+    if role_controller is not None:
+        return max(1, int(role_controller["generator_count"]))
+    generator_count, _ = resolve_initial_role_counts(args)
+    return max(1, generator_count)
 
 
 def role_controller_metrics(role_controller) -> dict[str, int]:
@@ -1624,10 +1958,14 @@ def apply_endpoint_bundle(args: CqdagTrackerServiceConfig) -> None:
     args.role_bind = bind_bundle.role
     args.ack_bind = bind_bundle.ack
     args.model_serve_bind = bind_bundle.model
-    args.public_control_connect = public_bundle.control
-    args.public_batch_connect = public_bundle.batch
-    args.public_ack_connect = public_bundle.ack
-    args.public_model_connect = public_bundle.model
+    if args.public_control_connect is None:
+        args.public_control_connect = public_bundle.control
+    if args.public_batch_connect is None:
+        args.public_batch_connect = public_bundle.batch
+    if args.public_ack_connect is None:
+        args.public_ack_connect = public_bundle.ack
+    if args.public_model_connect is None:
+        args.public_model_connect = public_bundle.model
 
 
 __all__ = [

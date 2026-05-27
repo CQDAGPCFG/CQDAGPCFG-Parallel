@@ -66,7 +66,7 @@ class BoundedCandidateQueue:
             )
 
     def put(self, batch: CandidateBatch) -> None:
-        if len(batch.records) > self.max_pending_candidates:
+        if batch.record_count > self.max_pending_candidates:
             raise ValueError("single batch exceeds max_pending_candidates")
         if batch.payload_bytes > self.max_pending_payload_bytes:
             raise ValueError("single batch exceeds max_pending_payload_bytes")
@@ -80,7 +80,7 @@ class BoundedCandidateQueue:
 
             self._items.append(batch)
             self._watermark.pending_batches += 1
-            self._watermark.pending_candidates += len(batch.records)
+            self._watermark.pending_candidates += batch.record_count
             self._watermark.pending_payload_bytes += batch.payload_bytes
             self._record_peak_locked()
             self._condition.notify_all()
@@ -94,7 +94,7 @@ class BoundedCandidateQueue:
 
             batch = self._items.popleft()
             self._watermark.pending_batches -= 1
-            self._watermark.pending_candidates -= len(batch.records)
+            self._watermark.pending_candidates -= batch.record_count
             self._watermark.pending_payload_bytes -= batch.payload_bytes
             self._condition.notify_all()
             return batch
@@ -107,7 +107,7 @@ class BoundedCandidateQueue:
     def _can_accept(self, batch: CandidateBatch) -> bool:
         return (
             self._watermark.pending_batches + 1 <= self.max_pending_batches
-            and self._watermark.pending_candidates + len(batch.records)
+            and self._watermark.pending_candidates + batch.record_count
             <= self.max_pending_candidates
             and self._watermark.pending_payload_bytes + batch.payload_bytes
             <= self.max_pending_payload_bytes

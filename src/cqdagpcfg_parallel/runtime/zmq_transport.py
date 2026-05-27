@@ -94,6 +94,56 @@ class ZmqEndpoint:
         raise ValueError(f"unsupported endpoint URI scheme: {parsed.scheme}")
 
 
+def configure_zmq_socket(
+    socket: Any,
+    endpoint: ZmqEndpoint,
+    *,
+    zmq_module: Any | None = None,
+    identity: bytes | None = None,
+    send: bool = False,
+    recv: bool = False,
+    connect: bool = False,
+) -> None:
+    """Apply CQPCFG transport defaults to a ZeroMQ socket.
+
+    The protocol often runs over Docker bridges, SSH tunnels, and WAN links.
+    Plain ZeroMQ defaults are fine on localhost, but they are too optimistic for
+    those paths: they do not enable TCP keepalive and connecting sockets may
+    queue before a usable pipe exists. These options keep local behavior intact
+    while making control, batch, and ack channels less fragile off-host.
+    """
+
+    zmq = _require_zmq() if zmq_module is None else zmq_module
+    if identity is not None:
+        socket.setsockopt(zmq.IDENTITY, identity)
+    if send:
+        socket.setsockopt(zmq.SNDHWM, endpoint.high_watermark)
+    if recv:
+        socket.setsockopt(zmq.RCVHWM, endpoint.high_watermark)
+    socket.setsockopt(zmq.LINGER, endpoint.linger_ms)
+    if connect:
+        _setsockopt_if_available(zmq, socket, "RECONNECT_IVL", 100)
+        _setsockopt_if_available(zmq, socket, "RECONNECT_IVL_MAX", 2000)
+        _setsockopt_if_available(zmq, socket, "TCP_KEEPALIVE", 1)
+        _setsockopt_if_available(zmq, socket, "TCP_KEEPALIVE_IDLE", 30)
+        _setsockopt_if_available(zmq, socket, "TCP_KEEPALIVE_INTVL", 10)
+        _setsockopt_if_available(zmq, socket, "TCP_KEEPALIVE_CNT", 3)
+        if send:
+            _setsockopt_if_available(zmq, socket, "IMMEDIATE", 1)
+
+
+def _setsockopt_if_available(
+    zmq: Any,
+    socket: Any,
+    option_name: str,
+    value: int,
+) -> None:
+    option = getattr(zmq, option_name, None)
+    if option is None:
+        return
+    socket.setsockopt(option, value)
+
+
 @dataclass(frozen=True, slots=True)
 class ZmqEndpointBundle:
     """Public CQPCFG endpoint expanded into internal ZeroMQ subchannels."""
@@ -215,8 +265,13 @@ class ZmqPushBatchSink:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.PUSH)
-        socket.setsockopt(zmq.SNDHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            send=True,
+            connect=not self.endpoint.bind,
+        )
         if self.endpoint.bind:
             socket.bind(self.endpoint.address)
         else:
@@ -323,8 +378,13 @@ class ZmqPullBatchSource:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.PULL)
-        socket.setsockopt(zmq.RCVHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            recv=True,
+            connect=not self.endpoint.bind,
+        )
         if self.endpoint.bind:
             socket.bind(self.endpoint.address)
         else:

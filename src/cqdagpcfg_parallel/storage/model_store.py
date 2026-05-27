@@ -7,6 +7,7 @@ from hashlib import sha256
 from math import ceil
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from .manifest import model_fingerprint
 
@@ -257,7 +258,7 @@ class FileModelArtifactCache:
         if fingerprint != manifest.model_fingerprint:
             raise ValueError("model payload fingerprint does not match manifest")
         path = self.artifact_path(manifest)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path = _temporary_artifact_path(path)
         tmp_path.write_bytes(payload)
         tmp_path.replace(path)
         self._write_manifest(manifest)
@@ -270,7 +271,7 @@ class FileModelArtifactCache:
             return self.artifact_path(manifest), manifest
 
         path = self.artifact_path(manifest)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path = _temporary_artifact_path(path)
         offset = 0
         with tmp_path.open("wb") as handle:
             while offset < manifest.size_bytes:
@@ -306,6 +307,10 @@ class FileModelArtifactCache:
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+
+def _temporary_artifact_path(path: Path) -> Path:
+    return path.with_suffix(f"{path.suffix}.{uuid4().hex}.tmp")
 
 
 class BoundedModelPageCache:

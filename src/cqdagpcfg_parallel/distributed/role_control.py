@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Iterable, Mapping
 
-from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, _require_zmq
+from cqdagpcfg_parallel.runtime.zmq_transport import (
+    ZmqEndpoint,
+    _require_zmq,
+    configure_zmq_socket,
+)
 
 from .job_context import JobContext
 from .resources import RoleResourcePolicy, WorkerResourceSpec
@@ -72,9 +76,13 @@ class RoleController:
         self._zmq = _require_zmq()
         self._context = self._zmq.Context()
         self._socket = self._context.socket(self._zmq.ROUTER)
-        self._socket.setsockopt(self._zmq.SNDHWM, endpoint.high_watermark)
-        self._socket.setsockopt(self._zmq.RCVHWM, endpoint.high_watermark)
-        self._socket.setsockopt(self._zmq.LINGER, endpoint.linger_ms)
+        configure_zmq_socket(
+            self._socket,
+            endpoint,
+            zmq_module=self._zmq,
+            send=True,
+            recv=True,
+        )
         self._socket.bind(endpoint.address)
 
     @property
@@ -236,10 +244,15 @@ class RoleClient:
         self._zmq = _require_zmq()
         self._context = self._zmq.Context()
         self._socket = self._context.socket(self._zmq.DEALER)
-        self._socket.setsockopt(self._zmq.IDENTITY, node_id.encode("utf-8"))
-        self._socket.setsockopt(self._zmq.SNDHWM, endpoint.high_watermark)
-        self._socket.setsockopt(self._zmq.RCVHWM, endpoint.high_watermark)
-        self._socket.setsockopt(self._zmq.LINGER, endpoint.linger_ms)
+        configure_zmq_socket(
+            self._socket,
+            endpoint,
+            zmq_module=self._zmq,
+            identity=node_id.encode("utf-8"),
+            send=True,
+            recv=True,
+            connect=True,
+        )
         self._socket.connect(endpoint.address)
 
     @property
@@ -281,10 +294,20 @@ class RoleClient:
             self._socket.send(payload, self._zmq.DONTWAIT)
         except self._zmq.Again:
             self._send_seconds += perf_counter() - started_at
-            self._bytes += len(payload)
-            self._messages += 1
-            self._observe_roundtrip(perf_counter() - request_started_at)
-            return self._last_reply
+            if not self._wait_until_writable():
+                self._bytes += len(payload)
+                self._messages += 1
+                self._observe_roundtrip(perf_counter() - request_started_at)
+                return self._last_reply
+            started_at = perf_counter()
+            try:
+                self._socket.send(payload, self._zmq.DONTWAIT)
+            except self._zmq.Again:
+                self._send_seconds += perf_counter() - started_at
+                self._bytes += len(payload)
+                self._messages += 1
+                self._observe_roundtrip(perf_counter() - request_started_at)
+                return self._last_reply
         self._send_seconds += perf_counter() - started_at
 
         started_at = perf_counter()
@@ -332,6 +355,15 @@ class RoleClient:
         self._roundtrip_ewma_seconds = (
             alpha * seconds + (1.0 - alpha) * self._roundtrip_ewma_seconds
         )
+
+    def _wait_until_writable(self) -> bool:
+        if self.reply_timeout_ms <= 0:
+            return False
+        started_at = perf_counter()
+        try:
+            return bool(self._socket.poll(self.reply_timeout_ms, self._zmq.POLLOUT))
+        finally:
+            self._poll_seconds += perf_counter() - started_at
 
 
 def _normalize_job_context(

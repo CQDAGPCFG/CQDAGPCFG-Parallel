@@ -41,22 +41,36 @@ class JsonCandidateBatchCodec:
 
     @classmethod
     def dumps(cls, batch: CandidateBatch) -> bytes:
-        payload = {
-            "schema_version": cls.schema_version,
-            "type": "batch",
-            "batch_id": batch.batch_id,
-            "start_rank": batch.start_rank,
-            "records": [
-                {
-                    "prob": record.prob,
-                    "guess": record.guess,
-                    "structure_index": record.structure_index,
-                    "structure_name": record.structure_name,
-                    "ranks": list(record.ranks),
-                }
-                for record in batch.records
-            ],
-        }
+        if batch.is_artifact:
+            payload = {
+                "schema_version": cls.schema_version,
+                "type": "artifact",
+                "batch_id": batch.batch_id,
+                "start_rank": batch.start_rank,
+                "record_count": batch.record_count,
+                "payload_bytes": batch.payload_bytes,
+                "artifact_uri": batch.artifact_uri,
+                "artifact_sha256": batch.artifact_sha256,
+                "artifact_format": batch.artifact_format,
+                "artifact_bytes": batch.artifact_bytes,
+            }
+        else:
+            payload = {
+                "schema_version": cls.schema_version,
+                "type": "batch",
+                "batch_id": batch.batch_id,
+                "start_rank": batch.start_rank,
+                "records": [
+                    {
+                        "prob": record.prob,
+                        "guess": record.guess,
+                        "structure_index": record.structure_index,
+                        "structure_name": record.structure_name,
+                        "ranks": list(record.ranks),
+                    }
+                    for record in batch.records
+                ],
+            }
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     @classmethod
@@ -78,6 +92,17 @@ class JsonCandidateBatchCodec:
         message_type = raw.get("type", "batch")
         if message_type == "end":
             return BatchEndOfStream(reason=str(raw.get("reason", "complete")))
+        if message_type == "artifact":
+            return CandidateBatch.from_artifact(
+                batch_id=int(raw["batch_id"]),
+                start_rank=int(raw["start_rank"]),
+                record_count=int(raw["record_count"]),
+                payload_bytes=int(raw["payload_bytes"]),
+                artifact_uri=str(raw["artifact_uri"]),
+                artifact_sha256=str(raw["artifact_sha256"]),
+                artifact_format=str(raw.get("artifact_format", "guess-lines-v1")),
+                artifact_bytes=int(raw.get("artifact_bytes", 0)),
+            )
         if message_type != "batch":
             raise ValueError(f"unsupported CandidateBatch message type: {message_type}")
 
@@ -115,9 +140,12 @@ class BinaryCandidateBatchCodec:
     _end_header = struct.Struct("!I")
     _type_batch = 1
     _type_end = 2
+    _type_artifact = 3
 
     @classmethod
     def dumps(cls, batch: CandidateBatch) -> bytes:
+        if batch.is_artifact:
+            return cls.dumps_artifact(batch)
         if cpp_serialize_candidate_batch is not None:
             return cpp_serialize_candidate_batch(
                 batch.batch_id,
@@ -159,6 +187,32 @@ class BinaryCandidateBatchCodec:
         )
 
     @classmethod
+    def dumps_artifact(cls, batch: CandidateBatch) -> bytes:
+        if not batch.is_artifact:
+            raise ValueError("expected artifact CandidateBatch")
+        payload = json.dumps(
+            {
+                "batch_id": batch.batch_id,
+                "start_rank": batch.start_rank,
+                "record_count": batch.record_count,
+                "payload_bytes": batch.payload_bytes,
+                "artifact_uri": batch.artifact_uri,
+                "artifact_sha256": batch.artifact_sha256,
+                "artifact_format": batch.artifact_format,
+                "artifact_bytes": batch.artifact_bytes,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return b"".join(
+            (
+                cls._header.pack(cls._magic, cls.schema_version, cls._type_artifact),
+                cls._end_header.pack(len(payload)),
+                payload,
+            )
+        )
+
+    @classmethod
     def loads_envelope(cls, payload: bytes) -> CandidateBatch | BatchEndOfStream:
         offset = 0
         magic, version, message_type = cls._header.unpack_from(payload, offset)
@@ -172,6 +226,19 @@ class BinaryCandidateBatchCodec:
             reason_length, offset = cls._read_end_length(payload, offset)
             reason = payload[offset : offset + reason_length].decode("utf-8")
             return BatchEndOfStream(reason=reason)
+        if message_type == cls._type_artifact:
+            artifact_length, offset = cls._read_end_length(payload, offset)
+            raw = json.loads(payload[offset : offset + artifact_length].decode("utf-8"))
+            return CandidateBatch.from_artifact(
+                batch_id=int(raw["batch_id"]),
+                start_rank=int(raw["start_rank"]),
+                record_count=int(raw["record_count"]),
+                payload_bytes=int(raw["payload_bytes"]),
+                artifact_uri=str(raw["artifact_uri"]),
+                artifact_sha256=str(raw["artifact_sha256"]),
+                artifact_format=str(raw.get("artifact_format", "guess-lines-v1")),
+                artifact_bytes=int(raw.get("artifact_bytes", 0)),
+            )
         if message_type != cls._type_batch:
             raise ValueError(f"unsupported CandidateBatch binary message type: {message_type}")
 
@@ -328,7 +395,7 @@ class BoundedBatchSink:
                 self.downstream.publish(batch)
                 with self._lock:
                     self._forwarded_batches += 1
-                    self._forwarded_candidates += len(batch.records)
+                    self._forwarded_candidates += batch.record_count
         except BaseException as exc:  # pragma: no cover - re-raised by caller
             with self._lock:
                 self._errors.append(exc)

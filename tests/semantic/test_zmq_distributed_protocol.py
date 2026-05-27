@@ -18,6 +18,7 @@ from cqdagpcfg_parallel.distributed import (
     DistributedProtocolConfig,
     DistributedProtocolTracker,
     DistributedProtocolWorker,
+    WorkerResourceSpec,
     content_digest,
     migrate_ack_message,
     migrate_state_message,
@@ -35,7 +36,7 @@ from cqdagpcfg_parallel.protocol import (
     stable_record_string,
 )
 from cqdagpcfg_parallel.runtime import ZmqEndpoint
-from cqdagpcfg_parallel.simulation import MappingRecordSource
+from cqdagpcfg_parallel.simulation import MappingRecordSource, SequenceRecordSource
 from cqdagpcfg_parallel.storage import DistributedTrackerCheckpoint
 
 
@@ -189,6 +190,68 @@ def test_zmq_tracker_accepts_worker_added_while_running() -> None:
     assert result.digest == stable_digest(records[:limit])
     assert WorkerId("worker-late") in result.seen_workers
     assert worker_counts[WorkerId("worker-late")] > 0
+
+
+def test_zmq_tracker_caps_work_items_by_worker_memory() -> None:
+    records = tuple(_record(index) for index in range(40))
+    limit = 12
+    worker_id = WorkerId("tiny-worker")
+    zmq = pytest.importorskip("zmq")
+    context = zmq.Context()
+    address = f"inproc://memory-capped-worker-{uuid4()}"
+    tracker = DistributedProtocolTracker(
+        endpoint=ZmqEndpoint(address, bind=True, linger_ms=0),
+        config=DistributedProtocolConfig(
+            scheduler=SchedulerConfig(
+                policy=ChunkSizePolicy.FIXED,
+                fixed_chunk_size=64,
+                max_chunk_size=64,
+            ),
+            demand_window=64,
+        ),
+        context=context,
+    )
+    started = Event()
+    result_holder = []
+    error_holder = []
+
+    def tracker_task() -> None:
+        try:
+            result_holder.append(
+                tracker.run(
+                    limit=limit,
+                    expected_workers=1,
+                    timeout_seconds=5.0,
+                    started_event=started,
+                    collect_outputs=True,
+                )
+            )
+        except BaseException as exc:
+            error_holder.append(exc)
+
+    tracker_thread = Thread(target=tracker_task, daemon=True)
+    tracker_thread.start()
+    assert started.wait(2.0)
+    worker = DistributedProtocolWorker(
+        worker_id=worker_id,
+        endpoint=ZmqEndpoint(address, bind=False, linger_ms=0),
+        source=SequenceRecordSource(records),
+        context=context,
+        resources=WorkerResourceSpec(memory_bytes=128 * 1024 * 1024),
+    )
+    try:
+        worker_stats = worker.run()
+        tracker_thread.join(5.0)
+    finally:
+        context.term()
+
+    assert not tracker_thread.is_alive()
+    assert not error_holder
+    result = result_holder[0]
+    assert result.digest == stable_digest(records[:limit])
+    assert dict(result.worker_chunk_caps)[worker_id] == 1
+    assert dict(result.assigned_items_by_worker)[worker_id] >= limit
+    assert worker_stats.completed_items >= limit
 
 
 def test_zmq_tracker_recovers_from_durable_checkpoint_after_restart() -> None:

@@ -5,12 +5,16 @@ from dataclasses import dataclass
 from .types import Demand, NodeId
 
 
+MIN_MASS_DENSITY = 1e-300
+
+
 @dataclass(frozen=True, slots=True)
 class NodeSchedulingFeatures:
     node_id: NodeId
     entropy: float = 0.0
     priority: float = 1.0
     estimated_cost: float = 1.0
+    cardinality: int | None = None
 
     def __post_init__(self) -> None:
         if self.entropy < 0.0:
@@ -19,6 +23,8 @@ class NodeSchedulingFeatures:
             raise ValueError("priority cannot be negative")
         if self.estimated_cost <= 0.0:
             raise ValueError("estimated_cost must be positive")
+        if self.cardinality is not None and self.cardinality < 0:
+            raise ValueError("cardinality cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +41,7 @@ class NodeDependency:
 @dataclass(slots=True)
 class NodeRuntimeState:
     node_id: NodeId
+    frontier_start: int = 0
     ready_end: int = 0
     scheduled_end: int = 0
     target_end: int = 0
@@ -46,10 +53,14 @@ class NodeRuntimeState:
     child_miss_rate: float = 0.0
     chunk_latency_ewma: float = 0.0
     feedback_count: int = 0
+    mass_density_ewma: float = 0.0
+    mass_feedback_count: int = 0
     exhausted: bool = False
     exhausted_at: int | None = None
 
     def __post_init__(self) -> None:
+        if self.frontier_start < 0:
+            raise ValueError("frontier_start cannot be negative")
         if self.ready_end < 0:
             raise ValueError("ready_end cannot be negative")
         if self.scheduled_end < 0:
@@ -74,6 +85,10 @@ class NodeRuntimeState:
             raise ValueError("chunk_latency_ewma cannot be negative")
         if self.feedback_count < 0:
             raise ValueError("feedback_count cannot be negative")
+        if self.mass_density_ewma < 0.0:
+            raise ValueError("mass_density_ewma cannot be negative")
+        if self.mass_feedback_count < 0:
+            raise ValueError("mass_feedback_count cannot be negative")
         if self.exhausted_at is not None and self.exhausted_at < 0:
             raise ValueError("exhausted_at cannot be negative")
 
@@ -89,11 +104,34 @@ class NodeRuntimeState:
             return 0
         return max(0, self.effective_target_end - self.ready_end)
 
+    @property
+    def effective_mass_density(self) -> float:
+        if self.mass_feedback_count > 0 and self.mass_density_ewma > 0.0:
+            return self.mass_density_ewma
+        return max(self.priority, MIN_MASS_DENSITY)
+
+    @property
+    def demand_mass_gap(self) -> float:
+        return self.demand_gap * self.effective_mass_density
+
+    @property
+    def frontier_ready_gap(self) -> int:
+        return max(0, self.ready_end - self.frontier_start)
+
+    @property
+    def is_frontier_blocked(self) -> bool:
+        return not self.exhausted and self.demand_gap > 0 and self.ready_end <= self.frontier_start
+
     def register_demand(self, demand: Demand) -> None:
         if demand.node_id != self.node_id:
             raise ValueError("demand node_id does not match state")
         self.target_end = max(self.target_end, demand.target_end)
         self.urgency = max(self.urgency, demand.urgency)
+
+    def update_frontier_start(self, index: int) -> None:
+        if index < self.frontier_start:
+            raise ValueError("frontier_start cannot move backward")
+        self.frontier_start = index
 
     def update_ready_end(self, ready_end: int) -> None:
         if ready_end < self.ready_end:
@@ -159,6 +197,7 @@ class NodeRuntimeState:
         records_requested: int,
         records_produced: int,
         ewma_alpha: float,
+        chunk_probability_mass: float | None = None,
     ) -> None:
         if chunk_latency_seconds < 0.0:
             raise ValueError("chunk_latency_seconds cannot be negative")
@@ -170,6 +209,8 @@ class NodeRuntimeState:
             raise ValueError("records_produced cannot exceed records_requested")
         if not 0.0 < ewma_alpha <= 1.0:
             raise ValueError("ewma_alpha must be in (0, 1]")
+        if chunk_probability_mass is not None and chunk_probability_mass < 0.0:
+            raise ValueError("chunk_probability_mass cannot be negative")
 
         miss_rate = 0.0
         if records_requested:
@@ -182,6 +223,15 @@ class NodeRuntimeState:
             self.feedback_count,
         )
         self.feedback_count += 1
+        if chunk_probability_mass is not None and records_produced > 0:
+            mass_density = chunk_probability_mass / records_produced
+            self.mass_density_ewma = _ewma(
+                self.mass_density_ewma,
+                mass_density,
+                ewma_alpha,
+                self.mass_feedback_count,
+            )
+            self.mass_feedback_count += 1
 
 
 class NodeStateTable:
@@ -212,6 +262,11 @@ class NodeStateTable:
                 priority=priority,
                 estimated_cost=estimated_cost,
             )
+        return state
+
+    def update_frontier_start(self, node_id: NodeId, index: int) -> NodeRuntimeState:
+        state = self.get(node_id)
+        state.update_frontier_start(index)
         return state
 
     def get(self, node_id: NodeId) -> NodeRuntimeState:
@@ -283,6 +338,7 @@ class NodeStateTable:
         records_requested: int,
         records_produced: int,
         ewma_alpha: float,
+        chunk_probability_mass: float | None = None,
     ) -> NodeRuntimeState:
         state = self.ensure_node(node_id)
         state.record_runtime_feedback(
@@ -290,6 +346,7 @@ class NodeStateTable:
             records_requested=records_requested,
             records_produced=records_produced,
             ewma_alpha=ewma_alpha,
+            chunk_probability_mass=chunk_probability_mass,
         )
         return state
 
@@ -304,6 +361,7 @@ def _ewma(previous: float, sample: float, alpha: float, count: int) -> float:
 
 
 __all__ = [
+    "MIN_MASS_DENSITY",
     "NodeDependency",
     "NodeRuntimeState",
     "NodeSchedulingFeatures",

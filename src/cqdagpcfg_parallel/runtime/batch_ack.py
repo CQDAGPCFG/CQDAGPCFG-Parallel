@@ -7,7 +7,12 @@ from time import perf_counter
 from types import TracebackType
 from typing import Any, Mapping
 
-from .zmq_transport import ZmqBatchTransportStats, ZmqEndpoint, _require_zmq
+from .zmq_transport import (
+    ZmqBatchTransportStats,
+    ZmqEndpoint,
+    _require_zmq,
+    configure_zmq_socket,
+)
 
 
 class BatchAckStatus(str, Enum):
@@ -116,8 +121,13 @@ class ZmqPushBatchAckSink:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.PUSH)
-        socket.setsockopt(zmq.SNDHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            send=True,
+            connect=not self.endpoint.bind,
+        )
         if self.endpoint.bind:
             socket.bind(self.endpoint.address)
         else:
@@ -201,8 +211,13 @@ class ZmqPullBatchAckSource:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.PULL)
-        socket.setsockopt(zmq.RCVHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            recv=True,
+            connect=not self.endpoint.bind,
+        )
         if self.endpoint.bind:
             socket.bind(self.endpoint.address)
         else:

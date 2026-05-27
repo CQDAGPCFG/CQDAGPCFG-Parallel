@@ -27,7 +27,11 @@ from .batch_transport import (
     publish_candidate_batches,
     publish_record_batches,
 )
-from .candidate_batch import CandidateBatch, guess_payload_bytes
+from .candidate_batch import (
+    CandidateBatch,
+    UNCHECKED_ARTIFACT_SHA256,
+    guess_payload_bytes,
+)
 from .candidate_queue import BoundedCandidateQueue, CandidateQueueStats, QueueWatermark
 from .mock_pipeline import PipelineConfig, PipelineStats, run_candidate_pipeline
 from .model_transport import (
@@ -108,6 +112,7 @@ __all__ = [
     "ZmqModelArtifactClient",
     "ZmqModelArtifactServer",
     "WorkerRunResult",
+    "UNCHECKED_ARTIFACT_SHA256",
     "guess_payload_bytes",
     "make_candidate_batches",
     "publish_candidate_batches",

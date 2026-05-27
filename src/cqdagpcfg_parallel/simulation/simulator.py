@@ -32,6 +32,7 @@ class ProtocolSimulatorConfig:
     entropy: float = 0.0
     priority: float = 1.0
     estimated_cost: float = 1.0
+    lazy_shard_activation: bool = True
 
     def __post_init__(self) -> None:
         if self.demand_window <= 0:
@@ -56,6 +57,13 @@ class ProtocolRunStats:
     reclaimed_records: int = 0
     affinity_hits: int = 0
     affinity_misses: int = 0
+    parallel_items: int = 0
+    tail_steal_attempts: int = 0
+    tail_steals: int = 0
+    tail_steal_denials: int = 0
+    rank_window_waits: int = 0
+    rank_window_forced_items: int = 0
+    rank_window_peak_outstanding_records: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +155,10 @@ class SingleProcessProtocolSimulator:
             priority=self.config.priority,
             estimated_cost=self.config.estimated_cost,
         )
-        self.merger = GlobalMerger((self.shard,))
+        self.merger = GlobalMerger(
+            (self.shard,),
+            lazy_shard_activation=self.config.lazy_shard_activation,
+        )
 
     def run(self, limit: int) -> ProtocolSimulationResult:
         if limit < 0:
@@ -185,6 +196,14 @@ class SingleProcessProtocolSimulator:
                 reclaimed_records=chunk_stats.reclaimed_record_count,
                 affinity_hits=schedule_stats.affinity_hits,
                 affinity_misses=schedule_stats.affinity_misses,
+                tail_steal_attempts=schedule_stats.tail_steal_attempts,
+                tail_steals=schedule_stats.tail_steals,
+                tail_steal_denials=schedule_stats.tail_steal_denials,
+                rank_window_waits=schedule_stats.rank_window_waits,
+                rank_window_forced_items=schedule_stats.rank_window_forced_items,
+                rank_window_peak_outstanding_records=(
+                    schedule_stats.rank_window_peak_outstanding_records
+                ),
             ),
         )
 

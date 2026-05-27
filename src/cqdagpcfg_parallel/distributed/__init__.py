@@ -33,6 +33,12 @@ from .messages import (
     wait_message,
     work_message,
 )
+from .memory_policy import (
+    BatchMemoryLimits,
+    memory_limited_batch_limits,
+    memory_limited_chunk_size,
+    memory_limited_model_page_cache,
+)
 from .migration import (
     DEFAULT_MAX_SNAPSHOT_BYTES,
     DEFAULT_MAX_SNAPSHOT_TO_WARMUP_RATIO,
@@ -81,6 +87,7 @@ from .worker import DistributedProtocolWorker, DistributedWorkerStats
 __all__ = [
     "ControlMessage",
     "ControlMessageCodec",
+    "BatchMemoryLimits",
     "RuntimeFeedback",
     "AnnotatedDistributedProtocol",
     "AnnotatedConsumer",
@@ -136,6 +143,9 @@ __all__ = [
     "expand_node_endpoints",
     "fetch_job_context",
     "job_payload_from_job_context",
+    "memory_limited_batch_limits",
+    "memory_limited_chunk_size",
+    "memory_limited_model_page_cache",
     "ready_message",
     "retire_message",
     "migrate_abort_message",

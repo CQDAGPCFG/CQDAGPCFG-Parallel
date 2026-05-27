@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from threading import Event
 from time import monotonic
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 from CQDAGPCFG import GuessRecord
 
@@ -19,12 +21,17 @@ from cqdagpcfg_parallel.protocol import (
     NodeStateTable,
     PriorityCostScheduler,
     SchedulerConfig,
+    StableStreamFingerprint,
     StaleLeaseError,
     WorkerId,
     WorkItem,
     stable_record_string,
 )
-from cqdagpcfg_parallel.runtime.zmq_transport import ZmqEndpoint, _require_zmq
+from cqdagpcfg_parallel.runtime.zmq_transport import (
+    ZmqEndpoint,
+    _require_zmq,
+    configure_zmq_socket,
+)
 from cqdagpcfg_parallel.simulation import (
     GlobalMerger,
     ProtocolRunStats,
@@ -46,6 +53,11 @@ from .messages import (
     wait_message,
     work_message,
 )
+from .memory_policy import (
+    DEFAULT_STREAMING_ARTIFACT_RECORD_BYTES,
+    DEFAULT_STREAMING_ARTIFACT_WORK_FRACTION,
+    memory_limited_chunk_size,
+)
 from .migration import (
     MigrationCoordinator,
     MigrationStats,
@@ -53,6 +65,7 @@ from .migration import (
     SnapshotPolicy,
     content_digest,
 )
+from .resources import WorkerResourceSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +87,11 @@ class DistributedProtocolConfig:
     lease_ttl_seconds: float = 30.0
     lease_recovery_enabled: bool = True
     automatic_migration_enabled: bool = True
+    lazy_shard_activation: bool = True
+    direct_root_chunk_emission: bool = True
+    direct_unordered_chunk_emission: bool = False
+    track_output_digest: bool = True
+    safe_record_chunk_size: int = 8192
 
     def __post_init__(self) -> None:
         if self.demand_window <= 0:
@@ -90,6 +108,8 @@ class DistributedProtocolConfig:
             raise ValueError("node_ids cannot be empty")
         if self.lease_ttl_seconds <= 0.0:
             raise ValueError("lease_ttl_seconds must be positive")
+        if self.safe_record_chunk_size <= 0:
+            raise ValueError("safe_record_chunk_size must be positive")
 
     @property
     def root_node_ids(self) -> tuple[NodeId, ...]:
@@ -111,6 +131,7 @@ class DistributedProtocolConfig:
 class DistributedRunResult:
     outputs: tuple[GuessRecord, ...]
     digest: str
+    stable_fingerprint: str
     emitted_count: int
     stats: ProtocolRunStats
     seen_workers: tuple[WorkerId, ...]
@@ -121,10 +142,13 @@ class DistributedRunResult:
     assigned_records_by_worker: tuple[tuple[WorkerId, int], ...] = ()
     assigned_items_by_node: tuple[tuple[NodeId, int], ...] = ()
     assigned_records_by_node: tuple[tuple[NodeId, int], ...] = ()
+    received_records_by_worker: tuple[tuple[WorkerId, int], ...] = ()
+    received_records_by_node: tuple[tuple[NodeId, int], ...] = ()
     migration_stats: MigrationStats = MigrationStats()
     expired_leases: int = 0
     automatic_migrations: int = 0
     failed_migration_triggers: int = 0
+    worker_chunk_caps: tuple[tuple[WorkerId, int], ...] = ()
 
     @property
     def stable_records(self) -> tuple[str, ...]:
@@ -161,9 +185,16 @@ class DistributedProtocolTracker:
         self._assigned_records_by_worker: dict[WorkerId, int] = {}
         self._assigned_items_by_node: dict[NodeId, int] = {}
         self._assigned_records_by_node: dict[NodeId, int] = {}
+        self._received_records_by_worker: dict[WorkerId, int] = {}
+        self._received_records_by_node: dict[NodeId, int] = {}
+        self._resources_by_worker: dict[WorkerId, WorkerResourceSpec] = {}
+        self._worker_chunk_caps_by_worker: dict[WorkerId, int] = {}
         self._control_outbox: dict[WorkerId, deque[ControlMessage]] = {}
         self._last_seen_by_worker: dict[WorkerId, float] = {}
         self._stopped_workers: set[WorkerId] = set()
+        self._pending_root_chunks: dict[int, ControlMessage] = {}
+        self._direct_unordered_active_nodes: set[NodeId] = set()
+        self._direct_unordered_shard_cursor = 0
         self._expired_leases = 0
         self._automatic_migrations = 0
         self._failed_migration_triggers = 0
@@ -179,17 +210,28 @@ class DistributedProtocolTracker:
                     entropy=feature.entropy,
                     priority=feature.priority,
                     estimated_cost=feature.estimated_cost,
+                    cardinality=feature.cardinality,
                     order_key=self.config.record_order_key or default_record_order_key,
                 )
             )
         self.shards = tuple(shards)
+        self._shard_by_node_id = {shard.node_id: shard for shard in self.shards}
+        self._direct_unordered_shards_by_priority = tuple(
+            sorted(
+                self.shards,
+                key=lambda shard: (-shard.priority, str(shard.node_id)),
+            )
+        )
         for dependency in self.config.node_dependencies:
             self.states.register_dependency(
                 dependency.parent_id,
                 dependency.child_id,
                 donation_weight=dependency.donation_weight,
             )
-        self.merger = GlobalMerger(self.shards)
+        self.merger = GlobalMerger(
+            self.shards,
+            lazy_shard_activation=self.config.lazy_shard_activation,
+        )
 
     def request_node_migration(
         self,
@@ -230,6 +272,9 @@ class DistributedProtocolTracker:
         started_event: Event | None = None,
         shutdown_grace_seconds: float = 0.2,
         output_callback: Callable[[GuessRecord], None] | None = None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None = None,
+        output_artifact_callback: Callable[..., None] | None = None,
+        schedule_backpressure_callback: Callable[[], bool] | None = None,
         collect_outputs: bool = False,
         resume_checkpoint: DistributedTrackerCheckpoint | None = None,
         checkpoint_callback: Callable[[DistributedTrackerCheckpoint], None] | None = None,
@@ -256,9 +301,13 @@ class DistributedProtocolTracker:
         owns_context = self.context is None
         context = zmq.Context() if self.context is None else self.context
         socket = context.socket(zmq.ROUTER)
-        socket.setsockopt(zmq.SNDHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.RCVHWM, self.endpoint.high_watermark)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            send=True,
+            recv=True,
+        )
         socket.bind(self.endpoint.address)
 
         if resume_checkpoint is not None:
@@ -272,6 +321,7 @@ class DistributedProtocolTracker:
             ),
             track_stable_records=checkpoint_callback is not None
             or resume_checkpoint is not None,
+            track_digest=self.config.track_output_digest,
         )
         seen_workers: set[WorkerId] = set()
         stopped_workers: set[WorkerId] = set()
@@ -283,6 +333,8 @@ class DistributedProtocolTracker:
             started_event.set()
 
         try:
+            if self.config.direct_unordered_chunk_emission:
+                self._register_direct_unordered_demands(limit)
             self._advance_outputs(
                 collector,
                 limit,
@@ -291,9 +343,17 @@ class DistributedProtocolTracker:
                 checkpoint_interval_records=checkpoint_interval_records,
             )
             while True:
+                if self._is_done(collector.emitted_count, limit):
+                    if shutdown_deadline is None:
+                        shutdown_deadline = monotonic() + shutdown_grace_seconds
+                    if monotonic() >= shutdown_deadline:
+                        break
                 if expected_workers is not None and len(stopped_workers) >= expected_workers:
                     break
-                if expected_workers is None and self._is_done(collector.emitted_count, limit):
+                if (
+                    self.config.direct_unordered_chunk_emission
+                    and self._direct_unordered_exhausted()
+                ):
                     if shutdown_deadline is None:
                         shutdown_deadline = monotonic() + shutdown_grace_seconds
                     if monotonic() >= shutdown_deadline:
@@ -317,12 +377,15 @@ class DistributedProtocolTracker:
                         collector=collector,
                         limit=limit,
                         output_callback=output_callback,
+                        output_records_callback=output_records_callback,
+                        output_artifact_callback=output_artifact_callback,
+                        schedule_backpressure_callback=schedule_backpressure_callback,
                         checkpoint_callback=checkpoint_callback,
                         checkpoint_interval_records=checkpoint_interval_records,
                     )
                     if message.type == "chunk":
                         received_chunks += 1
-                        received_records += len(message.records)
+                        received_records += _message_record_count(message)
                     if reply.type == "stop":
                         stopped_workers.add(worker_id)
                         self._stopped_workers.add(worker_id)
@@ -342,6 +405,7 @@ class DistributedProtocolTracker:
         return DistributedRunResult(
             outputs=collector.outputs,
             digest=collector.digest,
+            stable_fingerprint=collector.stable_fingerprint,
             emitted_count=collector.emitted_count,
             stats=ProtocolRunStats(
                 scheduled_items=schedule_stats.scheduled_items,
@@ -357,6 +421,15 @@ class DistributedProtocolTracker:
                 reclaimed_records=chunk_stats.reclaimed_record_count,
                 affinity_hits=schedule_stats.affinity_hits,
                 affinity_misses=schedule_stats.affinity_misses,
+                parallel_items=schedule_stats.parallel_items,
+                tail_steal_attempts=schedule_stats.tail_steal_attempts,
+                tail_steals=schedule_stats.tail_steals,
+                tail_steal_denials=schedule_stats.tail_steal_denials,
+                rank_window_waits=schedule_stats.rank_window_waits,
+                rank_window_forced_items=schedule_stats.rank_window_forced_items,
+                rank_window_peak_outstanding_records=(
+                    schedule_stats.rank_window_peak_outstanding_records
+                ),
             ),
             seen_workers=tuple(sorted(seen_workers, key=str)),
             stopped_workers=tuple(sorted(stopped_workers, key=str)),
@@ -366,10 +439,13 @@ class DistributedProtocolTracker:
             assigned_records_by_worker=_sorted_items(self._assigned_records_by_worker),
             assigned_items_by_node=_sorted_items(self._assigned_items_by_node),
             assigned_records_by_node=_sorted_items(self._assigned_records_by_node),
+            received_records_by_worker=_sorted_items(self._received_records_by_worker),
+            received_records_by_node=_sorted_items(self._received_records_by_node),
             migration_stats=self.migrations.stats,
             expired_leases=self._expired_leases,
             automatic_migrations=self._automatic_migrations,
             failed_migration_triggers=self._failed_migration_triggers,
+            worker_chunk_caps=_sorted_items(self._worker_chunk_caps_by_worker),
         )
 
     def _handle_message(
@@ -380,15 +456,28 @@ class DistributedProtocolTracker:
         collector: "_OutputCollector",
         limit: int,
         output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None = None,
+        output_artifact_callback: Callable[..., None] | None = None,
+        schedule_backpressure_callback: Callable[[], bool] | None = None,
         checkpoint_callback: Callable[[DistributedTrackerCheckpoint], None] | None = None,
         checkpoint_interval_records: int = 1,
     ) -> ControlMessage:
         self._validate_worker_identity(message, worker_id)
+        self._record_worker_resources(message, worker_id)
         if self._is_done(collector.emitted_count, limit):
+            self._delete_unpublished_artifacts(message)
             return stop_message()
 
         if message.type == "chunk":
-            migration_reply = self._accept_chunk(message, worker_id=worker_id)
+            migration_reply = self._accept_chunk(
+                message,
+                worker_id=worker_id,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+                output_artifact_callback=output_artifact_callback,
+            )
             if migration_reply is not None:
                 return migration_reply
         elif message.type == "exhausted":
@@ -413,22 +502,73 @@ class DistributedProtocolTracker:
         )
         if message.retire or self._is_done(collector.emitted_count, limit):
             return stop_message()
+        if (
+            schedule_backpressure_callback is not None
+            and schedule_backpressure_callback()
+        ):
+            return wait_message()
 
-        item = self.scheduler.schedule(worker_id)
+        item = self.scheduler.schedule(
+            worker_id,
+            max_chunk_size=self._worker_chunk_cap(worker_id),
+        )
         if item is None:
             return wait_message()
         self._record_assignment(item)
         return work_message(item)
+
+    def _record_worker_resources(
+        self,
+        message: ControlMessage,
+        worker_id: WorkerId,
+    ) -> None:
+        if message.worker_resources is not None:
+            self._resources_by_worker[worker_id] = message.worker_resources
+
+    def _worker_chunk_cap(self, worker_id: WorkerId) -> int:
+        resources = self._resources_by_worker.get(worker_id)
+        configured_max = self.config.scheduler.max_chunk_size
+        if self._worker_supports_streaming_artifacts(resources):
+            cap = memory_limited_chunk_size(
+                resources,
+                configured_max,
+                work_fraction=DEFAULT_STREAMING_ARTIFACT_WORK_FRACTION,
+                estimated_record_bytes=DEFAULT_STREAMING_ARTIFACT_RECORD_BYTES,
+            )
+            self._worker_chunk_caps_by_worker[worker_id] = cap
+            return cap
+        else:
+            configured_max = min(configured_max, self.config.safe_record_chunk_size)
+        cap = memory_limited_chunk_size(
+            resources,
+            configured_max,
+        )
+        self._worker_chunk_caps_by_worker[worker_id] = cap
+        return cap
+
+    def _worker_supports_streaming_artifacts(
+        self,
+        resources: WorkerResourceSpec | None,
+    ) -> bool:
+        if resources is None:
+            return False
+        return resources.labels.get("cqpcfg.streaming_artifacts") == "1"
 
     def _accept_chunk(
         self,
         message: ControlMessage,
         *,
         worker_id: WorkerId,
+        collector: "_OutputCollector",
+        limit: int,
+        output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None,
+        output_artifact_callback: Callable[..., None] | None,
     ) -> ControlMessage | None:
         if message.work_item is None:
             raise RuntimeError("chunk message is missing work_item")
         item = message.work_item
+        self._record_received(item, worker_id, _message_record_count(message))
         try:
             self.leases.require_valid(
                 node_id=item.node_id,
@@ -438,9 +578,40 @@ class DistributedProtocolTracker:
                 end=item.end,
             )
         except StaleLeaseError:
+            self._delete_unpublished_artifacts(message)
             return wait_message()
 
-        if message.records:
+        if self._is_direct_root_chunk(item) and (
+            self._is_artifact_chunk(message) or message.records
+        ):
+            self._record_runtime_feedback(message)
+            self._accept_direct_root_chunk(
+                message,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+                output_artifact_callback=output_artifact_callback,
+            )
+            return None
+        if self._is_direct_unordered_chunk(item) and (
+            self._is_artifact_chunk(message) or message.records
+        ):
+            self._record_runtime_feedback(message)
+            self._accept_direct_unordered_chunk(
+                message,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+                output_artifact_callback=output_artifact_callback,
+            )
+            return None
+        if self._is_artifact_chunk(message):
+            raise RuntimeError(
+                "artifact chunks are only supported for direct root range emission"
+            )
+        elif message.records:
             chunk = EnumerationChunk.from_records(
                 node_id=item.node_id,
                 start=item.start,
@@ -467,6 +638,339 @@ class DistributedProtocolTracker:
                 return migration_reply
             self.leases.release(lease)
         return None
+
+    def _is_artifact_chunk(self, message: ControlMessage) -> bool:
+        return (
+            message.artifact_uri is not None
+            and message.artifact_sha256 is not None
+            and message.artifact_record_count is not None
+        )
+
+    def _is_direct_root_chunk(self, item: WorkItem) -> bool:
+        return (
+            self.config.direct_root_chunk_emission
+            and len(self.shards) == 1
+            and item.node_id == self.shards[0].node_id
+        )
+
+    def _is_direct_unordered_chunk(self, item: WorkItem) -> bool:
+        return (
+            self.config.direct_unordered_chunk_emission
+            and item.node_id in self._shard_by_node_id
+        )
+
+    def _register_direct_unordered_demands(self, limit: int) -> None:
+        if limit <= 0:
+            return
+        if self._is_done_count_only(limit):
+            return
+        if self._direct_unordered_scheduled_count() >= limit:
+            return
+        self._direct_unordered_active_nodes = {
+            node_id
+            for node_id in self._direct_unordered_active_nodes
+            if not self.states.get(node_id).exhausted
+        }
+        active_target = max(
+            16,
+            self.config.scheduler.max_parallel_leases_per_node * 8,
+        )
+        while (
+            len(self._direct_unordered_active_nodes) < active_target
+            and self._direct_unordered_shard_cursor < len(self._direct_unordered_shards_by_priority)
+        ):
+            shard = self._direct_unordered_shards_by_priority[
+                self._direct_unordered_shard_cursor
+            ]
+            self._direct_unordered_shard_cursor += 1
+            if self.states.get(shard.node_id).exhausted:
+                continue
+            self._direct_unordered_active_nodes.add(shard.node_id)
+        for node_id in tuple(self._direct_unordered_active_nodes):
+            shard = self._shard_by_node_id.get(node_id)
+            if shard is None:
+                continue
+            state = self.states.get(shard.node_id)
+            if state.exhausted:
+                continue
+            ready_end = self.chunk_store.ready_end(shard.node_id)
+            target_base = max(ready_end, state.scheduled_end)
+            target_end = target_base + self.config.demand_window
+            if shard.cardinality is not None:
+                target_end = min(target_end, shard.cardinality)
+            if target_end <= target_base:
+                state.mark_exhausted(target_base)
+                continue
+            self.states.register_demand(
+                shard.node_id,
+                target_end,
+                entropy=shard.entropy,
+                priority=shard.priority,
+                estimated_cost=shard.estimated_cost,
+            )
+
+    def _is_done_count_only(self, limit: int) -> bool:
+        # Direct unordered emission may intentionally overrun by the final
+        # artifact chunk because artifact files are immutable batch payloads.
+        return sum(shard.cursor for shard in self.shards) >= limit
+
+    def _direct_unordered_scheduled_count(self) -> int:
+        count = 0
+        for shard in self.shards:
+            state = self.states.get(shard.node_id)
+            count += max(shard.cursor, state.scheduled_end)
+        return count
+
+    def _direct_unordered_exhausted(self) -> bool:
+        if not self.shards:
+            return True
+        for shard in self.shards:
+            if not self.states.get(shard.node_id).exhausted:
+                return False
+            if self.leases.active_count(shard.node_id) > 0:
+                return False
+        return True
+
+    def _can_direct_emit_root_chunk(
+        self,
+        item: WorkItem,
+        collector: "_OutputCollector",
+    ) -> bool:
+        return (
+            self.config.direct_root_chunk_emission
+            and len(self.shards) == 1
+            and item.node_id == self.shards[0].node_id
+            and item.start == collector.emitted_count
+        )
+
+    def _accept_direct_root_chunk(
+        self,
+        message: ControlMessage,
+        *,
+        collector: "_OutputCollector",
+        limit: int,
+        output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None,
+        output_artifact_callback: Callable[..., None] | None,
+    ) -> None:
+        if message.work_item is None:
+            raise RuntimeError("root chunk is missing work_item")
+        item = message.work_item
+        record_count = _message_record_count(message)
+        state = self.states.ensure_node(item.node_id)
+        if record_count < item.size:
+            state.mark_exhausted(item.start + record_count)
+        if record_count <= 0:
+            self._release_lease_for_item(item)
+            return
+        if item.start < collector.emitted_count:
+            self._delete_unpublished_artifacts(message)
+            self._release_lease_for_item(item)
+            return
+
+        self._pending_root_chunks[item.start] = message
+        while collector.emitted_count < limit:
+            pending = self._pending_root_chunks.pop(collector.emitted_count, None)
+            if pending is None:
+                return
+            self._emit_pending_root_chunk(
+                pending,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+                output_artifact_callback=output_artifact_callback,
+            )
+
+    def _accept_direct_unordered_chunk(
+        self,
+        message: ControlMessage,
+        *,
+        collector: "_OutputCollector",
+        limit: int,
+        output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None,
+        output_artifact_callback: Callable[..., None] | None,
+    ) -> None:
+        if message.work_item is None:
+            raise RuntimeError("direct chunk is missing work_item")
+        item = message.work_item
+        record_count = _message_record_count(message)
+        ready_end = item.start + record_count
+        state = self.states.ensure_node(item.node_id)
+        if record_count < item.size:
+            state.mark_exhausted(ready_end)
+        if record_count <= 0:
+            self._release_lease_for_item(item)
+            return
+        state = self.states.ensure_node(item.node_id)
+        if ready_end > state.ready_end:
+            self.states.update_ready_end(item.node_id, ready_end)
+        if ready_end > self.chunk_store.base_offset(item.node_id):
+            self.chunk_store.advance_base_offset(item.node_id, ready_end)
+        if self._is_artifact_chunk(message):
+            artifact_limit = limit
+            if self.config.direct_unordered_chunk_emission:
+                artifact_limit = max(limit, collector.emitted_count + record_count)
+            self._emit_direct_artifact(
+                item,
+                message,
+                collector=collector,
+                limit=artifact_limit,
+                output_artifact_callback=output_artifact_callback,
+            )
+        else:
+            self._emit_direct_records(
+                item,
+                message.records,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+            )
+        self._release_lease_for_item(item)
+        self._register_direct_unordered_demands(limit)
+
+    def _emit_pending_root_chunk(
+        self,
+        message: ControlMessage,
+        *,
+        collector: "_OutputCollector",
+        limit: int,
+        output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None,
+        output_artifact_callback: Callable[..., None] | None,
+    ) -> None:
+        if message.work_item is None:
+            raise RuntimeError("root chunk is missing work_item")
+        item = message.work_item
+        ready_end = item.start + _message_record_count(message)
+        self.states.update_ready_end(item.node_id, ready_end)
+        if self._is_artifact_chunk(message):
+            self._emit_direct_artifact(
+                item,
+                message,
+                collector=collector,
+                limit=limit,
+                output_artifact_callback=output_artifact_callback,
+            )
+        else:
+            self._emit_direct_records(
+                item,
+                message.records,
+                collector=collector,
+                limit=limit,
+                output_callback=output_callback,
+                output_records_callback=output_records_callback,
+            )
+        self._release_lease_for_item(item)
+
+    def _release_lease_for_item(self, item: WorkItem) -> None:
+        lease = self.leases.lease_for(item.node_id, item.epoch)
+        if lease is not None:
+            self.leases.release(lease)
+
+
+    def _emit_direct_records(
+        self,
+        item: WorkItem,
+        records: tuple[GuessRecord, ...],
+        *,
+        collector: "_OutputCollector",
+        limit: int,
+        output_callback: Callable[[GuessRecord], None] | None,
+        output_records_callback: Callable[[tuple[GuessRecord, ...]], None] | None,
+    ) -> None:
+        remaining = limit - collector.emitted_count
+        if remaining <= 0:
+            return
+        emitted = records[:remaining]
+        collector.extend(emitted)
+        if output_records_callback is not None:
+            output_records_callback(emitted)
+        elif output_callback is not None:
+            for record in emitted:
+                output_callback(record)
+
+        shard = self._shard_for_item(item)
+        shard.cursor = max(shard.cursor, item.start + len(emitted))
+        self.states.update_frontier_start(item.node_id, shard.cursor)
+        if self.config.reclaim_emitted_chunks:
+            self.chunk_store.advance_base_offset(item.node_id, shard.cursor)
+
+    def _emit_direct_artifact(
+        self,
+        item: WorkItem,
+        message: ControlMessage,
+        *,
+        collector: "_OutputCollector",
+        limit: int,
+        output_artifact_callback: Callable[..., None] | None,
+    ) -> None:
+        record_count = message.artifact_record_count or 0
+        if record_count <= 0:
+            return
+        remaining = limit - collector.emitted_count
+        emit_count = min(record_count, max(0, remaining))
+        if emit_count <= 0:
+            self._delete_unpublished_artifacts(message)
+            return
+        if emit_count != record_count:
+            raise RuntimeError("direct artifact chunk cannot be partially emitted")
+        if self.config.track_output_digest:
+            if message.stable_artifact_uri is not None and message.stable_artifact_sha256 is not None:
+                collector.extend_stable_artifact(
+                    message.stable_artifact_uri,
+                    expected_sha256=message.stable_artifact_sha256,
+                    record_count=emit_count,
+                )
+                _delete_file_uri(message.stable_artifact_uri)
+            elif (
+                message.stable_fingerprint is not None
+                and message.stable_fingerprint_bytes is not None
+            ):
+                collector.extend_stable_fingerprint(
+                    message.stable_fingerprint,
+                    byte_length=message.stable_fingerprint_bytes,
+                    record_count=emit_count,
+                )
+            else:
+                raise RuntimeError(
+                    "artifact chunk is missing stable digest or fingerprint"
+                )
+        else:
+            if message.stable_artifact_uri is not None:
+                _delete_file_uri(message.stable_artifact_uri)
+            collector.extend_count(emit_count)
+
+        if output_artifact_callback is not None:
+            output_artifact_callback(
+                record_count=emit_count,
+                payload_bytes=message.artifact_payload_bytes or 0,
+                artifact_uri=message.artifact_uri or "",
+                artifact_sha256=message.artifact_sha256 or "",
+                artifact_bytes=message.artifact_bytes or 0,
+                probability_mass=message.artifact_probability_mass or 0.0,
+                artifact_format=message.artifact_format or "guess-lines-v1",
+            )
+
+        shard = self._shard_for_item(item)
+        shard.cursor = max(shard.cursor, item.start + emit_count)
+        self.states.update_frontier_start(item.node_id, shard.cursor)
+        if self.config.reclaim_emitted_chunks:
+            self.chunk_store.advance_base_offset(item.node_id, shard.cursor)
+
+    def _delete_unpublished_artifacts(self, message: ControlMessage) -> None:
+        if message.artifact_uri is not None:
+            _delete_file_uri(message.artifact_uri)
+        if message.stable_artifact_uri is not None:
+            _delete_file_uri(message.stable_artifact_uri)
+
+    def _shard_for_item(self, item: WorkItem) -> RootShard:
+        shard = self._shard_by_node_id.get(item.node_id)
+        if shard is None:
+            raise RuntimeError(f"unknown direct chunk node: {item.node_id}")
+        return shard
 
     def _handle_migration_message(
         self,
@@ -668,12 +1172,18 @@ class DistributedProtocolTracker:
         if message.work_item is None or message.runtime_feedback is None:
             return
         feedback = message.runtime_feedback
+        chunk_probability_mass = (
+            message.artifact_probability_mass
+            if message.artifact_probability_mass is not None
+            else sum(max(0.0, record.prob) for record in message.records)
+        )
         self.states.record_runtime_feedback(
             message.work_item.node_id,
             chunk_latency_seconds=feedback.chunk_latency_seconds,
             records_requested=feedback.records_requested,
             records_produced=feedback.records_produced,
             ewma_alpha=self.config.scheduler.feedback_ewma_alpha,
+            chunk_probability_mass=chunk_probability_mass,
         )
 
     def _advance_outputs(
@@ -726,6 +1236,17 @@ class DistributedProtocolTracker:
         _increment(self._assigned_items_by_node, item.node_id, 1)
         _increment(self._assigned_records_by_node, item.node_id, item.size)
 
+    def _record_received(
+        self,
+        item: WorkItem,
+        worker_id: WorkerId,
+        record_count: int,
+    ) -> None:
+        if record_count <= 0:
+            return
+        _increment(self._received_records_by_worker, worker_id, record_count)
+        _increment(self._received_records_by_node, item.node_id, record_count)
+
     def _reclaim_consumed_records(self) -> None:
         for shard in self.shards:
             self.chunk_store.reclaim_before(shard.node_id, shard.cursor)
@@ -765,6 +1286,37 @@ def _sorted_items(mapping: dict) -> tuple:
     return tuple(sorted(mapping.items(), key=lambda item: str(item[0])))
 
 
+def _message_record_count(message: ControlMessage) -> int:
+    if message.records:
+        return len(message.records)
+    if message.artifact_record_count is not None:
+        return int(message.artifact_record_count)
+    return 0
+
+
+def _open_file_uri(uri: str):
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        return Path(unquote(parsed.path)).open("rb")
+    if parsed.scheme == "":
+        return Path(uri).open("rb")
+    raise RuntimeError(f"unsupported tracker artifact URI scheme: {parsed.scheme}")
+
+
+def _delete_file_uri(uri: str) -> None:
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        path = Path(unquote(parsed.path))
+    elif parsed.scheme == "":
+        path = Path(uri)
+    else:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
 class _OutputCollector:
     def __init__(
         self,
@@ -772,12 +1324,17 @@ class _OutputCollector:
         collect_outputs: bool,
         initial_stable_records: tuple[str, ...] = (),
         track_stable_records: bool = False,
+        track_digest: bool = True,
     ) -> None:
         self._outputs: list[GuessRecord] | None = [] if collect_outputs else None
+        self._track_digest = track_digest
         self._digest = sha256()
-        for stable_record in initial_stable_records:
-            self._digest.update(stable_record.encode("utf-8"))
-            self._digest.update(b"\n")
+        self._fingerprint = StableStreamFingerprint()
+        if self._track_digest:
+            for stable_record in initial_stable_records:
+                payload = stable_record.encode("utf-8") + b"\n"
+                self._digest.update(payload)
+                self._fingerprint = self._fingerprint.update_bytes(payload)
         self.emitted_count = len(initial_stable_records)
         self._stable_records: list[str] | None = (
             list(initial_stable_records) if track_stable_records else None
@@ -794,6 +1351,10 @@ class _OutputCollector:
         return self._digest.hexdigest()
 
     @property
+    def stable_fingerprint(self) -> str:
+        return self._fingerprint.to_string()
+
+    @property
     def stable_records(self) -> tuple[str, ...]:
         if self._stable_records is None:
             return ()
@@ -805,9 +1366,75 @@ class _OutputCollector:
             self._outputs.append(record)
         if self._stable_records is not None:
             self._stable_records.append(stable_record)
-        self._digest.update(stable_record.encode("utf-8"))
-        self._digest.update(b"\n")
+        payload = stable_record.encode("utf-8") + b"\n"
+        if self._track_digest:
+            self._digest.update(payload)
+        self._fingerprint = self._fingerprint.update_bytes(payload)
         self.emitted_count += 1
+
+    def extend(self, records: tuple[GuessRecord, ...]) -> None:
+        for record in records:
+            self.append(record)
+
+    def extend_count(self, record_count: int) -> None:
+        if record_count < 0:
+            raise ValueError("record_count cannot be negative")
+        if self._outputs is not None or self._stable_records is not None:
+            raise RuntimeError("count-only emission cannot collect outputs")
+        self.emitted_count += record_count
+
+    def extend_stable_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        byte_length: int,
+        record_count: int,
+    ) -> None:
+        if record_count < 0:
+            raise ValueError("record_count cannot be negative")
+        if self._outputs is not None or self._stable_records is not None:
+            raise RuntimeError(
+                "stable fingerprint emission cannot collect materialized outputs"
+            )
+        chunk = StableStreamFingerprint.from_string(fingerprint)
+        if chunk.byte_length != byte_length:
+            raise RuntimeError(
+                "stable fingerprint byte length mismatch: "
+                f"{chunk.byte_length} != {byte_length}"
+            )
+        self._fingerprint = self._fingerprint.combine(chunk)
+        self.emitted_count += record_count
+
+    def extend_stable_artifact(
+        self,
+        uri: str,
+        *,
+        expected_sha256: str,
+        record_count: int,
+    ) -> None:
+        if record_count < 0:
+            raise ValueError("record_count cannot be negative")
+        if self._outputs is not None or self._stable_records is not None:
+            raise RuntimeError(
+                "stable artifact emission cannot collect materialized outputs"
+            )
+        artifact_digest = sha256()
+        with _open_file_uri(uri) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                artifact_digest.update(chunk)
+                if self._track_digest:
+                    self._digest.update(chunk)
+                self._fingerprint = self._fingerprint.update_bytes(chunk)
+        actual = artifact_digest.hexdigest()
+        if actual != expected_sha256:
+            raise RuntimeError(
+                "stable artifact sha256 mismatch: "
+                f"{actual} != {expected_sha256}"
+            )
+        self.emitted_count += record_count
 
 
 __all__ = [

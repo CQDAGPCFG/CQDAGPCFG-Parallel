@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from CQDAGPCFG import GuessRecord
 
 from cqdagpcfg_parallel.protocol import NodeId, WorkItem, WorkerId
+from cqdagpcfg_parallel.runtime.batch_transport import BinaryCandidateBatchCodec
+from cqdagpcfg_parallel.runtime.candidate_batch import CandidateBatch
+
+from .resources import WorkerResourceSpec
 
 
 MessageType = Literal[
@@ -63,13 +68,34 @@ class ControlMessage:
     snapshot_payload: str | None = None
     snapshot_digest: str | None = None
     snapshot_bytes: int | None = None
+    artifact_uri: str | None = None
+    artifact_sha256: str | None = None
+    artifact_format: str | None = None
+    artifact_bytes: int | None = None
+    artifact_record_count: int | None = None
+    artifact_payload_bytes: int | None = None
+    artifact_probability_mass: float | None = None
+    stable_artifact_uri: str | None = None
+    stable_artifact_sha256: str | None = None
+    stable_artifact_bytes: int | None = None
+    stable_fingerprint: str | None = None
+    stable_fingerprint_bytes: int | None = None
+    worker_resources: WorkerResourceSpec | None = None
 
 
 class ControlMessageCodec:
     schema_version = 1
+    _binary_magic = b"CQC"
+    _binary_header = struct.Struct("!3sBI")
 
     @classmethod
     def dumps(cls, message: ControlMessage) -> bytes:
+        if message.records:
+            return cls._dumps_binary_records(message)
+        return cls._dumps_json(message)
+
+    @classmethod
+    def _dumps_json(cls, message: ControlMessage) -> bytes:
         payload: dict[str, Any] = {
             "schema_version": cls.schema_version,
             "type": message.type,
@@ -106,11 +132,120 @@ class ControlMessageCodec:
             payload["snapshot_digest"] = message.snapshot_digest
         if message.snapshot_bytes is not None:
             payload["snapshot_bytes"] = message.snapshot_bytes
+        if message.artifact_uri is not None:
+            payload["artifact_uri"] = message.artifact_uri
+        if message.artifact_sha256 is not None:
+            payload["artifact_sha256"] = message.artifact_sha256
+        if message.artifact_format is not None:
+            payload["artifact_format"] = message.artifact_format
+        if message.artifact_bytes is not None:
+            payload["artifact_bytes"] = message.artifact_bytes
+        if message.artifact_record_count is not None:
+            payload["artifact_record_count"] = message.artifact_record_count
+        if message.artifact_payload_bytes is not None:
+            payload["artifact_payload_bytes"] = message.artifact_payload_bytes
+        if message.artifact_probability_mass is not None:
+            payload["artifact_probability_mass"] = message.artifact_probability_mass
+        if message.stable_artifact_uri is not None:
+            payload["stable_artifact_uri"] = message.stable_artifact_uri
+        if message.stable_artifact_sha256 is not None:
+            payload["stable_artifact_sha256"] = message.stable_artifact_sha256
+        if message.stable_artifact_bytes is not None:
+            payload["stable_artifact_bytes"] = message.stable_artifact_bytes
+        if message.stable_fingerprint is not None:
+            payload["stable_fingerprint"] = message.stable_fingerprint
+        if message.stable_fingerprint_bytes is not None:
+            payload["stable_fingerprint_bytes"] = message.stable_fingerprint_bytes
+        if message.worker_resources is not None:
+            payload["worker_resources"] = message.worker_resources.to_dict()
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     @classmethod
+    def _dumps_binary_records(cls, message: ControlMessage) -> bytes:
+        payload = json.loads(cls._dumps_json(_message_without_records(message)).decode("utf-8"))
+        payload["records_codec"] = "candidate-batch-binary-v1"
+        start_rank = message.work_item.start if message.work_item is not None else 0
+        record_payload = BinaryCandidateBatchCodec.dumps(
+            CandidateBatch.from_records(
+                batch_id=0,
+                start_rank=start_rank,
+                records=message.records,
+            )
+        )
+        metadata = json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return b"".join(
+            (
+                cls._binary_header.pack(
+                    cls._binary_magic,
+                    cls.schema_version,
+                    len(metadata),
+                ),
+                metadata,
+                record_payload,
+            )
+        )
+
+    @classmethod
     def loads(cls, payload: bytes) -> ControlMessage:
+        if payload.startswith(cls._binary_magic):
+            return cls._loads_binary_records(payload)
         raw = json.loads(payload.decode("utf-8"))
+        return cls._message_from_raw(raw)
+
+    @classmethod
+    def _loads_binary_records(cls, payload: bytes) -> ControlMessage:
+        magic, version, metadata_length = cls._binary_header.unpack_from(payload, 0)
+        if magic != cls._binary_magic:
+            raise ValueError("unsupported control message binary magic")
+        if version != cls.schema_version:
+            raise ValueError("unsupported control message binary schema version")
+        offset = cls._binary_header.size
+        metadata = payload[offset : offset + metadata_length]
+        record_payload = payload[offset + metadata_length :]
+        raw = json.loads(metadata.decode("utf-8"))
+        if raw.get("records_codec") != "candidate-batch-binary-v1":
+            raise ValueError("unsupported control message records codec")
+        batch = BinaryCandidateBatchCodec.loads(record_payload)
+        message = cls._message_from_raw(raw)
+        return ControlMessage(
+            type=message.type,
+            worker_id=message.worker_id,
+            work_item=message.work_item,
+            records=batch.records,
+            runtime_feedback=message.runtime_feedback,
+            error=message.error,
+            retire=message.retire,
+            model_fingerprint=message.model_fingerprint,
+            migration_id=message.migration_id,
+            node_id=message.node_id,
+            source_worker_id=message.source_worker_id,
+            target_worker_id=message.target_worker_id,
+            source_epoch=message.source_epoch,
+            target_epoch=message.target_epoch,
+            snapshot_payload=message.snapshot_payload,
+            snapshot_digest=message.snapshot_digest,
+            snapshot_bytes=message.snapshot_bytes,
+            artifact_uri=message.artifact_uri,
+            artifact_sha256=message.artifact_sha256,
+            artifact_format=message.artifact_format,
+            artifact_bytes=message.artifact_bytes,
+            artifact_record_count=message.artifact_record_count,
+            artifact_payload_bytes=message.artifact_payload_bytes,
+            artifact_probability_mass=message.artifact_probability_mass,
+            stable_artifact_uri=message.stable_artifact_uri,
+            stable_artifact_sha256=message.stable_artifact_sha256,
+            stable_artifact_bytes=message.stable_artifact_bytes,
+            stable_fingerprint=message.stable_fingerprint,
+            stable_fingerprint_bytes=message.stable_fingerprint_bytes,
+            worker_resources=message.worker_resources,
+        )
+
+    @classmethod
+    def _message_from_raw(cls, raw: dict[str, Any]) -> ControlMessage:
         if raw.get("schema_version") != cls.schema_version:
             raise ValueError("unsupported control message schema version")
 
@@ -144,6 +279,43 @@ class ControlMessageCodec:
             snapshot_payload=raw.get("snapshot_payload"),
             snapshot_digest=raw.get("snapshot_digest"),
             snapshot_bytes=int(raw["snapshot_bytes"]) if "snapshot_bytes" in raw else None,
+            artifact_uri=raw.get("artifact_uri"),
+            artifact_sha256=raw.get("artifact_sha256"),
+            artifact_format=raw.get("artifact_format"),
+            artifact_bytes=int(raw["artifact_bytes"]) if "artifact_bytes" in raw else None,
+            artifact_record_count=(
+                int(raw["artifact_record_count"])
+                if "artifact_record_count" in raw
+                else None
+            ),
+            artifact_payload_bytes=(
+                int(raw["artifact_payload_bytes"])
+                if "artifact_payload_bytes" in raw
+                else None
+            ),
+            artifact_probability_mass=(
+                float(raw["artifact_probability_mass"])
+                if "artifact_probability_mass" in raw
+                else None
+            ),
+            stable_artifact_uri=raw.get("stable_artifact_uri"),
+            stable_artifact_sha256=raw.get("stable_artifact_sha256"),
+            stable_artifact_bytes=(
+                int(raw["stable_artifact_bytes"])
+                if "stable_artifact_bytes" in raw
+                else None
+            ),
+            stable_fingerprint=raw.get("stable_fingerprint"),
+            stable_fingerprint_bytes=(
+                int(raw["stable_fingerprint_bytes"])
+                if "stable_fingerprint_bytes" in raw
+                else None
+            ),
+            worker_resources=(
+                WorkerResourceSpec.from_dict(raw["worker_resources"])
+                if "worker_resources" in raw
+                else None
+            ),
         )
 
 
@@ -151,11 +323,13 @@ def ready_message(
     worker_id: WorkerId,
     *,
     model_fingerprint: str | None = None,
+    worker_resources: WorkerResourceSpec | None = None,
 ) -> ControlMessage:
     return ControlMessage(
         type="ready",
         worker_id=worker_id,
         model_fingerprint=model_fingerprint,
+        worker_resources=worker_resources,
     )
 
 
@@ -170,6 +344,7 @@ def chunk_message(
     runtime_feedback: RuntimeFeedback | None = None,
     retire: bool = False,
     model_fingerprint: str | None = None,
+    worker_resources: WorkerResourceSpec | None = None,
 ) -> ControlMessage:
     return ControlMessage(
         type="chunk",
@@ -179,6 +354,50 @@ def chunk_message(
         runtime_feedback=runtime_feedback,
         retire=retire,
         model_fingerprint=model_fingerprint,
+        worker_resources=worker_resources,
+    )
+
+
+def artifact_chunk_message(
+    item: WorkItem,
+    *,
+    artifact_uri: str,
+    artifact_sha256: str,
+    artifact_bytes: int,
+    artifact_record_count: int,
+    artifact_payload_bytes: int,
+    artifact_probability_mass: float,
+    stable_artifact_uri: str | None = None,
+    stable_artifact_sha256: str | None = None,
+    stable_artifact_bytes: int | None = None,
+    stable_fingerprint: str | None = None,
+    stable_fingerprint_bytes: int | None = None,
+    runtime_feedback: RuntimeFeedback | None = None,
+    retire: bool = False,
+    model_fingerprint: str | None = None,
+    worker_resources: WorkerResourceSpec | None = None,
+    artifact_format: str = "guess-lines-v1",
+) -> ControlMessage:
+    return ControlMessage(
+        type="chunk",
+        worker_id=item.worker_id,
+        work_item=item,
+        runtime_feedback=runtime_feedback,
+        retire=retire,
+        model_fingerprint=model_fingerprint,
+        artifact_uri=artifact_uri,
+        artifact_sha256=artifact_sha256,
+        artifact_format=artifact_format,
+        artifact_bytes=artifact_bytes,
+        artifact_record_count=artifact_record_count,
+        artifact_payload_bytes=artifact_payload_bytes,
+        artifact_probability_mass=artifact_probability_mass,
+        stable_artifact_uri=stable_artifact_uri,
+        stable_artifact_sha256=stable_artifact_sha256,
+        stable_artifact_bytes=stable_artifact_bytes,
+        stable_fingerprint=stable_fingerprint,
+        stable_fingerprint_bytes=stable_fingerprint_bytes,
+        worker_resources=worker_resources,
     )
 
 
@@ -188,6 +407,7 @@ def exhausted_message(
     runtime_feedback: RuntimeFeedback | None = None,
     retire: bool = False,
     model_fingerprint: str | None = None,
+    worker_resources: WorkerResourceSpec | None = None,
 ) -> ControlMessage:
     return ControlMessage(
         type="exhausted",
@@ -196,6 +416,7 @@ def exhausted_message(
         runtime_feedback=runtime_feedback,
         retire=retire,
         model_fingerprint=model_fingerprint,
+        worker_resources=worker_resources,
     )
 
 
@@ -211,12 +432,14 @@ def retire_message(
     worker_id: WorkerId,
     *,
     model_fingerprint: str | None = None,
+    worker_resources: WorkerResourceSpec | None = None,
 ) -> ControlMessage:
     return ControlMessage(
         type="retire",
         worker_id=worker_id,
         retire=True,
         model_fingerprint=model_fingerprint,
+        worker_resources=worker_resources,
     )
 
 
@@ -368,6 +591,8 @@ def _work_item_to_dict(item: WorkItem) -> dict[str, Any]:
         "worker_id": str(item.worker_id),
         "epoch": item.epoch,
         "reclaim_before": item.reclaim_before,
+        "estimated_mass": item.estimated_mass,
+        "mass_budget": item.mass_budget,
     }
 
 
@@ -379,6 +604,8 @@ def _work_item_from_dict(raw: dict[str, Any]) -> WorkItem:
         worker_id=WorkerId(str(raw["worker_id"])),
         epoch=int(raw["epoch"]),
         reclaim_before=int(raw.get("reclaim_before", 0)),
+        estimated_mass=float(raw.get("estimated_mass", 0.0)),
+        mass_budget=float(raw.get("mass_budget", 0.0)),
     )
 
 
@@ -418,10 +645,45 @@ def _runtime_feedback_from_dict(raw: dict[str, Any]) -> RuntimeFeedback:
     )
 
 
+def _message_without_records(message: ControlMessage) -> ControlMessage:
+    return ControlMessage(
+        type=message.type,
+        worker_id=message.worker_id,
+        work_item=message.work_item,
+        runtime_feedback=message.runtime_feedback,
+        error=message.error,
+        retire=message.retire,
+        model_fingerprint=message.model_fingerprint,
+        migration_id=message.migration_id,
+        node_id=message.node_id,
+        source_worker_id=message.source_worker_id,
+        target_worker_id=message.target_worker_id,
+        source_epoch=message.source_epoch,
+        target_epoch=message.target_epoch,
+        snapshot_payload=message.snapshot_payload,
+        snapshot_digest=message.snapshot_digest,
+        snapshot_bytes=message.snapshot_bytes,
+        artifact_uri=message.artifact_uri,
+        artifact_sha256=message.artifact_sha256,
+        artifact_format=message.artifact_format,
+        artifact_bytes=message.artifact_bytes,
+        artifact_record_count=message.artifact_record_count,
+        artifact_payload_bytes=message.artifact_payload_bytes,
+        artifact_probability_mass=message.artifact_probability_mass,
+        stable_artifact_uri=message.stable_artifact_uri,
+        stable_artifact_sha256=message.stable_artifact_sha256,
+        stable_artifact_bytes=message.stable_artifact_bytes,
+        stable_fingerprint=message.stable_fingerprint,
+        stable_fingerprint_bytes=message.stable_fingerprint_bytes,
+        worker_resources=message.worker_resources,
+    )
+
+
 __all__ = [
     "ControlMessage",
     "ControlMessageCodec",
     "RuntimeFeedback",
+    "artifact_chunk_message",
     "chunk_message",
     "error_message",
     "exhausted_message",

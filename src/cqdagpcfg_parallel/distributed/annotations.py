@@ -38,7 +38,7 @@ class AnnotatedGenerator:
 @dataclass(slots=True)
 class AnnotatedConsumer:
     handler: ConsumerHandler
-    close_handler: Callable[[], None] | None = None
+    close_handler: Callable[[], object] | None = None
     role: str = "consumer"
     closed: bool = False
 
@@ -47,12 +47,13 @@ class AnnotatedConsumer:
             raise RuntimeError("cannot publish to a closed annotated consumer")
         return self.handler(batch)
 
-    def close(self) -> None:
+    def close(self) -> object:
         if self.closed:
-            return
+            return None
         self.closed = True
         if self.close_handler is not None:
-            self.close_handler()
+            return self.close_handler()
+        return None
 
     def __call__(self, batch: CandidateBatch) -> object:
         return self.publish(batch)
@@ -213,7 +214,7 @@ def cqpcfg_generator(source_factory: WorkerSourceFactory) -> AnnotatedGenerator:
 def cqpcfg_consumer(
     handler: ConsumerHandler | None = None,
     *,
-    close: Callable[[], None] | None = None,
+    close: Callable[[], object] | None = None,
 ) -> Callable[[ConsumerHandler], AnnotatedConsumer] | AnnotatedConsumer:
     def decorator(consumer_handler: ConsumerHandler) -> AnnotatedConsumer:
         return AnnotatedConsumer(handler=consumer_handler, close_handler=close)

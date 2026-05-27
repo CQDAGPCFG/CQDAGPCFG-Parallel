@@ -8,6 +8,7 @@ from cqdagpcfg_parallel.distributed import (
     DistributedProtocolConfig,
     DistributedProtocolTracker,
     RuntimeFeedback,
+    WorkerResourceSpec,
     chunk_message,
     migrate_install_message,
     migrate_state_message,
@@ -36,6 +37,8 @@ def test_control_message_codec_round_trips_work_item() -> None:
         worker_id=WorkerId("worker-0"),
         epoch=7,
         reclaim_before=2,
+        estimated_mass=0.75,
+        mass_budget=1.0,
     )
 
     decoded = ControlMessageCodec.loads(ControlMessageCodec.dumps(work_message(item)))
@@ -43,6 +46,8 @@ def test_control_message_codec_round_trips_work_item() -> None:
     assert decoded.type == "work"
     assert decoded.work_item == item
     assert decoded.work_item.reclaim_before == 2
+    assert decoded.work_item.estimated_mass == pytest.approx(0.75)
+    assert decoded.work_item.mass_budget == pytest.approx(1.0)
     assert decoded.worker_id == WorkerId("worker-0")
 
 
@@ -96,6 +101,27 @@ def test_control_message_codec_round_trips_model_fingerprint() -> None:
     )
 
     assert decoded.model_fingerprint == "sha256:model"
+
+
+def test_control_message_codec_round_trips_worker_resources() -> None:
+    resources = WorkerResourceSpec(
+        cpu_cores=2.0,
+        memory_bytes=512 * 1024 * 1024,
+        gpu_count=1,
+        model_json_page_cache=16,
+    )
+
+    decoded = ControlMessageCodec.loads(
+        ControlMessageCodec.dumps(
+            ready_message(
+                WorkerId("worker-0"),
+                model_fingerprint="sha256:model",
+                worker_resources=resources,
+            )
+        )
+    )
+
+    assert decoded.worker_resources == resources
 
 
 def test_control_message_codec_round_trips_migration_state() -> None:

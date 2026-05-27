@@ -14,7 +14,7 @@ from cqdagpcfg_parallel.storage import (
     PagedModelManifest,
 )
 
-from .zmq_transport import ZmqEndpoint, _require_zmq
+from .zmq_transport import ZmqEndpoint, _require_zmq, configure_zmq_socket
 
 
 ModelFetchKind = Literal["manifest", "chunk", "paged_manifest", "page"]
@@ -204,7 +204,13 @@ class ZmqModelArtifactServer:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.REP)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            send=True,
+            recv=True,
+        )
         if self.endpoint.bind:
             socket.bind(self.endpoint.address)
         else:  # pragma: no cover - guarded above
@@ -325,7 +331,14 @@ class ZmqModelArtifactClient:
         if self.context is None:
             self.context = zmq.Context()
         socket = self.context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, self.endpoint.linger_ms)
+        configure_zmq_socket(
+            socket,
+            self.endpoint,
+            zmq_module=zmq,
+            send=True,
+            recv=True,
+            connect=True,
+        )
         if self.timeout_ms > 0:
             socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
             socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
