@@ -508,9 +508,20 @@ class DistributedProtocolTracker:
         ):
             return wait_message()
 
+        worker_chunk_cap = self._worker_chunk_cap(worker_id)
+        if self.config.direct_unordered_chunk_emission:
+            remaining_budget = (
+                limit
+                - collector.emitted_count
+                - self._direct_unordered_inflight_records()
+            )
+            if remaining_budget <= 0:
+                return wait_message()
+            worker_chunk_cap = min(worker_chunk_cap, remaining_budget)
+
         item = self.scheduler.schedule(
             worker_id,
-            max_chunk_size=self._worker_chunk_cap(worker_id),
+            max_chunk_size=worker_chunk_cap,
         )
         if item is None:
             return wait_message()
@@ -671,10 +682,7 @@ class DistributedProtocolTracker:
             for node_id in self._direct_unordered_active_nodes
             if not self.states.get(node_id).exhausted
         }
-        active_target = max(
-            16,
-            self.config.scheduler.max_parallel_leases_per_node * 8,
-        )
+        active_target = 1
         while (
             len(self._direct_unordered_active_nodes) < active_target
             and self._direct_unordered_shard_cursor < len(self._direct_unordered_shards_by_priority)
@@ -686,7 +694,11 @@ class DistributedProtocolTracker:
             if self.states.get(shard.node_id).exhausted:
                 continue
             self._direct_unordered_active_nodes.add(shard.node_id)
+        planned_count = self._direct_unordered_scheduled_count()
         for node_id in tuple(self._direct_unordered_active_nodes):
+            remaining = limit - planned_count
+            if remaining <= 0:
+                return
             shard = self._shard_by_node_id.get(node_id)
             if shard is None:
                 continue
@@ -696,6 +708,8 @@ class DistributedProtocolTracker:
             ready_end = self.chunk_store.ready_end(shard.node_id)
             target_base = max(ready_end, state.scheduled_end)
             target_end = target_base + self.config.demand_window
+            target_end = min(target_end, target_base + remaining)
+            target_end = min(target_end, limit)
             if shard.cardinality is not None:
                 target_end = min(target_end, shard.cardinality)
             if target_end <= target_base:
@@ -708,6 +722,7 @@ class DistributedProtocolTracker:
                 priority=shard.priority,
                 estimated_cost=shard.estimated_cost,
             )
+            planned_count += target_end - target_base
 
     def _is_done_count_only(self, limit: int) -> bool:
         # Direct unordered emission may intentionally overrun by the final
@@ -718,8 +733,16 @@ class DistributedProtocolTracker:
         count = 0
         for shard in self.shards:
             state = self.states.get(shard.node_id)
-            count += max(shard.cursor, state.scheduled_end)
+            count += max(shard.cursor, state.scheduled_end, state.effective_target_end)
         return count
+
+    def _direct_unordered_inflight_records(self) -> int:
+        total = 0
+        for shard in self.shards:
+            for lease in self.leases.active_leases(shard.node_id):
+                if lease.end is not None:
+                    total += max(0, lease.end - lease.start)
+        return total
 
     def _direct_unordered_exhausted(self) -> bool:
         if not self.shards:

@@ -95,6 +95,36 @@ class CandidateRangeArtifact:
     probability_mass: float
 
 
+def _empty_candidate_artifact(
+    *,
+    guess_path: Path,
+    stable_path: Path | None,
+    verify_artifact: bool,
+) -> CandidateRangeArtifact:
+    guess_path.parent.mkdir(parents=True, exist_ok=True)
+    guess_path.write_bytes(b"")
+    if stable_path is not None:
+        stable_path.parent.mkdir(parents=True, exist_ok=True)
+        stable_path.write_bytes(b"")
+    return CandidateRangeArtifact(
+        record_count=0,
+        payload_bytes=0,
+        artifact_uri=guess_path.resolve().as_uri(),
+        artifact_sha256=_artifact_sha256(guess_path, verify_artifact),
+        artifact_bytes=0,
+        stable_artifact_uri=(
+            stable_path.resolve().as_uri() if stable_path is not None else None
+        ),
+        stable_artifact_sha256=(
+            _file_sha256(stable_path) if stable_path is not None else None
+        ),
+        stable_artifact_bytes=0,
+        stable_fingerprint="sfp-v1:0:0000000000000000:0000000000000000",
+        stable_fingerprint_bytes=0,
+        probability_mass=0.0,
+    )
+
+
 class CQDAGRecordSource:
     """Lazy local-result provider backed by a CQDAGPCFG serial enumerator."""
 
@@ -1062,12 +1092,18 @@ class _CppStructureLocalStream:
             raise ValueError("invalid structure source range")
         if start < self._cache_base:
             raise RuntimeError("requested range was already reclaimed by the C++ source")
-        if end > self.max_records:
-            raise RuntimeError("requested range exceeds configured structure source limit")
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            self.exhausted = True
+            return ()
         if start > self.ready_end:
             self._skip_to(start)
-        self._ensure(end)
-        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+        self._ensure(effective_end)
+        if effective_end < end:
+            self.exhausted = True
+        return tuple(
+            self._cache[start - self._cache_base : effective_end - self._cache_base]
+        )
 
     def write_range_artifact(
         self,
@@ -1083,17 +1119,23 @@ class _CppStructureLocalStream:
             raise ValueError("invalid structure source range")
         if start < self._cache_base:
             raise RuntimeError("requested range was already reclaimed by the C++ source")
-        if end > self.max_records:
-            raise RuntimeError("requested range exceeds configured structure source limit")
         guess_path = Path(guess_path)
         stable_path = None if stable_path is None else Path(stable_path)
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            self.exhausted = True
+            return _empty_candidate_artifact(
+                guess_path=guess_path,
+                stable_path=stable_path,
+                verify_artifact=verify_artifact,
+            )
         guess_path.parent.mkdir(parents=True, exist_ok=True)
         if stable_path is not None:
             stable_path.parent.mkdir(parents=True, exist_ok=True)
         writer = getattr(self.enumerator, "write_structure_artifacts", None)
         if not callable(writer):
             return _write_record_artifact(
-                self.read_range(start, end),
+                self.read_range(start, effective_end),
                 guess_path=guess_path,
                 stable_path=stable_path,
                 verify_artifact=verify_artifact,
@@ -1102,7 +1144,7 @@ class _CppStructureLocalStream:
         info = writer(
             self.structure_index,
             start,
-            end,
+            effective_end,
             guess_path,
             stable_path,
             include_stable_metadata=(
@@ -1116,7 +1158,7 @@ class _CppStructureLocalStream:
         self._raw_buffer.clear()
         self._lookahead_record = None
         self._reclaimed_records = max(self._reclaimed_records, self._cache_base)
-        if record_count < end - start:
+        if effective_end < end or record_count < effective_end - start:
             self.exhausted = True
         return CandidateRangeArtifact(
             record_count=record_count,
@@ -1326,12 +1368,18 @@ class _StructureLocalStream:
             raise ValueError("invalid structure source range")
         if start < self._cache_base:
             self._restart_from_zero()
-        if end > self.max_records:
-            raise RuntimeError("requested range exceeds configured structure source limit")
+        effective_end = min(end, self.max_records)
+        if start >= effective_end:
+            self.exhausted = True
+            return ()
         if start > self.ready_end:
             self._skip_to(start)
-        self._ensure(end)
-        return tuple(self._cache[start - self._cache_base : end - self._cache_base])
+        self._ensure(effective_end)
+        if effective_end < end:
+            self.exhausted = True
+        return tuple(
+            self._cache[start - self._cache_base : effective_end - self._cache_base]
+        )
 
     @property
     def cached_records(self) -> int:
