@@ -14,7 +14,9 @@ from cqdagpcfg_parallel.adapters.cqdagpcfg import (
     ROOT_NODE_ID,
     SerialCQDAGOracle,
     build_cqdag_node_source,
+    parse_structure_rank_lane_node_id,
     resolve_generation_backend,
+    structure_rank_lane_bounds,
 )
 from cqdagpcfg_parallel.protocol import (
     ChunkSizePolicy,
@@ -186,6 +188,60 @@ def test_cqdag_structure_source_skips_unneeded_prefix_without_caching_records() 
     assert stats.cached_records <= limit - start
     assert stats.peak_cached_records >= end - start
     assert stats.reclaimed_records >= start
+
+
+def test_cqdag_structure_rank_lane_source_maps_local_rank_to_structure_rank() -> None:
+    model = _toy_model()
+    adapter = CQDAGBlockGraphAdapter(model)
+    node = max(adapter.structure_nodes(), key=lambda descriptor: descriptor.cardinality)
+    if node.cardinality < 8:
+        pytest.skip("toy model did not produce a large enough structure stream")
+
+    lane_nodes = tuple(
+        lane
+        for lane in adapter.structure_rank_lane_nodes(lane_count=2)
+        if lane.structure_index == node.structure_index
+    )
+    assert len(lane_nodes) == 2
+    lane = lane_nodes[1]
+    assert parse_structure_rank_lane_node_id(lane.node_id) == (
+        node.structure_index,
+        1,
+        2,
+        node.name,
+    )
+    lane_start, lane_end = structure_rank_lane_bounds(
+        cardinality=node.cardinality,
+        lane_index=1,
+        lane_count=2,
+    )
+    assert lane.rank_start == lane_start
+    assert lane.rank_end == lane_end
+
+    read_count = min(4, lane.cardinality)
+    baseline_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=node.cardinality,
+        adapter=adapter,
+    )
+    baseline = baseline_source.read_range(
+        node.node_id,
+        lane.rank_start,
+        lane.rank_start + read_count,
+    )
+
+    lane_source = CQDAGStructureRecordSource(
+        model,
+        max_records_per_structure=node.cardinality,
+        adapter=adapter,
+    )
+    records = lane_source.read_range(lane.node_id, 0, read_count)
+
+    assert tuple(record.stable_string() for record in records) == tuple(
+        record.stable_string() for record in baseline
+    )
+    assert lane_source.reclaim_before(lane.node_id, read_count) == read_count
+    assert lane_source.stats().reclaimed_records >= read_count
 
 
 def test_cpp_cqdag_structure_source_matches_python_stream_and_skip() -> None:

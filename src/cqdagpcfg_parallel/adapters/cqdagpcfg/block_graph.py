@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import fsum, log, prod
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -68,6 +68,41 @@ class BlockNodeDescriptor:
     estimated_cost: float = 1.0
     base_prob: float = 1.0
     cardinality: int = 1
+    lane_index: int | None = None
+    lane_count: int = 1
+    rank_start: int = 0
+    rank_end: int | None = None
+
+    @property
+    def is_lane(self) -> bool:
+        return self.lane_index is not None
+
+
+@dataclass(frozen=True, slots=True)
+class StructureRankLane:
+    structure_index: int
+    structure_name: str
+    lane_index: int
+    lane_count: int
+    start: int
+    end: int
+
+    @property
+    def node_id(self) -> NodeId:
+        return structure_rank_lane_node_id(
+            self.structure_index,
+            self.structure_name,
+            self.lane_index,
+            self.lane_count,
+        )
+
+    @property
+    def base_node_id(self) -> NodeId:
+        return NodeId(f"structure:{self.structure_index}:{self.structure_name}")
+
+    @property
+    def length(self) -> int:
+        return max(0, self.end - self.start)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +158,63 @@ def _empty_candidate_artifact(
         stable_fingerprint_bytes=0,
         probability_mass=0.0,
     )
+
+
+def structure_rank_lane_node_id(
+    structure_index: int,
+    structure_name: str,
+    lane_index: int,
+    lane_count: int,
+) -> NodeId:
+    if structure_index < 0:
+        raise ValueError("structure_index cannot be negative")
+    if lane_index < 0:
+        raise ValueError("lane_index cannot be negative")
+    if lane_count <= 0:
+        raise ValueError("lane_count must be positive")
+    if lane_index >= lane_count:
+        raise ValueError("lane_index cannot be greater than or equal to lane_count")
+    return NodeId(
+        f"structure:{structure_index}:lane:{lane_index}:{lane_count}:{structure_name}"
+    )
+
+
+def parse_structure_rank_lane_node_id(node_id: NodeId) -> tuple[int, int, int, str] | None:
+    parts = str(node_id).split(":", 5)
+    if len(parts) != 6 or parts[0] != "structure" or parts[2] != "lane":
+        return None
+    try:
+        structure_index = int(parts[1])
+        lane_index = int(parts[3])
+        lane_count = int(parts[4])
+    except ValueError:
+        return None
+    if structure_index < 0 or lane_index < 0 or lane_count <= 0 or lane_index >= lane_count:
+        return None
+    return structure_index, lane_index, lane_count, parts[5]
+
+
+def structure_rank_lane_bounds(
+    *,
+    cardinality: int,
+    lane_index: int,
+    lane_count: int,
+) -> tuple[int, int]:
+    if cardinality < 0:
+        raise ValueError("cardinality cannot be negative")
+    if lane_count <= 0:
+        raise ValueError("lane_count must be positive")
+    if lane_index < 0 or lane_index >= lane_count:
+        raise ValueError("lane_index is out of range")
+    if cardinality == 0:
+        return 0, 0
+    effective_lanes = min(lane_count, cardinality)
+    if lane_index >= effective_lanes:
+        return cardinality, cardinality
+    lane_size = (cardinality + effective_lanes - 1) // effective_lanes
+    start = min(cardinality, lane_index * lane_size)
+    end = min(cardinality, start + lane_size)
+    return start, end
 
 
 class CQDAGRecordSource:
@@ -707,8 +799,16 @@ class CQDAGStructureRecordSource:
     ) -> Sequence[GuessRecord]:
         if start < 0 or end < start:
             raise ValueError("invalid source range")
+        descriptor = self._descriptor_for_node(node_id)
+        lane = self._lane_for_descriptor(descriptor)
+        if lane is None:
+            stream = self._stream_for(node_id)
+            return stream.read_range(start, end)
+        effective_end = min(end, lane.length)
+        if start >= effective_end:
+            return ()
         stream = self._stream_for(node_id)
-        return stream.read_range(start, end)
+        return stream.read_range(lane.start + start, lane.start + effective_end)
 
     def write_range_artifact(
         self,
@@ -721,7 +821,21 @@ class CQDAGStructureRecordSource:
         verify_artifact: bool = True,
         include_stable_metadata: bool = True,
     ) -> CandidateRangeArtifact:
+        descriptor = self._descriptor_for_node(node_id)
+        lane = self._lane_for_descriptor(descriptor)
         stream = self._stream_for(node_id)
+        if lane is not None:
+            effective_end = min(end, lane.length)
+            guess_path = Path(guess_path)
+            stable_path = None if stable_path is None else Path(stable_path)
+            if start >= effective_end:
+                return _empty_candidate_artifact(
+                    guess_path=guess_path,
+                    stable_path=stable_path,
+                    verify_artifact=verify_artifact,
+                )
+            start = lane.start + start
+            end = lane.start + effective_end
         writer = getattr(stream, "write_range_artifact", None)
         if callable(writer):
             return writer(
@@ -741,19 +855,35 @@ class CQDAGStructureRecordSource:
         )
 
     def reclaim_before(self, node_id: NodeId, index: int) -> int:
-        if node_id not in self._descriptors:
-            raise KeyError(f"unknown CQDAG structure source node: {node_id}")
+        descriptor = self._descriptor_for_node(node_id)
+        lane = self._lane_for_descriptor(descriptor)
         stream = self._streams.get(node_id)
         if stream is None:
             return 0
+        if lane is not None:
+            before = max(0, min(stream.reclaimed_records, lane.end) - lane.start)
+            stream.reclaim_before(lane.start + min(index, lane.length))
+            after = max(0, min(stream.reclaimed_records, lane.end) - lane.start)
+            return max(0, after - before)
         return stream.reclaim_before(index)
 
     def stats(self) -> CQDAGSourceReclaimStats:
+        reclaimed_records = 0
+        for node_id, stream in self._streams.items():
+            descriptor = self._descriptor_for_node(node_id)
+            lane = self._lane_for_descriptor(descriptor)
+            if lane is None:
+                reclaimed_records += stream.reclaimed_records
+            else:
+                reclaimed_records += max(
+                    0,
+                    min(stream.reclaimed_records, lane.end) - lane.start,
+                )
         return CQDAGSourceReclaimStats(
             node_count=len(self._descriptors),
             cached_records=sum(stream.cached_records for stream in self._streams.values()),
             peak_cached_records=sum(stream.peak_cached_records for stream in self._streams.values()),
-            reclaimed_records=sum(stream.reclaimed_records for stream in self._streams.values()),
+            reclaimed_records=reclaimed_records,
             dag_repository_active_units=self._repository_active_units(),
             dag_stream_active_units=sum(stream.active_units for stream in self._streams.values()),
         )
@@ -838,17 +968,20 @@ class CQDAGStructureRecordSource:
         stream = self._streams.get(node_id)
         if stream is not None:
             return stream
-        try:
-            descriptor = self._descriptors[node_id]
-        except KeyError as exc:
-            raise KeyError(f"unknown CQDAG structure source node: {node_id}") from exc
+        descriptor = self._descriptor_for_node(node_id)
+        lane = self._lane_for_descriptor(descriptor)
         structure_index = _require_structure_index(descriptor)
+        max_records = (
+            min(self.max_records_per_structure, lane.end)
+            if lane is not None
+            else self.max_records_per_structure
+        )
         if self.cpp_enumerator is not None:
             stream = _CppStructureLocalStream(
                 self.model,
                 enumerator=self.cpp_enumerator,
                 structure_index=structure_index,
-                max_records=self.max_records_per_structure,
+                max_records=max_records,
             )
         else:
             if self.factory is None:
@@ -857,10 +990,60 @@ class CQDAGStructureRecordSource:
                 self.model,
                 factory=self.factory,
                 structure_index=structure_index,
-                max_records=self.max_records_per_structure,
+                max_records=max_records,
             )
         self._streams[node_id] = stream
         return stream
+
+    def _descriptor_for_node(self, node_id: NodeId) -> BlockNodeDescriptor:
+        descriptor = self._descriptors.get(node_id)
+        if descriptor is not None:
+            return descriptor
+        lane_parts = parse_structure_rank_lane_node_id(node_id)
+        if lane_parts is None:
+            raise KeyError(f"unknown CQDAG structure source node: {node_id}")
+        structure_index, lane_index, lane_count, structure_name = lane_parts
+        base_node_id = NodeId(f"structure:{structure_index}:{structure_name}")
+        base = self._descriptors.get(base_node_id)
+        if base is None:
+            raise KeyError(f"unknown CQDAG structure source node: {node_id}")
+        lanes = min(lane_count, max(1, base.cardinality))
+        start, end = structure_rank_lane_bounds(
+            cardinality=base.cardinality,
+            lane_index=lane_index,
+            lane_count=lanes,
+        )
+        if end <= start:
+            raise KeyError(f"empty CQDAG structure lane node: {node_id}")
+        descriptor = replace(
+            base,
+            node_id=node_id,
+            name=f"{base.name}/lane{lane_index + 1}of{lanes}",
+            cardinality=end - start,
+            lane_index=lane_index,
+            lane_count=lanes,
+            rank_start=start,
+            rank_end=end,
+        )
+        self._descriptors[node_id] = descriptor
+        return descriptor
+
+    def _lane_for_descriptor(
+        self,
+        descriptor: BlockNodeDescriptor,
+    ) -> StructureRankLane | None:
+        if descriptor.lane_index is None or descriptor.rank_end is None:
+            return None
+        structure_index = _require_structure_index(descriptor)
+        structure_name = self.model.structures[structure_index].name
+        return StructureRankLane(
+            structure_index=structure_index,
+            structure_name=structure_name,
+            lane_index=descriptor.lane_index,
+            lane_count=descriptor.lane_count,
+            start=descriptor.rank_start,
+            end=descriptor.rank_end,
+        )
 
     def _repository_active_units(self) -> int:
         if self.cpp_enumerator is not None:
@@ -919,6 +1102,50 @@ class CQDAGBlockGraphAdapter:
         )
         return self._structure_nodes_cache
 
+    def structure_rank_lane_nodes(
+        self,
+        *,
+        lane_count: int,
+    ) -> tuple[BlockNodeDescriptor, ...]:
+        if lane_count <= 0:
+            raise ValueError("lane_count must be positive")
+        nodes: list[BlockNodeDescriptor] = []
+        for node in self.structure_nodes():
+            lanes = min(lane_count, max(1, node.cardinality))
+            for lane_index in range(lanes):
+                start, end = structure_rank_lane_bounds(
+                    cardinality=node.cardinality,
+                    lane_index=lane_index,
+                    lane_count=lanes,
+                )
+                if end <= start:
+                    continue
+                # Earlier rank lanes are more valuable in cracking mode.  We
+                # keep the structure probability as the dominant signal and use
+                # a mild lane decay so the scheduler prefers front lanes without
+                # starving high-mass neighboring structures.
+                lane_decay = 1.0 / (1.0 + lane_index)
+                nodes.append(
+                    replace(
+                        node,
+                        node_id=structure_rank_lane_node_id(
+                            _require_structure_index(node),
+                            node.name,
+                            lane_index,
+                            lanes,
+                        ),
+                        name=f"{node.name}/lane{lane_index + 1}of{lanes}",
+                        priority=node.priority * lane_decay,
+                        base_prob=node.base_prob * lane_decay,
+                        cardinality=end - start,
+                        lane_index=lane_index,
+                        lane_count=lanes,
+                        rank_start=start,
+                        rank_end=end,
+                    )
+                )
+        return tuple(nodes)
+
     def scheduling_features(self) -> tuple[NodeSchedulingFeatures, ...]:
         if self._scheduling_features_cache is not None:
             return self._scheduling_features_cache
@@ -933,6 +1160,21 @@ class CQDAGBlockGraphAdapter:
             for node in self.structure_nodes()
         )
         return self._scheduling_features_cache
+
+    def scheduling_features_for(
+        self,
+        nodes: Sequence[BlockNodeDescriptor],
+    ) -> tuple[NodeSchedulingFeatures, ...]:
+        return tuple(
+            NodeSchedulingFeatures(
+                node_id=node.node_id,
+                entropy=node.slot_dispersion,
+                priority=node.priority,
+                estimated_cost=node.estimated_cost,
+                cardinality=node.cardinality,
+            )
+            for node in nodes
+        )
 
     def dependencies(
         self,
@@ -1823,6 +2065,10 @@ __all__ = [
     "CQDAGSourceReclaimStats",
     "CQDAGStructureRecordSource",
     "ROOT_NODE_ID",
+    "StructureRankLane",
+    "parse_structure_rank_lane_node_id",
     "slot_entropy",
     "slot_entropy_bound",
+    "structure_rank_lane_bounds",
+    "structure_rank_lane_node_id",
 ]

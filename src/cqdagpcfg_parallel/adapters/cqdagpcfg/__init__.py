@@ -8,8 +8,12 @@ from .block_graph import (
     CQDAGSourceReclaimStats,
     CQDAGStructureRecordSource,
     CppFileCQDAGRecordSource,
+    StructureRankLane,
+    parse_structure_rank_lane_node_id,
     slot_entropy,
     slot_entropy_bound,
+    structure_rank_lane_bounds,
+    structure_rank_lane_node_id,
 )
 from .paged_source import (
     PagedCQDAGModelClient,
@@ -119,6 +123,7 @@ __all__ = [
     "SerialCQDAGOracle",
     "SerialOracleResult",
     "StreamingRecordBatchPublisher",
+    "StructureRankLane",
     "build_paged_model",
     "build_cqdag_node_source",
     "ensure_compact_cpp_model_path",
@@ -137,8 +142,11 @@ __all__ = [
     "cqdagpcfg_remote",
     "cqdagpcfg_tracker",
     "pcfg",
+    "parse_structure_rank_lane_node_id",
     "resolve_cqdag_model_path",
     "resolve_generation_backend",
     "slot_entropy",
     "slot_entropy_bound",
+    "structure_rank_lane_bounds",
+    "structure_rank_lane_node_id",
 ]

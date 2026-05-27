@@ -508,19 +508,23 @@ class StreamingRecordBatchPublisher:
 
     def set_protocol_result(self, result) -> None:
         emitted = max(result.emitted_count, 1)
-        overgenerated_records = max(0, result.stats.scheduled_records - result.emitted_count)
-        received_overgenerated_records = max(0, result.received_records - result.emitted_count)
+        requested_records = result.stats.scheduled_records
+        requested_overgenerated_records = max(0, requested_records - result.emitted_count)
+        overgenerated_records = max(0, result.received_records - result.emitted_count)
         worker_chunk_caps = tuple(cap for _, cap in result.worker_chunk_caps)
         self.protocol_metrics = {
             "emitted_records": result.emitted_count,
             "scheduler_scheduled_items": result.stats.scheduled_items,
             "scheduler_scheduled_records": result.stats.scheduled_records,
+            "scheduler_requested_records": requested_records,
+            "requested_overgenerated_records": requested_overgenerated_records,
+            "requested_overgeneration_ratio": requested_overgenerated_records / emitted,
             "received_chunks": result.received_chunks,
             "received_records": result.received_records,
             "overgenerated_records": overgenerated_records,
             "overgeneration_ratio": overgenerated_records / emitted,
-            "received_overgenerated_records": received_overgenerated_records,
-            "received_overgeneration_ratio": received_overgenerated_records / emitted,
+            "received_overgenerated_records": overgenerated_records,
+            "received_overgeneration_ratio": overgenerated_records / emitted,
             "chunkstore_resident_records": result.stats.resident_records,
             "chunkstore_peak_resident_records": result.stats.peak_resident_records,
             "chunkstore_reclaimed_records": result.stats.reclaimed_records,

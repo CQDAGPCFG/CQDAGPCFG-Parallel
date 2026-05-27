@@ -323,17 +323,20 @@ class PriorityCostScheduler:
                 self._lease_denials += 1
                 continue
             if extends_active_tail:
+                if not self.config.tail_stealing_enabled:
+                    self._lease_denials += 1
+                    continue
                 self._tail_steal_attempts += 1
-            if extends_active_tail and not self._can_tail_steal_state(
-                state,
-                gap=gap,
-                active_leases=active_leases,
-                pending_tail=start - state.ready_end,
-                max_chunk_size=effective_max_chunk_size,
-            ):
-                self._lease_denials += 1
-                self._tail_steal_denials += 1
-                continue
+                if not self._can_tail_steal_state(
+                    state,
+                    gap=gap,
+                    active_leases=active_leases,
+                    pending_tail=start - state.ready_end,
+                    max_chunk_size=effective_max_chunk_size,
+                ):
+                    self._lease_denials += 1
+                    self._tail_steal_denials += 1
+                    continue
             window_gap = self._rank_window_gap(
                 state,
                 gap,

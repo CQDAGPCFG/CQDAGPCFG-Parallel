@@ -669,12 +669,24 @@ def _run_cqdag_tracker_service(
     model_server = start_model_artifact_server(args)
     role_controller = start_role_controller(args, job_payload, tracker_hooks=tracker_hooks)
     generator_slots = expected_generator_slots(args, role_controller)
+    max_parallel_leases_per_node = effective_max_parallel_leases_per_node(args)
+    shard_rank_lane_count = 1
+    if args.source_mode == "shard" and adapter is not None:
+        shard_rank_lane_count = max(
+            1,
+            expected_generator_capacity(args, role_controller),
+            max_parallel_leases_per_node,
+        )
+        protocol_nodes = adapter.structure_rank_lane_nodes(
+            lane_count=shard_rank_lane_count
+        )
+        node_ids = tuple(node.node_id for node in protocol_nodes)
+        node_features = adapter.scheduling_features_for(protocol_nodes)
     root_artifact_chunk_size = _direct_artifact_chunk_size(
         args,
         limit=limit,
         generator_slots=generator_slots,
     )
-    max_parallel_leases_per_node = effective_max_parallel_leases_per_node(args)
     effective_max_chunk_size = max(args.max_chunk_size, root_artifact_chunk_size)
     root_parallel_window = (
         min(limit, root_artifact_chunk_size * max_parallel_leases_per_node)
@@ -714,6 +726,7 @@ def _run_cqdag_tracker_service(
         root_artifact_target_bytes=args.root_artifact_target_bytes,
         root_parallel_window=root_parallel_window,
         generator_slots=generator_slots,
+        shard_rank_lane_count=shard_rank_lane_count,
         shard_parallel_pipeline_depth=DEFAULT_SHARD_PARALLEL_PIPELINE_DEPTH,
         max_parallel_leases_per_node=max_parallel_leases_per_node,
         requested_max_parallel_leases_per_node=args.max_parallel_leases_per_node,
@@ -725,7 +738,9 @@ def _run_cqdag_tracker_service(
         rank_window_size=effective_rank_window_size,
         configured_rank_window_size=args.rank_window_size,
         rank_window_frontier_multiplier=args.rank_window_frontier_multiplier,
-        tail_stealing_enabled=not args.disable_tail_stealing,
+        tail_stealing_enabled=(
+            not args.disable_tail_stealing and args.source_mode != "shard"
+        ),
         tail_steal_min_gap=args.tail_steal_min_gap,
         tail_steal_pending_limit_multiplier=effective_tail_steal_pending_limit_multiplier,
         configured_tail_steal_pending_limit_multiplier=(
@@ -747,7 +762,9 @@ def _run_cqdag_tracker_service(
             target_chunk_probability_mass=args.target_chunk_probability_mass,
             rank_window_size=effective_rank_window_size,
             rank_window_frontier_multiplier=args.rank_window_frontier_multiplier,
-            tail_stealing_enabled=not args.disable_tail_stealing,
+            tail_stealing_enabled=(
+                not args.disable_tail_stealing and args.source_mode != "shard"
+            ),
             tail_steal_min_gap=args.tail_steal_min_gap,
             tail_steal_pending_limit_multiplier=(
                 effective_tail_steal_pending_limit_multiplier
@@ -1603,6 +1620,14 @@ def expected_generator_slots(args: CqdagTrackerServiceConfig, role_controller) -
         return max(1, int(role_controller["generator_count"]))
     generator_count, _ = resolve_initial_role_counts(args)
     return max(1, generator_count)
+
+
+def expected_generator_capacity(args: CqdagTrackerServiceConfig, role_controller) -> int:
+    if args.total_nodes is not None:
+        return max(1, args.total_nodes - max(0, args.min_consumers))
+    if args.expected_workers is not None:
+        return max(1, args.expected_workers)
+    return expected_generator_slots(args, role_controller)
 
 
 def role_controller_metrics(role_controller) -> dict[str, int]:

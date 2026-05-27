@@ -682,7 +682,7 @@ class DistributedProtocolTracker:
             for node_id in self._direct_unordered_active_nodes
             if not self.states.get(node_id).exhausted
         }
-        active_target = 1
+        active_target = max(1, self.config.scheduler.max_parallel_leases_per_node)
         while (
             len(self._direct_unordered_active_nodes) < active_target
             and self._direct_unordered_shard_cursor < len(self._direct_unordered_shards_by_priority)
